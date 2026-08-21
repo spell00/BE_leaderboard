@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "policy": {
+    "unit": "whole_dataset",
+    "fitness_uses": ["train"],
+    "model_selection_uses": ["validation"],
+    "test_manifest_is_separate": true
+  },
+  "partitions": {
+    "train": [
+      "massbench_adenocarcinoma",
+      "massbench_benchmark"
+    ],
+    "validation": [
+      "massbench_alzheimer"
+    ]
+  }
+}

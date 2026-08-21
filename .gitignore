@@ -1,0 +1,10 @@
+results/
+logs/
+mlruns/
+wandb/
+.vscode/
+__pycache__/
+*.pyc
+*.pyo
+*.bak*
+*.launch.log

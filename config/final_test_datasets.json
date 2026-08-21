@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "policy": {
+    "unit": "whole_dataset",
+    "purpose": "one-time final evaluation of a frozen selected genome once a replacement is selected",
+    "must_not_be_loaded_by_search": true
+  },
+  "status": "replacement_required",
+  "datasets": []
+}
