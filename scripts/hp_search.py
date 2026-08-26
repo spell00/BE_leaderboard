@@ -829,6 +829,13 @@ def run_trial(cfg: dict, args, data, exp_id: str, fixed_test_data=None):
         y_fixed = np.asarray(fixed_test_data[1]).astype(str)
         metrics["test_mcc_fold_mean"] = float(metrics.get("test_mcc", np.nan))
         metrics["test_mcc"] = float(matthews_corrcoef(y_fixed, ensemble))
+        print(
+            "[trial test] monitoring-only fixed-test ensemble "
+            f"MCC = {metrics['test_mcc']:.4f} "
+            f"(fold mean = {metrics['test_mcc_fold_mean']:.4f}); "
+            "excluded from optimization and model selection",
+            flush=True,
+        )
     metrics["resolved_n_repeats"] = float(resolved_n_repeats)
     if is_alzheimer:
         metrics["supervised_samples"] = float(len(supervised_indices))

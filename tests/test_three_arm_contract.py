@@ -54,6 +54,15 @@ def test_fixed_test_labels_never_enter_bernn_fit():
     assert "X_fixed.copy(),\n                None," in text
 
 
+def test_fixed_test_is_scored_and_reported_after_cv():
+    text=(ROOT/"scripts/hp_search.py").read_text()
+    fold_loop=text.index("for fold_idx, (train_idx, test_idx) in enumerate(split_iter):")
+    aggregation=text.index("prediction_matrix = np.stack(fixed_test_predictions)")
+    report=text.index('"[trial test] monitoring-only fixed-test ensemble "')
+    returned=text.index('return float(metrics["valid_mcc"]), metrics')
+    assert fold_loop < aggregation < report < returned
+    assert "excluded from optimization and model selection" in text
+
 def test_cv_splits_are_persisted_and_reused():
     hp=(ROOT/"scripts/hp_search.py").read_text()
     assert "def cached_cv_splits" in hp
