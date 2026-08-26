@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import importlib.metadata
 import uuid
 import argparse
 import csv
@@ -66,6 +67,20 @@ from src.zero_shot_recommender.meta_features import (
 _ACTIVE_STORAGE = None
 _ACTIVE_WANDB_RUN = None
 _THRESHOLD_STATE: dict[str, dict[str, float]] = {}
+DATASET_CV_FOLDS = {
+    "normal_tissue_878": 3,
+    "colon_3041": 3,
+    "massbench_adenocarcinoma": 3,
+    "massbench_benchmark": 3,
+    "massbench_alzheimer": 3,
+}
+
+
+def _dataset_cv_settings(dataset_id: str, default_n_repeats: int, batches) -> tuple[int, int]:
+    """Return the requested and resolved fold counts for one dataset."""
+    requested = int(DATASET_CV_FOLDS.get(dataset_id, default_n_repeats))
+    resolved = hp_search.resolve_n_repeats(requested, batches)
+    return requested, resolved
 
 
 def _cleanup_runtime_resources() -> None:
@@ -340,7 +355,15 @@ def parse_args(argv=None):
     parser.add_argument("--output-dir", type=Path, default=ROOT / "results" / "optuna_comparison")
     parser.add_argument("--n-trials", type=int, default=1000, help="Trials per dataset.")
     parser.add_argument("--n-epochs", type=int, default=1000)
-    parser.add_argument("--n-repeats", type=int, default=-1)
+    parser.add_argument("--n-repeats", type=int, default=3)
+    parser.add_argument(
+        "--batch-size", type=int, default=32,
+        help="Maximum BERNN batch size; may be lowered for very small dataset folds.",
+    )
+    parser.add_argument(
+        "--num-workers", type=int, default=0,
+        help="PyTorch DataLoader subprocesses per BERNN loader.",
+    )
     parser.add_argument("--device", default="cuda", choices=["cpu", "cuda"])
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", action="store_true")
@@ -390,9 +413,76 @@ def _trial_payload(trial) -> dict:
         "valid_mcc": float(trial.value),
         "test_mcc": float(attrs.get("test_mcc", np.nan)),
         "fit_seconds": float(attrs.get("fit_seconds", np.nan)),
+        "fold_scores": attrs.get("fold_scores", {}),
         "config": attrs.get("config", {}),
         "error": attrs.get("error"),
     }
+
+
+def _fold_scores_payload(metrics: dict) -> dict[str, list[float]]:
+    """Return JSON-safe, per-fold MCC values without replacing their means."""
+    payload = {}
+    for split in ("valid", "test"):
+        values = metrics.get(f"{split}_mcc_folds", [])
+        if isinstance(values, (list, tuple, np.ndarray)):
+            payload[split] = [float(value) for value in values]
+    return payload
+
+
+def _fold_score_rows(
+    phase: str,
+    solution_step: int,
+    dataset_id: str,
+    fold_scores: dict[str, list[float]],
+    trial_number: int | None = None,
+) -> list[dict]:
+    rows = []
+    for split, values in fold_scores.items():
+        for fold_index, score in enumerate(values):
+            rows.append({
+                "phase": phase,
+                "solution_step": int(solution_step),
+                "trial_number": "" if trial_number is None else int(trial_number),
+                "dataset": dataset_id,
+                "split": split,
+                "fold": int(fold_index),
+                "mcc": float(score),
+            })
+    return rows
+
+
+def _append_fold_scores(output_dir: Path, rows: list[dict]) -> None:
+    """Persist every CV point in a tidy CSV suitable for arbitrary replots."""
+    if not rows:
+        return
+    path = output_dir / "cv_fold_scores.csv"
+    fieldnames = ("phase", "solution_step", "trial_number", "dataset", "split", "fold", "mcc")
+    write_header = not path.exists() or path.stat().st_size == 0
+    with path.open("a", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerows(rows)
+
+
+def _wandb_fold_table(wandb, rows: list[dict]):
+    columns = ["phase", "solution_step", "trial_number", "dataset", "split", "fold", "mcc"]
+    return wandb.Table(columns=columns, data=[[row[column] for column in columns] for row in rows])
+
+
+def _fold_boxplot(rows: list[dict], title: str):
+    """Make Plotly boxes with the individual fold MCC values overlaid."""
+    import plotly.express as px
+
+    return px.box(
+        rows,
+        x="dataset",
+        y="mcc",
+        color="split",
+        points="all",
+        hover_data=["solution_step", "trial_number", "fold"],
+        title=title,
+    )
 
 
 def _best_payload(study) -> dict:
@@ -590,11 +680,18 @@ def _append_solution(output_dir: Path, record: dict, dataset_ids: tuple[str, ...
 def _main(argv=None) -> int:
     global _ACTIVE_STORAGE, _ACTIVE_WANDB_RUN
     args = parse_args(argv)
+    if args.n_repeats != 3:
+        raise ValueError("Dataset-conditional meta-learning requires grouped CV=3")
     if args.n_trials < 1:
         raise ValueError("n_trials must be positive")
+    if args.batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    if args.num_workers < 0:
+        raise ValueError("num_workers must be >= 0")
     if args.log1p_mode != "on":
         raise ValueError("This comparison requires --log1p-mode on")
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    bernn_version = importlib.metadata.version("bernn")
     metadata_path = args.output_dir / "run_metadata.json"
     had_persisted_wandb_id = False
     if metadata_path.exists():
@@ -615,6 +712,11 @@ def _main(argv=None) -> int:
     code_manifest = _build_code_manifest(repo_root)
     code_manifest_path = _write_code_manifest(args.output_dir, code_manifest)
     metadata.update({
+        "arm": "dataset_conditional_meta_learning",
+        "candidate_budget": int(args.n_trials),
+        "budget_unit": "solution_step_one_trial_per_train_dataset",
+        "per_dataset_trial_budget": int(args.n_trials),
+        "total_train_dataset_fits": int(args.n_trials * len(load_dataset_partitions(args.split_manifest).train)),
         "repo_root": str(repo_root),
         "git_head": git_info["head"],
         "git_dirty": git_info["dirty"],
@@ -623,6 +725,7 @@ def _main(argv=None) -> int:
         "code_file_count": code_manifest["summary"]["existing_file_count"],
         "code_missing_file_count": code_manifest["summary"]["missing_file_count"],
         "log1p_mode": args.log1p_mode,
+        "bernn_version": bernn_version,
     })
     if not args.no_wandb and not metadata.get("wandb_run_id"):
         metadata["wandb_run_id"] = uuid.uuid4().hex[:8]
@@ -634,6 +737,11 @@ def _main(argv=None) -> int:
         f"{code_manifest['summary']['existing_file_count']} files present, "
         f"{code_manifest['summary']['missing_file_count']} missing, "
         f"manifest={code_manifest['summary']['manifest_sha256'][:12]}",
+        flush=True,
+    )
+    print(
+        f"[optuna-comparison] BERNN {bernn_version}; "
+        f"num_workers={args.num_workers}; CV overrides={DATASET_CV_FOLDS}",
         flush=True,
     )
 
@@ -712,6 +820,7 @@ def _main(argv=None) -> int:
                 "method": "joint_meta_hpo_from_scratch_validation",
                 "validation_initialization": "from_scratch",
                 "preprocessing/log1p": True,
+                "bernn_version": bernn_version,
                 "host": metadata["hostname"],
                 "gpu": metadata["gpu"],
             },
@@ -779,6 +888,7 @@ def _main(argv=None) -> int:
             )
 
             validation_payload = {"solution_step": solution_step}
+            validation_fold_rows = []
 
             predicted_configs, meta_diagnostics, meta_checkpoint = _fit_joint_meta_model(
                 studies, datasets, validation_datasets, args
@@ -791,20 +901,30 @@ def _main(argv=None) -> int:
                 validation_args = hp_search.parse_args([])
                 validation_args.dataset = validation_id
                 validation_args.n_epochs = args.n_epochs
-                validation_args.n_repeats = args.n_repeats
+                validation_args.n_repeats, validation_args.resolved_n_repeats = _dataset_cv_settings(
+                    validation_id, args.n_repeats, batches_v
+                )
+                validation_args.num_workers = args.num_workers
                 validation_args.device = args.device
                 validation_args.seed = args.seed + 10000 + validation_index
                 validation_args.no_wandb = True
                 validation_args.combine_test = False
                 validation_args.max_warmup = max(1, min(50, args.n_epochs))
                 validation_args.log1p = True
-                validation_args.bs = recommended_batch_size(batches_v, cap=validation_args.bs)
-                validation_args.resolved_n_repeats = hp_search.resolve_n_repeats(
-                    args.n_repeats, batches_v
-                )
+                validation_args.bs = recommended_batch_size(batches_v, cap=args.batch_size)
+                predicted_config.update({
+                    "batch_size": int(validation_args.bs),
+                    "cv_folds": int(validation_args.resolved_n_repeats),
+                    "num_workers": int(validation_args.num_workers),
+                    "lisi_enabled": False,
+                })
                 validation_args.results_dir = str(
                     args.output_dir / "validation" / validation_id / "joint_meta_model"
                 )
+                validation_args.cv_split_cache = str(
+                    args.output_dir / "cv_splits" / f"{validation_id}.npz"
+                )
+                metrics = {}
                 try:
                     valid_mcc, metrics = hp_search.run_trial(
                         predicted_config, validation_args, (Xv, yv, batches_v),
@@ -816,15 +936,25 @@ def _main(argv=None) -> int:
                 except Exception as exc:
                     valid_mcc, test_mcc = -1.0, np.nan
                     print(f"[optuna-comparison] validation failed {validation_id}: {type(exc).__name__}: {exc}", flush=True)
+                fold_scores = _fold_scores_payload(metrics)
                 validation_history[validation_id].append((solution_step, valid_mcc, test_mcc))
                 validation_results[validation_id] = {
                     "valid_mcc": valid_mcc, "test_mcc": test_mcc,
+                    "fold_scores": fold_scores,
                     "config": predicted_config,
                 }
+                validation_fold_rows.extend(_fold_score_rows(
+                    "validation", solution_step, validation_id, fold_scores
+                ))
                 update_score_threshold(validation_id, valid_mcc)
                 validation_payload[f"validation/{validation_id}/valid_mcc"] = valid_mcc
                 validation_payload[f"validation/{validation_id}/test_mcc"] = test_mcc
                 validation_payload[f"validation/{validation_id}/meta_train_loss"] = meta_diagnostics["meta_train_loss"]
+                for split, values in fold_scores.items():
+                    for fold_index, value in enumerate(values):
+                        validation_payload[
+                            f"validation/folds/{validation_id}/{split}_mcc/fold_{fold_index}"
+                        ] = value
                 _log_hparams(validation_payload, f"validation/{validation_id}/hparams", predicted_config)
 
             total_validation_mcc = _aggregate_metric(validation_results, validation_ids, "valid_mcc")
@@ -840,10 +970,19 @@ def _main(argv=None) -> int:
             }
             with (args.output_dir / "validation_solutions.jsonl").open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(validation_record, default=str) + "\n")
+            _append_fold_scores(args.output_dir, validation_fold_rows)
             import torch
             torch.save(meta_checkpoint, args.output_dir / "latest_joint_meta_model.pt")
 
             if wandb_run is not None and len(validation_payload) > 1:
+                if validation_fold_rows:
+                    validation_payload["validation/cv_fold_scores"] = _wandb_fold_table(
+                        wandb, validation_fold_rows
+                    )
+                    validation_payload["validation/cv_boxplot"] = _fold_boxplot(
+                        validation_fold_rows,
+                        f"Validation CV fold MCCs - solution {solution_step}",
+                    )
                 wandb_run.summary.update(score_threshold_payload(threshold_dataset_ids))
                 wandb_run.log(validation_payload)
 
@@ -855,17 +994,28 @@ def _main(argv=None) -> int:
                 hp_args = hp_search.parse_args([])
                 hp_args.dataset = dataset_id
                 hp_args.n_epochs = args.n_epochs
-                hp_args.n_repeats = args.n_repeats
+                _, _, batches = datasets[dataset_id]
+                hp_args.n_repeats, hp_args.resolved_n_repeats = _dataset_cv_settings(
+                    dataset_id, args.n_repeats, batches
+                )
+                hp_args.num_workers = args.num_workers
                 hp_args.device = args.device
                 hp_args.seed = args.seed + dataset_index
                 hp_args.no_wandb = True
                 hp_args.combine_test = False
                 hp_args.max_warmup = max(1, min(50, args.n_epochs))
                 hp_args.log1p = True
-                _, _, batches = datasets[dataset_id]
-                hp_args.bs = recommended_batch_size(batches, cap=hp_args.bs)
-                hp_args.resolved_n_repeats = hp_search.resolve_n_repeats(args.n_repeats, batches)
+                hp_args.bs = recommended_batch_size(batches, cap=args.batch_size)
+                hp_args.cv_split_cache = str(
+                    args.output_dir / "cv_splits" / f"{dataset_id}.npz"
+                )
                 config = hp_search.sample_config(trial, hp_args)
+                config.update({
+                    "batch_size": int(hp_args.bs),
+                    "cv_folds": int(hp_args.resolved_n_repeats),
+                    "num_workers": int(hp_args.num_workers),
+                    "lisi_enabled": False,
+                })
                 started = time.monotonic()
                 error = None
                 metrics = {}
@@ -882,6 +1032,7 @@ def _main(argv=None) -> int:
                     print(f"[optuna-comparison] {dataset_id} trial {trial.number} failed: {error}", flush=True)
                 trial.set_user_attr("config", config)
                 trial.set_user_attr("test_mcc", float(metrics.get("test_mcc", np.nan)))
+                trial.set_user_attr("fold_scores", _fold_scores_payload(metrics))
                 trial.set_user_attr("fit_seconds", time.monotonic() - started)
                 if error:
                     trial.set_user_attr("error", error)
@@ -902,9 +1053,18 @@ def _main(argv=None) -> int:
             "best_total_valid_mcc": _aggregate_metric(best, dataset_ids, "valid_mcc"),
         }
         _append_solution(args.output_dir, record, dataset_ids)
+        solution_fold_rows = []
         for dataset_id in dataset_ids:
             row = current[dataset_id]
             history[dataset_id].append((solution_step, row["valid_mcc"], row["test_mcc"]))
+            solution_fold_rows.extend(_fold_score_rows(
+                "solutions",
+                solution_step,
+                dataset_id,
+                row.get("fold_scores", {}),
+                trial_number=row.get("trial_number"),
+            ))
+        _append_fold_scores(args.output_dir, solution_fold_rows)
         if wandb_run is not None:
             telemetry = {}
             for dataset_id in dataset_ids:
@@ -932,12 +1092,27 @@ def _main(argv=None) -> int:
                     f"solutions/best/{dataset_id}/valid_mcc": best[dataset_id]["valid_mcc"],
                     f"solutions/best/{dataset_id}/test_mcc": best[dataset_id]["test_mcc"],
                     f"comparison/fit_seconds/{dataset_id}": current[dataset_id]["fit_seconds"],
-                    f"solutions/mcc/{dataset_id}": _score_figure(dataset_id, history[dataset_id]),
+                    f"solutions/mcc/{dataset_id}": _score_figure(
+                        dataset_id,
+                        history[dataset_id],
+                        thresholds=_THRESHOLD_STATE.get(dataset_id),
+                    ),
                 })
+                for split, values in current[dataset_id].get("fold_scores", {}).items():
+                    for fold_index, value in enumerate(values):
+                        payload[
+                            f"solutions/folds/{dataset_id}/{split}_mcc/fold_{fold_index}"
+                        ] = value
                 _log_hparams(
                     payload,
                     f"solutions/best_config/{dataset_id}",
                     best[dataset_id]["config"],
+                )
+            if solution_fold_rows:
+                payload["solutions/cv_fold_scores"] = _wandb_fold_table(wandb, solution_fold_rows)
+                payload["solutions/cv_boxplot"] = _fold_boxplot(
+                    solution_fold_rows,
+                    f"Training CV fold MCCs - solution {solution_step}",
                 )
             wandb_run.log(payload)
             wandb_run.summary.update(score_threshold_payload(threshold_dataset_ids))

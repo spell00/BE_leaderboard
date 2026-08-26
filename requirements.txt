@@ -27,7 +27,7 @@ scanpy>=1.9.0
 harmonypy>=0.0.9
 mlflow>=2.14.0
 tensorboard>=2.14.0
-bernn @ git+https://github.com/spell00/BERNN_MSMS.git@4dac01e1a9836d78ae9641a36125648afec8ed16
+bernn==1.0.5
 torchvision>=0.15.0
 tensorboardX>=2.6.0
 dvc>=3.0

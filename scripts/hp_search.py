@@ -84,6 +84,7 @@ Outputs (written under --results-dir, prefixed with --out-prefix)
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import math
@@ -272,6 +273,7 @@ def build_trainer_config(cfg: dict, args, exp_id: str):
         # an outer CV wrapper and passes the resolved fold count through.
         n_repeats=int(getattr(args, "resolved_n_repeats", args.n_repeats)),
         bs=int(args.bs),
+        num_workers=int(getattr(args, "num_workers", 0)),
         device=args.device,
         exp_id=exp_id,                 # MLflow experiment bernn logs this trial into
     )
@@ -494,7 +496,10 @@ def _fit_one(cfg, args, data, exp_id: str, seed: int, keep_models: bool):
     set_bernn_seed(seed)       # reproducibility: same config/seed -> same result
     trainer_cls = TrainAEThenClassifierHoldout if cfg.get("model_type") == "two_stage" else TrainAEClassifierHoldout
     trainer = trainer_cls(
-        config=tc, log_metrics=True, keep_models=keep_models, log_mlflow=True,
+        # BERNN's aggregate metrics hook includes the expensive LISI diagnostics.
+        # HPO scoring is computed directly below, so these diagnostics are not
+        # needed for model selection and are intentionally disabled.
+        config=tc, log_metrics=False, keep_models=keep_models, log_mlflow=True,
     )
     trainer.seed = int(seed)   # vary stochastic BERNN initialization across folds
     import inspect
@@ -533,11 +538,9 @@ def _fit_one(cfg, args, data, exp_id: str, seed: int, keep_models: bool):
                 "X_test": X_test.copy(),
                 "groups_test": np.asarray(batches_test).copy(),
             })
-            if y_test is not None:
-                # Local fixed-test HPO experiments have labels; pass them so BERNN
-                # can log test MCC/accuracy each epoch. The submission runner still
-                # keeps hidden benchmark labels out of user fit() calls.
-                fit_kwargs["y_test"] = np.asarray(y_test).copy()
+            # Never pass fixed-test labels into BERNN. They are retained only by
+            # run_trial() for scoring predictions after fit, so label vocabulary,
+            # losses, checkpoints, and early stopping cannot inspect them.
         else:
             # BERNN currently requires a non-empty test loader. In pure CV mode,
             # reuse the validation features without labels, so test metrics remain
@@ -610,6 +613,35 @@ def cv_splits(y, batches, n_repeats: int):
         yield from splitter.split(np.zeros(len(y)), y)
 
 
+def cached_cv_splits(y, batches, n_repeats: int, cache_path=None):
+    """Persist deterministic grouped folds so every candidate reuses them exactly."""
+    y = np.asarray(y).astype(str)
+    batches = np.asarray(batches).astype(str)
+    digest = hashlib.sha256()
+    digest.update("\x1f".join(y).encode())
+    digest.update(b"\x00")
+    digest.update("\x1f".join(batches).encode())
+    fingerprint = digest.hexdigest()
+    path = Path(cache_path) if cache_path else None
+    if path is not None and path.exists():
+        try:
+            with np.load(path, allow_pickle=False) as payload:
+                if str(payload["fingerprint"].item()) == fingerprint and int(payload["n_repeats"].item()) == int(n_repeats):
+                    count = int(payload["count"].item())
+                    return [(payload[f"train_{i}"].copy(), payload[f"valid_{i}"].copy()) for i in range(count)]
+        except Exception:
+            pass
+    splits = [(np.asarray(train, dtype=int), np.asarray(valid, dtype=int)) for train, valid in cv_splits(y, batches, n_repeats)]
+    if path is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fields = {"fingerprint": np.asarray(fingerprint), "n_repeats": np.asarray(int(n_repeats)), "count": np.asarray(len(splits))}
+        for i, (train, valid) in enumerate(splits):
+            fields[f"train_{i}"] = train
+            fields[f"valid_{i}"] = valid
+        np.savez_compressed(path, **fields)
+    return splits
+
+
 def _aggregate_fold_metrics(fold_metrics: list[dict]) -> dict:
     """Mean metric dictionaries and retain per-fold vectors for dashboards.
 
@@ -670,15 +702,19 @@ def run_trial(cfg: dict, args, data, exp_id: str, fixed_test_data=None):
         pool_indices = np.flatnonzero(~np.isin(y.astype(str), list(ALZHEIMER_SUPERVISED_LABELS)))
         if not len(pool_indices):
             raise ValueError("Alzheimer semi-supervised task requires pooled samples")
+        base_splits = cached_cv_splits(
+            y[supervised_indices], batches[supervised_indices], int(args.n_repeats),
+            getattr(args, "cv_split_cache", None),
+        )
         split_iter = (
             (supervised_indices[train_sub], supervised_indices[valid_sub])
-            for train_sub, valid_sub in cv_splits(
-                y[supervised_indices], batches[supervised_indices], int(args.n_repeats)
-            )
+            for train_sub, valid_sub in base_splits
         )
     else:
         pool_indices = np.array([], dtype=int)
-        split_iter = cv_splits(y, batches, int(args.n_repeats))
+        split_iter = cached_cv_splits(
+            y, batches, int(args.n_repeats), getattr(args, "cv_split_cache", None)
+        )
 
     for fold_idx, (train_idx, test_idx) in enumerate(split_iter):
         model_y = np.asarray(y).astype(object).copy()
@@ -720,13 +756,12 @@ def run_trial(cfg: dict, args, data, exp_id: str, fixed_test_data=None):
             batches[test_idx],
         )
         if fixed_test_data is not None:
-            # Fully transductive external cross-test: features, batch IDs, and
-            # labels are supplied once. BERNN uses all spectra for AE/domain
-            # learning, but classifier gradients remain train-only; test labels
-            # are monitoring-only and never drive early stopping/model selection.
+            # Fully transductive external cross-test: features and batch IDs are
+            # supplied to BERNN, while labels remain outside fit() and are used
+            # only below to score predictions after training.
             fit_data = fit_data + (
                 X_fixed.copy(),
-                np.asarray(y_fixed).copy(),
+                None,
                 np.asarray(batches_fixed).copy(),
             )
         print(
@@ -970,6 +1005,10 @@ def parse_args(argv=None):
     p.add_argument("--n-repeats", type=int, default=-1,
                    help="CV folds for the BERNN wrapper. Use -1 for grouped CV capped at 5 folds.")
     p.add_argument("--bs", type=int, default=32)
+    p.add_argument(
+        "--num-workers", type=int, default=0,
+        help="PyTorch DataLoader subprocesses per loader (default: 0).",
+    )
     p.add_argument("--max-warmup", type=int, default=50, help="Upper bound of the warmup search range.")
     p.add_argument("--device", default=_default_device(), choices=["cpu", "cuda"],
                    help="Compute device (default: cuda if a GPU is available, else cpu).")

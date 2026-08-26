@@ -171,7 +171,7 @@ def aggregate_dataset_scores(scores: Iterable[float], worst_dataset_weight: floa
     return float((1.0 - weight) * values.mean() + weight * values.min())
 
 
-def recommended_batch_size(batch_labels, cap: int = 32) -> int:
+def recommended_batch_size(batch_labels, cap: int = 128) -> int:
     """Choose a non-empty loader size for leave-one-batch-out training folds."""
     labels = np.asarray(batch_labels).astype(str)
     if labels.size < 2:

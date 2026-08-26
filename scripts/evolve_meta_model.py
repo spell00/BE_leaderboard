@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import importlib.metadata
 import json
 import os
 import sys
@@ -59,7 +60,8 @@ def parse_args(argv=None):
     parser.add_argument("--worst-dataset-weight", type=float, default=0.25)
     parser.add_argument("--validation-patience", type=int, default=8)
     parser.add_argument("--n-epochs", type=int, default=100)
-    parser.add_argument("--n-repeats", type=int, default=-1)
+    parser.add_argument("--n-repeats", type=int, default=3)
+    parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument(
         "--validation-epoch-interval", type=int, default=10,
         help="Log held-out validation epoch telemetry at epoch 0 and this interval.",
@@ -234,7 +236,11 @@ def _numeric_config_telemetry(dataset_id: str, config: dict) -> dict[str, float]
     return telemetry
 
 
-def _score_figure(dataset_id: str, rows: list[tuple[int, float, float]]):
+def _score_figure(
+    dataset_id: str,
+    rows: list[tuple[int, float, float]],
+    thresholds: dict[str, float] | None = None,
+):
     """Plot validation/test MCC plus BERNN-best and acceptable-goal traces."""
     import plotly.graph_objects as go
 
@@ -244,15 +250,17 @@ def _score_figure(dataset_id: str, rows: list[tuple[int, float, float]]):
     figure = go.Figure()
     figure.add_trace(go.Scatter(x=x, y=valid, mode="lines+markers", name="valid_mcc"))
     figure.add_trace(go.Scatter(x=x, y=test, mode="lines+markers", name="test_mcc"))
-    thresholds = SCORE_THRESHOLDS[dataset_id]
-    figure.add_trace(go.Scatter(
-        x=x, y=[thresholds["reference"]] * len(x), mode="lines",
-        line={"dash": "solid", "width": 2}, name="Best valid MCC",
-    ))
-    figure.add_trace(go.Scatter(
-        x=x, y=[thresholds["acceptable"]] * len(x), mode="lines",
-        line={"dash": "dash", "width": 2}, name="goal",
-    ))
+    thresholds = dict(SCORE_THRESHOLDS.get(dataset_id, {}) if thresholds is None else thresholds)
+    if "reference" in thresholds:
+        figure.add_trace(go.Scatter(
+            x=x, y=[thresholds["reference"]] * len(x), mode="lines",
+            line={"dash": "solid", "width": 2}, name="Best valid MCC",
+        ))
+    if "acceptable" in thresholds:
+        figure.add_trace(go.Scatter(
+            x=x, y=[thresholds["acceptable"]] * len(x), mode="lines",
+            line={"dash": "dash", "width": 2}, name="goal",
+        ))
     figure.update_layout(
         title=f"{dataset_id}: MCC versus BERNN thresholds",
         xaxis_title="solution step", yaxis_title="grouped-CV MCC",
@@ -263,6 +271,10 @@ def _score_figure(dataset_id: str, rows: list[tuple[int, float, float]]):
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    if args.n_repeats != 3:
+        raise ValueError("Meta-evolution requires grouped CV=3")
+    if importlib.metadata.version("bernn") != "1.0.5":
+        raise RuntimeError("This experiment requires bernn==1.0.5")
     if args.generations < 1 or args.validation_patience < 1:
         raise ValueError("generations and validation_patience must be positive")
     partitions = load_dataset_partitions(args.split_manifest)
@@ -271,7 +283,7 @@ def main(argv=None) -> int:
     # Held-out meta-test datasets are not touched until evolution, validation
     # selection, and early stopping are completely finished.
     development_ids = partitions.train + partitions.validation
-    heldout_ids = tuple(partitions.test)
+    heldout_ids = tuple(getattr(partitions, "test", ()))
     datasets, raw_meta = _load_datasets(development_ids)
 
     # Fixed within-dataset test labels are monitoring-only. They never enter
@@ -335,22 +347,38 @@ def main(argv=None) -> int:
     hp_args = hp_search.parse_args([])
     hp_args.n_epochs = args.n_epochs
     hp_args.n_repeats = args.n_repeats
+    hp_args.num_workers = args.num_workers
+    hp_args.log1p = True
     hp_args.device = args.device
     hp_args.no_wandb = True
     hp_args.combine_test = False
     hp_args.max_warmup = max(1, min(50, args.n_epochs))
     score_cache = {}
 
+    run_metadata_path = args.output_dir / "run_metadata.json"
+    if run_metadata_path.exists():
+        run_metadata = json.loads(run_metadata_path.read_text())
+    else:
+        run_metadata = {"wandb_run_id": uuid.uuid4().hex[:8]}
+    run_metadata.update({
+        "arm": "meta_evolution",
+        "candidate_budget": int(args.population_size * args.generations),
+        "budget_unit": "candidate_policy",
+        "population_size": int(args.population_size),
+        "generations": int(args.generations),
+        "bernn_version": importlib.metadata.version("bernn"),
+        "log1p": True,
+        "num_workers": int(args.num_workers),
+        "train_datasets": list(partitions.train),
+        "validation_datasets": list(partitions.validation),
+        "fixed_test_labels": "monitoring_only",
+    })
+    _atomic_json(run_metadata_path, run_metadata)
+
     wandb_run = None
     if not args.no_wandb:
         import wandb
 
-        run_metadata_path = args.output_dir / "run_metadata.json"
-        if run_metadata_path.exists():
-            run_metadata = json.loads(run_metadata_path.read_text())
-        else:
-            run_metadata = {"wandb_run_id": uuid.uuid4().hex[:8]}
-            _atomic_json(run_metadata_path, run_metadata)
         wandb_run = wandb.init(
             project=args.wandb_project,
             name=args.wandb_run_name,
@@ -392,6 +420,7 @@ def main(argv=None) -> int:
                 run_args.seed = args.seed
                 run_args.bs = recommended_batch_size(batches, cap=hp_args.bs)
                 run_args.results_dir = str(args.output_dir / dataset_id)
+                run_args.cv_split_cache = str(args.output_dir / "cv_splits" / f"{dataset_id}.npz")
                 run_args.resolved_n_repeats = hp_search.resolve_n_repeats(run_args.n_repeats, batches)
                 exp_id = f"meta_evolution_{dataset_id}_{genome_digest(genome)[:12]}"
                 score, metrics = hp_search.run_trial(
@@ -633,6 +662,7 @@ def main(argv=None) -> int:
             run_args.seed = args.seed + 10_000 + dataset_index
             run_args.bs = recommended_batch_size(batches, cap=hp_args.bs)
             run_args.results_dir = str(args.output_dir / "heldout" / dataset_id)
+            run_args.cv_split_cache = str(args.output_dir / "cv_splits" / f"{dataset_id}.npz")
             run_args.resolved_n_repeats = hp_search.resolve_n_repeats(
                 run_args.n_repeats,
                 batches,
