@@ -733,7 +733,7 @@ def maybe_register_tuned(cfg: dict, valid_mcc) -> str | None:
     return preset
 
 
-def build_bernn_code(cfg=None, preset=None):
+def build_bernn_code(cfg=None, preset=None, *, meta_predicted=False):
     """Render a self-contained BERNN ``fit`` from a config dict.
 
     The generated code carries a CONFIG dict the user can edit, then dispatches
@@ -863,6 +863,11 @@ def build_bernn_code(cfg=None, preset=None):
     # ---- End head-sweep path --------------------------------------------
 
     config_block = "\n".join(f"        {key!r}: {cfg[key]!r}," for key in _BERNN_CONFIG_ORDER)
+    config_assignment = (
+        "    CONFIG = predict_meta_bernn_config(X_train, y_train, batches_train)"
+        if meta_predicted else
+        f"    CONFIG = {{\n{config_block}\n    }}"
+    )
     # 8-space indent: these lines live inside the nested _make_trainer() factory.
     attr_block = "\n".join(f'        cfg.{key} = CONFIG[{key!r}]' for key in _BERNN_ATTR_KEYS)
     return f'''def fit(
@@ -880,9 +885,7 @@ def build_bernn_code(cfg=None, preset=None):
     # dloss:      no | DANN | revDANN | inverseTriplet | normae
     # model_type: joint (AE + classifier) | two_stage (AE, then classifier)
     # variational: False = AE, True = VAE   |   kan: False = MLP, True = KAN
-    CONFIG = {{
-{config_block}
-    }}
+{config_assignment}
     # ================================================
     if CONFIG.get("device") == "cuda" and not CUDA_AVAILABLE:
         CONFIG["device"] = "cpu"     # portable fallback when this machine has no GPU
@@ -947,6 +950,11 @@ def bernn_model_examples():
             "name": "BERNN — Parameterized (edit CONFIG)",
             "description": "Single BERNN baseline exposing every model-selection knob via a CONFIG dict",
             "code": build_bernn_code(bernn_config("ae_inversetriplet")),
+        },
+        "bernn_meta_predicted": {
+            "name": "BERNN — Meta-model predicted",
+            "description": "Predicts dataset-specific BERNN hyperparameters from the persistent evolutionary meta-policy",
+            "code": build_bernn_code(bernn_config("ae_inversetriplet"), meta_predicted=True),
         },
     }
     for key in BERNN_PRESETS:

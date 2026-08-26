@@ -454,6 +454,12 @@ def _base_exec_env(
     dataset_name: str | None = None,
 ) -> dict[str, object]:
     from src.baselines import bernn_config as _default_bernn_config
+    from src.meta_policy import predict_meta_bernn_config as _predict_meta_config
+
+    def _leaderboard_meta_config(X, y, batches):
+        predicted = _predict_meta_config(X, y, batches)
+        # Preserve stable runtime controls not emitted by the evolutionary policy.
+        return _default_bernn_config("ae_inversetriplet", **predicted)
 
     env: dict[str, object] = {
         "__builtins__": _safe_builtins(),
@@ -481,6 +487,7 @@ def _base_exec_env(
         # Optional user-facing BERNN CONFIG. Submitted code may override this
         # locally, but short snippets can use it directly.
         "CONFIG": _default_bernn_config("ae_inversetriplet"),
+        "predict_meta_bernn_config": _leaderboard_meta_config,
         "plot_capture": plot_capture,
         "CURRENT_DATASET": dataset_name or "",
     }

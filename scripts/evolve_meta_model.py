@@ -37,6 +37,7 @@ from src.zero_shot_recommender.meta_features import (
     META_FEATURE_NAMES,
     extract_meta_features,
 )
+from src.meta_policy import META_POLICY_REPO, load_policy_metadata, publish_policy_if_improved
 
 SCORE_THRESHOLDS = {
     "massbench_adenocarcinoma": {"reference": 0.24, "acceptable": 0.19},
@@ -73,6 +74,11 @@ def parse_args(argv=None):
     parser.add_argument("--no-wandb", action="store_true", help="Disable live Weights & Biases telemetry")
     parser.add_argument("--wandb-project", default="BE_leaderboard_meta_evolution")
     parser.add_argument("--wandb-run-name", default=None)
+    parser.add_argument("--hf-meta-policy-repo", default=META_POLICY_REPO)
+    parser.add_argument(
+        "--no-hf-meta-policy-push", action="store_true",
+        help="Do not compare/promote the validation champion on Hugging Face.",
+    )
     return parser.parse_args(argv)
 
 
@@ -344,6 +350,20 @@ def main(argv=None) -> int:
     else:
         population = initialize_population(shape, evolution, rng)
 
+    persistent_metadata = None
+    if not args.no_hf_meta_policy_push:
+        persistent_metadata = load_policy_metadata(args.hf_meta_policy_repo)
+        if persistent_metadata is not None and "validation_score" in persistent_metadata:
+            persistent_score = float(persistent_metadata["validation_score"])
+            best_validation = max(best_validation, persistent_score)
+            print(
+                f"[meta-policy] persistent Hub champion validation MCC={persistent_score:.6f} "
+                f"from {args.hf_meta_policy_repo}",
+                flush=True,
+            )
+        else:
+            print("[meta-policy] no persistent Hub champion logged yet", flush=True)
+
     hp_args = hp_search.parse_args([])
     hp_args.n_epochs = args.n_epochs
     hp_args.n_repeats = args.n_repeats
@@ -402,6 +422,8 @@ def main(argv=None) -> int:
         for dataset_id, thresholds in SCORE_THRESHOLDS.items():
             wandb_run.summary[f"reference_mcc/{dataset_id}"] = thresholds["reference"]
             wandb_run.summary[f"acceptable_mcc/{dataset_id}"] = thresholds["acceptable"]
+        wandb_run.summary["meta_policy/repository"] = args.hf_meta_policy_repo
+        wandb_run.summary["meta_policy/persistent_best_validation_mcc"] = best_validation
 
     def evaluate(genome, dataset_id):
         key = f"{genome_digest(genome)}:{dataset_id}"
@@ -577,6 +599,30 @@ def main(argv=None) -> int:
                 hidden_size=np.asarray([shape.hidden_size]),
             )
             _atomic_json(args.output_dir / "best_policy.json", record)
+            publication = {
+                **record,
+                "validation_score": float(validation_score),
+                "source_git_commit": os.getenv("BE_LEADERBOARD_GIT_COMMIT", "unknown"),
+                "wandb_run_id": run_metadata["wandb_run_id"],
+                "policy_file": "best_policy.npz",
+            }
+            if not args.no_hf_meta_policy_push:
+                try:
+                    published, previous = publish_policy_if_improved(
+                        args.output_dir / "best_policy.npz",
+                        publication,
+                        repo_id=args.hf_meta_policy_repo,
+                    )
+                    print(
+                        f"[meta-policy] {'published' if published else 'retained'} "
+                        f"Hub champion; current={validation_score:.6f} previous={previous}",
+                        flush=True,
+                    )
+                except Exception as exc:  # local checkpoint remains authoritative for this run
+                    print(f"[meta-policy] Hugging Face publication failed: {type(exc).__name__}: {exc}", flush=True)
+            if wandb_run is not None:
+                wandb_run.summary["meta_policy/persistent_best_validation_mcc"] = best_validation
+                wandb_run.summary["meta_policy/champion_generation"] = generation
         else:
             stale_generations += 1
 
