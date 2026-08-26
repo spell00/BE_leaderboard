@@ -13,7 +13,7 @@ def test_global_contract():
     text=(ROOT/"scripts/run_global_shared_optuna.py").read_text()
     assert "aggregate_dataset_scores(scores" in text
     assert 'validation_ids != ("massbench_alzheimer",)' in text
-    assert 'importlib.metadata.version("bernn") != "1.0.5"' in text
+    assert 'importlib.metadata.version("bernn") != "1.0.6"' in text
     assert 'run_args.log1p = True' in text
 def test_orchestrator_production_defaults():
     text=(ROOT/"scripts/run_three_arm_experiment.py").read_text()

@@ -273,8 +273,8 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     if args.n_repeats != 3:
         raise ValueError("Meta-evolution requires grouped CV=3")
-    if importlib.metadata.version("bernn") != "1.0.5":
-        raise RuntimeError("This experiment requires bernn==1.0.5")
+    if importlib.metadata.version("bernn") != "1.0.6":
+        raise RuntimeError("This experiment requires bernn==1.0.6")
     if args.generations < 1 or args.validation_patience < 1:
         raise ValueError("generations and validation_patience must be positive")
     partitions = load_dataset_partitions(args.split_manifest)

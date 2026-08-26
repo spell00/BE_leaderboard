@@ -48,8 +48,8 @@ def main(argv=None):
     if args.n_repeats != 3:
         raise ValueError("Global shared HPO requires grouped CV=3")
     if args.n_trials < 1: raise ValueError("n_trials must be positive")
-    if importlib.metadata.version("bernn") != "1.0.5":
-        raise RuntimeError("This experiment requires bernn==1.0.5")
+    if importlib.metadata.version("bernn") != "1.0.6":
+        raise RuntimeError("This experiment requires bernn==1.0.6")
     parts = load_dataset_partitions(args.split_manifest)
     train_ids, validation_ids = tuple(parts.train), tuple(parts.validation)
     if validation_ids != ("massbench_alzheimer",):
@@ -62,7 +62,7 @@ def main(argv=None):
                  "budget_unit":"shared_config_evaluated_on_all_train_datasets",
                  "train_datasets":train_ids, "validation_datasets":validation_ids,
                  "aggregate":"aggregate_dataset_scores", "worst_dataset_weight":args.worst_dataset_weight,
-                 "bernn_version":"1.0.5", "log1p":True, "seed":args.seed,
+                 "bernn_version":"1.0.6", "log1p":True, "seed":args.seed,
                  "wandb_run_id":meta.get("wandb_run_id") or uuid.uuid4().hex[:8]})
     _atomic(meta_path, meta)
     import optuna
