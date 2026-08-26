@@ -8,6 +8,8 @@
   },
   "partitions": {
     "train": [
+      "normal_tissue_878",
+      "colon_3041",
       "massbench_adenocarcinoma",
       "massbench_benchmark"
     ],

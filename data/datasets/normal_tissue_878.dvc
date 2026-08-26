@@ -1,0 +1,6 @@
+outs:
+- md5: 4d62c9662eb412c03070bf01086443ed.dir
+  size: 266769893
+  nfiles: 5
+  hash: md5
+  path: normal_tissue_878

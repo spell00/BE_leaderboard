@@ -8,3 +8,15 @@ __pycache__/
 *.pyo
 *.bak*
 *.launch.log
+
+# Local dataset backups and generated figures
+data/datasets/.pre_reproduction_*/
+/PRC.png
+/ROC.png
+/Precision-Recall.png
+/prc_train_multiclass.png
+/prc_valid_multiclass.png
+/prc_test_multiclass.png
+
+# Reproducible downloaded GEO intermediates (regenerate with preparation scripts)
+/data/geo_batch/
