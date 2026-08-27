@@ -22,7 +22,7 @@ def test_orchestrator_production_defaults():
     assert 'a.n_repeats != 3' in text
 
 
-def test_every_arm_enforces_cv3():
+def test_every_arm_uses_cv3_with_adaptive_grouped_folds():
     expectations = {
         "evolve_meta_model.py": "args.n_repeats != 3",
         "run_optuna_comparison.py": "args.n_repeats != 3",
@@ -33,11 +33,15 @@ def test_every_arm_enforces_cv3():
         assert "default=3" in text
         assert guard in text
     conditional=(ROOT/"scripts/run_optuna_comparison.py").read_text()
+    assert '"massbench_adenocarcinoma": 2' in conditional
     for dataset in (
-        "normal_tissue_878", "colon_3041", "massbench_adenocarcinoma",
+        "normal_tissue_878", "colon_3041",
         "massbench_benchmark", "massbench_alzheimer",
     ):
         assert f'"{dataset}": 3' in conditional
+    hp_search=(ROOT/"scripts/hp_search.py").read_text()
+    assert "min(requested, len(unique_batches))" in hp_search
+    assert "Grouped CV produced an invalid empty fold" in hp_search
 def test_evolution_manifest_without_test_partition():
     text=(ROOT/"scripts/evolve_meta_model.py").read_text()
     assert 'getattr(partitions, "test", ())' in text

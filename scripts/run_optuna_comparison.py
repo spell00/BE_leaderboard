@@ -70,7 +70,7 @@ _THRESHOLD_STATE: dict[str, dict[str, float]] = {}
 DATASET_CV_FOLDS = {
     "normal_tissue_878": 3,
     "colon_3041": 3,
-    "massbench_adenocarcinoma": 3,
+    "massbench_adenocarcinoma": 2,
     "massbench_benchmark": 3,
     "massbench_alzheimer": 3,
 }

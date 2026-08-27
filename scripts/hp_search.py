@@ -579,10 +579,10 @@ def _fit_one(cfg, args, data, exp_id: str, seed: int, keep_models: bool):
 
 
 def resolve_n_repeats(n_repeats: int, batches) -> int:
-    """Resolve -1 to grouped CV capped at five folds."""
+    """Resolve grouped CV without requesting more folds than batch groups."""
     requested = int(n_repeats)
+    unique_batches = np.unique(np.asarray(batches, dtype=str))
     if requested == -1:
-        unique_batches = np.unique(np.asarray(batches, dtype=str))
         if len(unique_batches) < 2:
             raise ValueError(
                 "n_repeats=-1 requires at least 2 unique batch IDs; "
@@ -591,6 +591,8 @@ def resolve_n_repeats(n_repeats: int, batches) -> int:
         return int(min(5, len(unique_batches)))
     if requested < 2:
         raise ValueError("--n-repeats must be -1 or >= 2 for BERNN CV split handling.")
+    if len(unique_batches) > 1:
+        return int(min(requested, len(unique_batches)))
     return requested
 
 
@@ -600,13 +602,13 @@ def cv_splits(y, batches, n_repeats: int):
 
     y = np.asarray(y)
     batches = np.asarray(batches)
+    resolved_n_repeats = resolve_n_repeats(n_repeats, batches)
     if int(n_repeats) == -1:
-        resolved_n_repeats = resolve_n_repeats(n_repeats, batches)
         splitter = StratifiedGroupKFold(n_splits=resolved_n_repeats, shuffle=True, random_state=0)
         yield from splitter.split(np.zeros(len(y)), y, batches)
         return
     if len(np.unique(batches)) > 1:
-        splitter = StratifiedGroupKFold(n_splits=n_repeats, shuffle=True, random_state=0)
+        splitter = StratifiedGroupKFold(n_splits=resolved_n_repeats, shuffle=True, random_state=0)
         yield from splitter.split(np.zeros(len(y)), y, batches)
     else:
         splitter = StratifiedKFold(n_splits=n_repeats, shuffle=True, random_state=0)
@@ -622,19 +624,36 @@ def cached_cv_splits(y, batches, n_repeats: int, cache_path=None):
     digest.update(b"\x00")
     digest.update("\x1f".join(batches).encode())
     fingerprint = digest.hexdigest()
+    resolved_n_repeats = resolve_n_repeats(n_repeats, batches)
     path = Path(cache_path) if cache_path else None
     if path is not None and path.exists():
         try:
             with np.load(path, allow_pickle=False) as payload:
-                if str(payload["fingerprint"].item()) == fingerprint and int(payload["n_repeats"].item()) == int(n_repeats):
+                if (
+                    str(payload["fingerprint"].item()) == fingerprint
+                    and int(payload["n_repeats"].item()) == int(n_repeats)
+                    and int(payload["resolved_n_repeats"].item()) == resolved_n_repeats
+                ):
                     count = int(payload["count"].item())
-                    return [(payload[f"train_{i}"].copy(), payload[f"valid_{i}"].copy()) for i in range(count)]
+                    splits = [(payload[f"train_{i}"].copy(), payload[f"valid_{i}"].copy()) for i in range(count)]
+                    if count == resolved_n_repeats and all(len(train) and len(valid) for train, valid in splits):
+                        return splits
         except Exception:
             pass
     splits = [(np.asarray(train, dtype=int), np.asarray(valid, dtype=int)) for train, valid in cv_splits(y, batches, n_repeats)]
+    if len(splits) != resolved_n_repeats or any(not len(train) or not len(valid) for train, valid in splits):
+        raise ValueError(
+            "Grouped CV produced an invalid empty fold: "
+            f"requested={n_repeats}, resolved={resolved_n_repeats}."
+        )
     if path is not None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        fields = {"fingerprint": np.asarray(fingerprint), "n_repeats": np.asarray(int(n_repeats)), "count": np.asarray(len(splits))}
+        fields = {
+            "fingerprint": np.asarray(fingerprint),
+            "n_repeats": np.asarray(int(n_repeats)),
+            "resolved_n_repeats": np.asarray(resolved_n_repeats),
+            "count": np.asarray(len(splits)),
+        }
         for i, (train, valid) in enumerate(splits):
             fields[f"train_{i}"] = train
             fields[f"valid_{i}"] = valid
