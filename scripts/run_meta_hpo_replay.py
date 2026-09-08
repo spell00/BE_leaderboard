@@ -44,15 +44,8 @@ from src.meta_hpo_bank import (
     source_dataset_ids,
     trials_at_prefix,
 )
-from src.meta_hpo_models import (
-    fit_extra_trees_surrogate,
-    fit_mlp_surrogate,
-    leave_one_dataset_out_surrogate_rmse,
-    optimize_surrogate_tpe,
-    optimize_surrogate_evolution,
-    train_direct_meta_model,
-    train_reinforce_policy,
-)
+from src.meta_hpo_models import fit_extra_trees_surrogate, fit_mlp_surrogate, leave_one_dataset_out_surrogate_rmse, optimize_surrogate_tpe, optimize_surrogate_evolution, train_direct_meta_model, train_reinforce_policy
+from src.meta_leaderboard import update_best
 from src.zero_shot_recommender.meta_features import META_FEATURE_NAMES, extract_meta_features
 
 DATASET_CV_FOLDS = {
@@ -428,6 +421,7 @@ def main(argv=None) -> int:
             "cache_reused": bool(actual.get("cache_reused", False)),
             "extra": extra or {},
         }
+        universal_best, universal_is_best = update_best(args.output_dir.parent / "best_alzheimer.json", score=float(row["actual_valid_mcc"]), strategy=f"meta_replay:{scenario}", trial=validation_counter + 1, config=config, run_name=args.wandb_run_name, output_dir=str(args.output_dir), extra={"source_prefix": int(prefix), "checkpoint_kind": checkpoint_kind, "checkpoint": int(checkpoint), "actual_test_mcc": float(row["actual_test_mcc"])})
         _append_jsonl(results_path, row)
         completed_keys.add(result_key)
         validation_counter += 1
@@ -437,6 +431,7 @@ def main(argv=None) -> int:
             + ("" if predicted_mcc is None else f" predicted={float(predicted_mcc):.4f}"),
             flush=True,
         )
+
         if wandb_run is not None:
             payload = {
                 "validation_index": validation_counter,
@@ -444,6 +439,7 @@ def main(argv=None) -> int:
                 f"{scenario}/actual_alzheimer_valid_mcc": row["actual_valid_mcc"],
                 f"{scenario}/checkpoint": int(checkpoint),
             }
+            payload["leaderboard/best_alzheimer_valid_mcc"] = float(universal_best["score"]); payload["leaderboard/is_current_best"] = int(universal_is_best)
             if predicted_mcc is not None:
                 payload[f"{scenario}/predicted_alzheimer_mcc"] = float(predicted_mcc)
                 payload[f"{scenario}/prediction_error"] = row["surrogate_signed_error"]
@@ -650,6 +646,7 @@ def main(argv=None) -> int:
 
         return 0
     finally:
+
         if wandb_run is not None:
             wandb_run.finish()
 

@@ -8,6 +8,7 @@ from scripts import hp_search
 from src.meta_hpo_utils import sample_bernn_config
 from src.meta_hpo_bank import BankTrial,config_feature_vector
 from src.meta_hpo_models import train_direct_meta_model,normalize_source_meta,_decode_direct
+from src.meta_leaderboard import update_best
 from src.zero_shot_recommender.meta_features import extract_meta_features,META_FEATURE_NAMES
 def payload(t):
  a=dict(t.user_attrs); return {"trial_number":int(t.number),"valid_mcc":float(t.value),"test_mcc":float(a.get("test_mcc",np.nan)),"fit_seconds":float(a.get("fit_seconds",np.nan)),"config":a["config"],"valid_mcc_folds":tuple(a.get("valid_mcc_folds",())),"test_mcc_folds":tuple(a.get("test_mcc_folds",())),"error":a.get("error")}
@@ -46,9 +47,10 @@ def main():
   X,y,b=data[alz]; run=argparse.Namespace(**vars(hp)); run.dataset=alz; run.seed=a.seed+10000+step; run.results_dir=str(a.output_dir/"alzheimer"); run.cv_split_cache=str(a.output_dir/"cv_splits"/"massbench_alzheimer.npz"); run.resolved_n_repeats=hp_search.resolve_n_repeats(run.n_repeats,b)
   try: score,metrics=hp_search.run_trial(alzcfg,run,(X,y,b),f"sync_meta_alzheimer_{step}",fixed_test_data=hp_search.load_fixed_test_dataset(alz))
   except Exception as e: score=-1.; metrics={"error":f"{type(e).__name__}: {e}"}
-  best_alz=max([float(x.get("alzheimer_valid_mcc",-1)) for x in old],default=-1); best_alz=max(best_alz,float(score)); rec={"round":step,"source_trials":[current[d] for d in datasets],"best_source":best,"meta_hidden_size":h,"meta_lr":ml,"benchmark_prediction_error":valerr,"benchmark_reference_config":best[valid_id]["config"],"alzheimer_config":alzcfg,"alzheimer_valid_mcc":float(score),"alzheimer_metrics":metrics,"best_alzheimer_valid_mcc":best_alz}
+  universal_best, universal_is_best = update_best(a.output_dir.parent / "best_alzheimer.json", score=float(score), strategy="synchronized_meta_hpo", trial=step+1, config=alzcfg, run_name=a.wandb_run_name, output_dir=str(a.output_dir), extra={"benchmark_hparam_error": float(valerr)})
+  best_alz=max([float(x.get("alzheimer_valid_mcc",-1)) for x in old],default=-1); best_alz=max(best_alz,float(score)); rec={"round":step,"source_trials":[current[d] for d in datasets],"best_source":best,"meta_hidden_size":h,"meta_lr":ml,"benchmark_prediction_error":valerr,"benchmark_reference_config":best[valid_id]["config"],"alzheimer_config":alzcfg,"alzheimer_valid_mcc":float(score),"alzheimer_metrics":metrics,"best_alzheimer_valid_mcc":best_alz,"leaderboard/best_alzheimer_valid_mcc":float(universal_best["score"]),"leaderboard/is_current_best":int(universal_is_best),"universal_best_alzheimer":universal_best}
   with ledger.open("a") as f: f.write(json.dumps(rec,default=str)+chr(10)); f.flush(); os.fsync(f.fileno())
-  if wr: wr.log({"round":step,"benchmark_hparam_error":valerr,"alzheimer_valid_mcc":float(score),"best_alzheimer_valid_mcc":best_alz,"meta_hidden_size":h,"meta_lr":ml,**{"alzheimer/"+k:v for k,v in alzcfg.items() if isinstance(v,(int,float,bool))}})
+  if wr: wr.log({"round":step,"benchmark_hparam_error":valerr,"alzheimer_valid_mcc":float(score),"best_alzheimer_valid_mcc":best_alz,"leaderboard/best_alzheimer_valid_mcc":float(universal_best["score"]),"leaderboard/is_current_best":int(universal_is_best),"meta_hidden_size":h,"meta_lr":ml,**{"alzheimer/"+k:v for k,v in alzcfg.items() if isinstance(v,(int,float,bool))}})
   print(f"[sync-meta] round={step+1}/{a.n_trials} benchmark_error={valerr:.4f} Alzheimer={float(score):.4f}",flush=True); old.append(rec)
  if wr: wr.finish()
 if __name__=="__main__": main()
