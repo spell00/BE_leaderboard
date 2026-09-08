@@ -20,10 +20,10 @@ def main():
  bt={d:bests[d] for d in train_ids}; base,hist,diag=train_direct_meta_model(bt,norm,meta[alz],max_warmup=max_warmup,hidden_size=a.hidden_size,epochs=a.meta_epochs,lr=1e-2,seed=a.seed)
  zvalid=torch.tensor(((meta[valid]-mean)/scale)[None,:],dtype=torch.float32); zalz=torch.tensor(((meta[alz]-mean)/scale)[None,:],dtype=torch.float32)
  ledger=a.output_dir/"evolution_trials.jsonl"; statep=a.output_dir/"state.json"; modelp=a.output_dir/"best_model.pt"; rows=[json.loads(x) for x in ledger.open()] if a.resume and ledger.exists() else []
- start=len(rows); best_score=max([float(r.get("alzheimer_valid_mcc",-1)) for r in rows],default=-1); stale=0 if not rows else int(json.loads(statep.read_text()).get("stale_trials",0)); best_state=torch.load(modelp,map_location="cpu") if a.resume and modelp.exists() else copy.deepcopy(base.state_dict())
+ start=len(rows); best_score=max([float(r.get("alzheimer_valid_mcc",-1)) for r in rows],default=-1); stale=0 if not rows else int(json.loads(statep.read_text()).get("stale_trials",0)); best_state=torch.load(modelp,map_location="cpu") if a.resume and modelp.exists() else copy.deepcopy(base.model.state_dict())
  import wandb; wr=wandb.init(project=a.wandb_project,name=a.wandb_run_name,config={"protocol":"evolutionary_meta_network_three_source_benchmark_diagnostic_alzheimer_validation","train_datasets":train_ids,"benchmark":valid,"target":alz,"trials":a.trials,"patience":a.patience})
  for step in range(start,a.trials):
-  model=copy.deepcopy(base); model.load_state_dict(best_state)
+  model=copy.deepcopy(base); model.model.load_state_dict(best_state)
   if step>0:
    with torch.no_grad():
     for q in model.parameters(): q.add_(torch.tensor(rng.normal(0,.08,size=tuple(q.shape)),dtype=q.dtype))
@@ -34,7 +34,7 @@ def main():
   try: score,metrics=hp_search.run_trial(cfg,run,(X,y,b),f"meta_evolution_{step}_alzheimer",fixed_test_data=hp_search.load_fixed_test_dataset(alz))
   except Exception as e: score=-1.; metrics={"error":f"{type(e).__name__}: {e}"}
   score=float(score); improved=score>best_score
-  if improved: best_score=score; stale=0; best_state=copy.deepcopy(model.state_dict()); torch.save(best_state,modelp)
+  if improved: best_score=score; stale=0; best_state=copy.deepcopy(model.model.state_dict()); torch.save(best_state,modelp)
   else: stale+=1
   universal_best, universal_is_best = update_best(a.output_dir.parent / "best_alzheimer.json", score=score, strategy="meta_evolution_alzheimer_validation", trial=step+1, config=cfg, run_name=a.wandb_run_name, output_dir=str(a.output_dir), extra={"benchmark_config_error": float(err)})
   rec={"trial":step+1,"benchmark_prediction":pred_b,"benchmark_config_error":err,"alzheimer_config":cfg,"alzheimer_valid_mcc":score,"alzheimer_metrics":metrics,"best_alzheimer_valid_mcc":best_score,"universal_best_alzheimer":universal_best,"stale_trials":stale,"improved":improved}
