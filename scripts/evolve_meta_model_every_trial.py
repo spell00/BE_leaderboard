@@ -32,12 +32,14 @@ from src.evolutionary_meta import (
     initialize_population,
     normalize_meta_features,
     recommended_batch_size,
+    genome_from_config,
 )
 from src.zero_shot_recommender.meta_features import (
     META_FEATURE_NAMES,
     extract_meta_features,
 )
 from src.meta_policy import META_POLICY_REPO, load_policy_metadata, publish_policy_if_improved
+from src.meta_hpo_utils import apply_fixed_categories, load_fixed_categories
 
 SCORE_THRESHOLDS = {
     "massbench_adenocarcinoma": {"reference": 0.24, "acceptable": 0.19},
@@ -58,6 +60,14 @@ def parse_args(argv=None):
              "defaults to population-size * generations and may end mid-generation.",
     )
     parser.add_argument("--hidden-size", type=int, default=16)
+    parser.add_argument(
+        "--fixed-categories-json", type=Path, default=None,
+        help="categorical_consensus.json from the Stage-0 independent Optuna controls.",
+    )
+    parser.add_argument(
+        "--fixed-categories-policy", choices=("robust", "strict"), default="robust",
+        help="Freeze only categorical/discrete consensus knobs; continuous knobs remain evolved.",
+    )
     parser.add_argument("--elite-count", type=int, default=2)
     parser.add_argument("--tournament-size", type=int, default=3)
     parser.add_argument("--crossover-rate", type=float, default=0.9)
@@ -75,6 +85,7 @@ def parse_args(argv=None):
     parser.add_argument("--device", default="cuda", choices=["cpu", "cuda"])
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--seed-bank", type=Path, default=None)
     parser.add_argument("--smoke-evaluator", action="store_true", help="Exercise evolution without training BERNN")
     parser.add_argument("--no-wandb", action="store_true", help="Disable live Weights & Biases telemetry")
     parser.add_argument("--wandb-project", default="BE_leaderboard_meta_evolution")
@@ -370,6 +381,9 @@ def _replay_source_champion(
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    fixed_categories = load_fixed_categories(
+        args.fixed_categories_json, policy=args.fixed_categories_policy
+    )
     if args.n_repeats != 3:
         raise ValueError("Meta-evolution requires grouped CV=3")
     if importlib.metadata.version("bernn") != "1.0.6":
@@ -385,8 +399,9 @@ def main(argv=None) -> int:
         raise ValueError("candidate_budget must be positive")
     partitions = load_dataset_partitions(args.split_manifest)
 
-    # Target datasets provide descriptors for a frozen recommendation only.
-    # Their BERNN scores and fixed tests are never opened by source search.
+    # Validation (Alzheimer) is evaluated after EVERY source candidate for a
+    # learning curve, but its scores never enter source fitness, breeding,
+    # categorical freezing, or champion selection.
     heldout_ids = tuple(getattr(partitions, "test", ()))
     datasets, raw_meta = _load_datasets(partitions.train)
     fixed_tests = {
@@ -398,6 +413,17 @@ def main(argv=None) -> int:
     normalized_train, mean, scale = normalize_meta_features(train_matrix)
     normalized_meta = {
         name: row for name, row in zip(partitions.train, normalized_train)
+    }
+
+    validation_datasets, validation_raw_meta = _load_datasets(partitions.validation)
+    validation_fixed_tests = {
+        dataset_id: hp_search.load_fixed_test_dataset(dataset_id)
+        for dataset_id in partitions.validation
+    }
+    validation_matrix = np.stack([validation_raw_meta[name] for name in partitions.validation])
+    normalized_validation, _, _ = normalize_meta_features(train_matrix, validation_matrix)
+    validation_meta = {
+        name: row for name, row in zip(partitions.validation, normalized_validation)
     }
 
     evolution = EvolutionConfig(
@@ -431,6 +457,8 @@ def main(argv=None) -> int:
             raise ValueError("Policy shape differs from the saved checkpoint")
         if state.get("evolution_config") != config_dict(evolution):
             raise ValueError("Evolution configuration differs from the saved checkpoint")
+        if state.get("fixed_categories", {}) != fixed_categories:
+            raise ValueError("Fixed categorical controls differ from the saved checkpoint")
         saved = np.load(checkpoint_path)
         population = saved["population"]
         generation_start = int(state["next_generation"])
@@ -439,6 +467,17 @@ def main(argv=None) -> int:
         rng.bit_generator.state = state["rng_state"]
     else:
         population = initialize_population(shape, evolution, rng)
+        if args.seed_bank is not None:
+            rows = []
+            with args.seed_bank.open() as fh:
+                for line in fh:
+                    try:
+                        row = json.loads(line)
+                        if row.get("config") and row.get("valid_mcc") is not None: rows.append(row)
+                    except json.JSONDecodeError: pass
+            rows.sort(key=lambda r: float(r.get("valid_mcc", -1)), reverse=True)
+            for i, row in enumerate(rows[:len(population)]): population[i] = genome_from_config(row["config"], shape)
+            print(f"[evolution] seeded {min(len(rows), len(population))} members from bank", flush=True)
 
     hp_args = hp_search.parse_args([])
     hp_args.n_epochs = args.n_epochs
@@ -450,6 +489,7 @@ def main(argv=None) -> int:
     hp_args.combine_test = False
     hp_args.max_warmup = max(1, min(50, args.n_epochs))
     score_cache = {}
+    validation_score_cache = {}
 
     run_metadata_path = args.output_dir / "run_metadata.json"
     if run_metadata_path.exists():
@@ -468,7 +508,11 @@ def main(argv=None) -> int:
         "train_datasets": list(partitions.train),
         "validation_datasets": list(partitions.validation),
         "selection_protocol": "source_only_best_fitness",
-        "target_scores_observed": False,
+        "target_scores_observed": True,
+        "target_scores_role": "monitoring_only_every_source_candidate_excluded_from_fitness_and_selection",
+        "fixed_categories": dict(fixed_categories),
+        "fixed_categories_policy": args.fixed_categories_policy,
+        "continuous_hparams_frozen": False,
         "cross_test": 1,
         "fixed_test_labels": "monitoring_only_excluded_from_fitness_and_selection",
     })
@@ -500,7 +544,8 @@ def main(argv=None) -> int:
             wandb_run.summary[f"reference_mcc/{dataset_id}"] = thresholds["reference"]
             wandb_run.summary[f"acceptable_mcc/{dataset_id}"] = thresholds["acceptable"]
         wandb_run.summary["selection_protocol"] = "source_only_best_fitness"
-        wandb_run.summary["target_scores_observed_after_contract_fix"] = False
+        wandb_run.summary["target_scores_observed_after_contract_fix"] = True
+        wandb_run.summary["target_scores_role"] = "monitoring_only_every_source_candidate"
 
     def evaluate(genome, dataset_id):
         key = f"{genome_digest(genome)}:{dataset_id}"
@@ -513,7 +558,10 @@ def main(argv=None) -> int:
                 score = float(np.tanh(np.mean(genome[: min(len(genome), len(target))]) + np.mean(target) * 1e-4))
             else:
                 X, y, batches = datasets[dataset_id]
-                config = decode_config(genome, normalized_meta[dataset_id], shape, max_warmup=hp_args.max_warmup)
+                config = apply_fixed_categories(
+                    decode_config(genome, normalized_meta[dataset_id], shape, max_warmup=hp_args.max_warmup),
+                    fixed_categories,
+                )
                 run_args = argparse.Namespace(**vars(hp_args))
                 run_args.dataset = dataset_id
                 run_args.seed = args.seed
@@ -535,6 +583,44 @@ def main(argv=None) -> int:
             )
         score_cache[key] = (float(score), metrics)
         return score_cache[key]
+
+    def evaluate_validation(genome, dataset_id):
+        """Evaluate Alzheimer/validation every candidate; never return it to evolution."""
+        key = f"{genome_digest(genome)}:{dataset_id}"
+        if key in validation_score_cache:
+            return validation_score_cache[key]
+        metrics = {}
+        config = apply_fixed_categories(
+            decode_config(genome, validation_meta[dataset_id], shape, max_warmup=hp_args.max_warmup),
+            fixed_categories,
+        )
+        try:
+            if args.smoke_evaluator:
+                target = validation_raw_meta[dataset_id]
+                score = float(np.tanh(np.mean(genome[: min(len(genome), len(target))]) + np.mean(target) * 1e-4))
+            else:
+                X, y, batches = validation_datasets[dataset_id]
+                run_args = argparse.Namespace(**vars(hp_args))
+                run_args.dataset = dataset_id
+                run_args.seed = args.seed + 10000
+                run_args.bs = recommended_batch_size(batches, cap=hp_args.bs)
+                run_args.results_dir = str(args.output_dir / "validation" / dataset_id)
+                run_args.cv_split_cache = str(args.output_dir / "cv_splits" / f"{dataset_id}.npz")
+                run_args.resolved_n_repeats = hp_search.resolve_n_repeats(run_args.n_repeats, batches)
+                exp_id = f"meta_evolution_validation_{dataset_id}_{genome_digest(genome)[:12]}"
+                score, metrics = hp_search.run_trial(
+                    config, run_args, (X, y, batches), exp_id,
+                    fixed_test_data=validation_fixed_tests[dataset_id],
+                )
+        except Exception as exc:  # monitoring failure must not change source fitness
+            score = -1.0
+            print(
+                f"[evolution] validation failed genome={genome_digest(genome)[:12]} "
+                f"dataset={dataset_id}: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+        validation_score_cache[key] = (float(score), metrics, config)
+        return validation_score_cache[key]
 
     replayed = _replay_source_champion(args.output_dir, shape, evolution, args.seed)
     if replayed is not None:
@@ -569,6 +655,7 @@ def main(argv=None) -> int:
             "development_manifest_sha256": manifest_hash,
             "policy_shape": {"n_inputs": shape.n_inputs, "hidden_size": shape.hidden_size},
             "evolution_config": config_dict(evolution),
+            "fixed_categories": dict(fixed_categories),
             "train_datasets": list(partitions.train),
             "validation_datasets": list(partitions.validation),
             "heldout_datasets": list(heldout_ids),
@@ -605,7 +692,10 @@ def main(argv=None) -> int:
             train_scores[population_index] = scores
             train_fitness[population_index] = fitness
             decoded = {
-                name: decode_config(genome, normalized_meta[name], shape, max_warmup=hp_args.max_warmup)
+                name: apply_fixed_categories(
+                    decode_config(genome, normalized_meta[name], shape, max_warmup=hp_args.max_warmup),
+                    fixed_categories,
+                )
                 for name in partitions.train
             }
             solution_record = {
@@ -633,6 +723,34 @@ def main(argv=None) -> int:
                 score_history[dataset_id].append((
                     solution_step, float(score), solution_record["test_scores"][dataset_id],
                 ))
+
+            # Mandatory real validation update at EVERY source candidate.
+            validation_results = {
+                name: evaluate_validation(genome, name) for name in partitions.validation
+            }
+            solution_record["validation_scores"] = {
+                name: float(result[0]) for name, result in validation_results.items()
+            }
+            solution_record["validation_test_scores"] = {
+                name: float(result[1].get("test_mcc", np.nan))
+                for name, result in validation_results.items()
+            }
+            solution_record["validation_configs"] = {
+                name: result[2] for name, result in validation_results.items()
+            }
+            solution_record["target_scores_observed"] = True
+            solution_record["target_scores_used_for_selection"] = False
+            with (args.output_dir / "validation_solutions.jsonl").open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps({
+                    "solution_step": solution_step,
+                    "generation": generation,
+                    "population_index": population_index,
+                    "genome_digest": genome_digest(genome),
+                    "validation_scores": solution_record["validation_scores"],
+                    "validation_test_scores": solution_record["validation_test_scores"],
+                    "validation_configs": solution_record["validation_configs"],
+                    "used_for_source_fitness_or_selection": False,
+                }, default=str) + "\n")
             _append_solution_record(args.output_dir, solution_record, list(partitions.train))
 
             if fitness > best_train_fitness:
@@ -676,10 +794,22 @@ def main(argv=None) -> int:
                         for name in partitions.train
                     },
                     "solutions/total_test_mcc": solution_record["total_test_mcc"],
+                    **{
+                        f"validation/{name}/valid_mcc": solution_record["validation_scores"][name]
+                        for name in partitions.validation
+                    },
+                    **{
+                        f"validation/{name}/test_mcc": solution_record["validation_test_scores"][name]
+                        for name in partitions.validation
+                    },
                     **config_telemetry,
                     **figure_telemetry,
                 })
-            print(f"[evolution] source solution {solution_step} complete", flush=True)
+            print(
+                f"[evolution] source solution {solution_step} complete; "
+                f"validation={solution_record['validation_scores']}",
+                flush=True,
+            )
             solution_step += 1
 
         evaluated = int(np.isfinite(train_fitness).sum())
@@ -699,7 +829,8 @@ def main(argv=None) -> int:
             "train_champion_fitness": float(train_fitness[champion_index]),
             "train_scores": dict(zip(partitions.train, train_scores[champion_index].tolist())),
             "champion_digest": genome_digest(population[champion_index]),
-            "target_scores_observed": False,
+            "target_scores_observed": True,
+            "target_scores_used_for_selection": False,
         }
         with ledger.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(source_record, default=str) + "\n")
@@ -717,16 +848,13 @@ def main(argv=None) -> int:
         raise FileNotFoundError("Source-only evolution did not produce best_policy.npz")
     best_policy = np.load(best_policy_path)
     best_genome = best_policy["genome"]
-    _, target_raw_meta = _load_datasets(partitions.validation)
-    target_matrix = np.stack([target_raw_meta[name] for name in partitions.validation])
-    normalized_targets, _, _ = normalize_meta_features(train_matrix, target_matrix)
-    target_meta = {
-        name: row for name, row in zip(partitions.validation, normalized_targets)
-    }
     target_configs = {
-        name: decode_config(
-            best_genome, target_meta[name], shape,
-            max_warmup=hp_args.max_warmup,
+        name: apply_fixed_categories(
+            decode_config(
+                best_genome, validation_meta[name], shape,
+                max_warmup=hp_args.max_warmup,
+            ),
+            fixed_categories,
         )
         for name in partitions.validation
     }
@@ -734,7 +862,9 @@ def main(argv=None) -> int:
         "selection_protocol": "source_only_best_fitness",
         "source_candidates": int(solution_step),
         "source_best_train_fitness": float(best_train_fitness),
-        "target_scores_observed": False,
+        "target_scores_observed": True,
+        "target_scores_used_for_selection": False,
+        "fixed_categories": dict(fixed_categories),
         "policy": best_policy_path.name,
         "policy_digest": genome_digest(best_genome),
         "target_configs": target_configs,

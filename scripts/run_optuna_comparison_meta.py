@@ -58,6 +58,7 @@ from scripts.evolve_meta_model import (
 )
 from src.dataset_splits import load_dataset_partitions
 from src.evolutionary_meta import aggregate_dataset_scores, recommended_batch_size
+from src.meta_hpo_utils import apply_fixed_categories, load_fixed_categories, sample_bernn_config
 from src.zero_shot_recommender.meta_features import (
     META_FEATURE_NAMES,
     extract_meta_features,
@@ -373,9 +374,17 @@ def parse_args(argv=None):
     parser.add_argument("--meta-hidden-size", type=int, default=64)
     parser.add_argument("--meta-epochs", type=int, default=1000)
     parser.add_argument(
+        "--fixed-categories-json", type=Path, default=None,
+        help="categorical_consensus.json from the completed Stage-0 independent Optuna control run.",
+    )
+    parser.add_argument(
+        "--fixed-categories-policy", choices=("robust", "strict"), default="robust",
+        help="Which consensus block to freeze. Continuous hyperparameters are never frozen.",
+    )
+    parser.add_argument(
         "--validation-eval-policy",
         choices=("never", "on-source-improvement", "every-trial"),
-        default="never",
+        default="every-trial",
         help=(
             "When to fit the held-out validation dataset with meta-predicted "
             "hyperparameters. Validation scores never update Optuna or the meta-model."
@@ -633,7 +642,12 @@ def _fit_joint_meta_model(studies, datasets, validation_datasets, args):
     model.eval()
     with torch.no_grad():
         predictions = model(torch.tensor(valid_meta, dtype=torch.float32)).cpu().numpy()
-    configs = {name: _decode_config(row, max_warmup) for name, row in zip(validation_ids, predictions)}
+    configs = {
+        name: apply_fixed_categories(
+            _decode_config(row, max_warmup), getattr(args, "fixed_categories", {})
+        )
+        for name, row in zip(validation_ids, predictions)
+    }
     diagnostics = {
         "meta_train_loss": final_loss,
         "source_best_scores": {name: source_best[name]["valid_mcc"] for name in source_ids},
@@ -689,6 +703,14 @@ def _append_solution(output_dir: Path, record: dict, dataset_ids: tuple[str, ...
 def _main(argv=None) -> int:
     global _ACTIVE_STORAGE, _ACTIVE_WANDB_RUN
     args = parse_args(argv)
+    args.fixed_categories = load_fixed_categories(
+        args.fixed_categories_json, policy=args.fixed_categories_policy
+    )
+    if args.validation_eval_policy != "every-trial":
+        raise ValueError(
+            "This scenario contract requires --validation-eval-policy every-trial "
+            "so Alzheimer is updated after every source solution step."
+        )
     if args.n_repeats != 3:
         raise ValueError("Dataset-conditional meta-learning requires grouped CV=3")
     if args.n_trials < 1:
@@ -708,6 +730,10 @@ def _main(argv=None) -> int:
         had_persisted_wandb_id = bool(metadata.get("wandb_run_id"))
         if not args.resume:
             raise FileExistsError(f"{args.output_dir} already contains a run; pass --resume")
+        if metadata.get("fixed_categories", {}) != dict(args.fixed_categories):
+            raise ValueError(
+                "Cannot resume with different fixed categorical controls; use a fresh output directory."
+            )
     else:
         metadata = {
             "created_at_unix": time.time(),
@@ -726,6 +752,9 @@ def _main(argv=None) -> int:
         "budget_unit": "solution_step_one_trial_per_train_dataset",
         "per_dataset_trial_budget": int(args.n_trials),
         "validation_eval_policy": args.validation_eval_policy,
+        "fixed_categories": dict(args.fixed_categories),
+        "fixed_categories_policy": args.fixed_categories_policy,
+        "continuous_hparams_frozen": False,
         "total_train_dataset_fits": int(args.n_trials * len(load_dataset_partitions(args.split_manifest).train)),
         "repo_root": str(repo_root),
         "git_head": git_info["head"],
@@ -830,7 +859,8 @@ def _main(argv=None) -> int:
                 "log1p_mode": args.log1p_mode,
                 "train_datasets": list(dataset_ids),
                 "validation_datasets": list(validation_ids),
-                "method": "joint_meta_hpo_from_scratch_validation",
+                "method": "joint_meta_hpo_from_scratch_validation_categorical_pruned",
+                "fixed_categories": dict(args.fixed_categories),
                 "validation_initialization": "from_scratch",
                 "preprocessing/log1p": True,
                 "cross_test": 1,
@@ -868,6 +898,7 @@ def _main(argv=None) -> int:
     print(
         "[optuna-comparison] Independent TPE studies optimize grouped-CV valid_mcc only; "
         "fixed cross-test features are included transductively and test_mcc is monitoring-only. "
+        f"Frozen categorical controls={args.fixed_categories}; continuous knobs remain searchable. "
         "The studies provide targets "
         "for ONE joint meta-model across all partitions.train datasets. The joint "
         "model predicts hparams for partitions.validation, where BERNN is initialized "
@@ -961,7 +992,7 @@ def _main(argv=None) -> int:
                 hp_args.cv_split_cache = str(
                     args.output_dir / "cv_splits" / f"{dataset_id}.npz"
                 )
-                config = hp_search.sample_config(trial, hp_args)
+                config = sample_bernn_config(trial, hp_args, args.fixed_categories)
                 config.update({
                     "batch_size": int(hp_args.bs),
                     "cv_folds": int(hp_args.resolved_n_repeats),

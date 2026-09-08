@@ -63,16 +63,20 @@ def main(argv=None):
                  "train_datasets":train_ids, "validation_datasets":validation_ids,
                  "aggregate":"aggregate_dataset_scores", "worst_dataset_weight":args.worst_dataset_weight,
                  "bernn_version":"1.0.6", "log1p":True, "seed":args.seed,
+                 "cross_test":1, "fixed_test_labels":"monitoring_only_excluded_from_selection",
                  "wandb_run_id":meta.get("wandb_run_id") or uuid.uuid4().hex[:8]})
     _atomic(meta_path, meta)
     import optuna
     storage = f"sqlite:///{(args.output_dir / 'optuna.sqlite3').resolve()}"
     study = optuna.create_study(study_name="global_shared", direction="maximize",
         sampler=optuna.samplers.TPESampler(seed=args.seed), storage=storage, load_if_exists=True)
+    if args.resume:
+        for trial in study.get_trials(deepcopy=False):
+            if trial.state == optuna.trial.TrialState.RUNNING:
+                study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
+                print(f"[global-shared] marked interrupted trial {trial.number} FAIL before resume", flush=True)
     datasets = {} if args.smoke else {d: hp_search.load_dataset(d) for d in train_ids}
-    fixed = {} if args.smoke else {d: hp_search.load_fixed_test_dataset(d) for d in train_ids}
-    validation = {} if args.smoke else {d: hp_search.load_dataset(d) for d in validation_ids}
-    validation_fixed = {} if args.smoke else {d: hp_search.load_fixed_test_dataset(d) for d in validation_ids}
+    fixed_tests = {} if args.smoke else {d: hp_search.load_fixed_test_dataset(d) for d in train_ids}
     wandb_run = None
     if not args.no_wandb:
         import wandb
@@ -103,44 +107,46 @@ def main(argv=None):
                            num_workers=args.num_workers, lisi_enabled=False)
                 try:
                     score,metrics=hp_search.run_trial(cfg,run_args,datasets[dataset_id],
-                        f"global_shared_{meta['wandb_run_id']}_{trial.number}_{dataset_id}",fixed_test_data=fixed[dataset_id])
+                        f"global_shared_{meta['wandb_run_id']}_{trial.number}_{dataset_id}",
+                        fixed_test_data=fixed_tests[dataset_id])
                 except Exception as exc:
                     score,metrics=-1.0,{"error":f"{type(exc).__name__}: {exc}"}
             score=float(score); scores.append(score)
             rows[dataset_id]={"valid_mcc":score,"test_mcc":float(metrics.get("test_mcc",np.nan)),
                               "fold_scores":_fold_scores_payload(metrics)}
         fitness=aggregate_dataset_scores(scores,args.worst_dataset_weight)
+        test_scores=[rows[dataset_id]["test_mcc"] for dataset_id in train_ids]
+        aggregate_test_mcc=(aggregate_dataset_scores(test_scores,args.worst_dataset_weight)
+                            if np.isfinite(test_scores).all() else np.nan)
         trial.set_user_attr("config",config); trial.set_user_attr("datasets",rows)
         study.tell(trial,fitness)
         best_config = dict(study.best_trial.user_attrs["config"])
-        validation_rows = {}
-        for i, dataset_id in enumerate(validation_ids):
-            if args.smoke:
-                valid_score, valid_metrics = 0.0, {}
-            else:
-                X,y,batches = validation[dataset_id]
-                run_args = hp_search.parse_args([])
-                run_args.dataset, run_args.n_epochs = dataset_id, args.n_epochs
-                run_args.n_repeats, run_args.resolved_n_repeats = _dataset_cv_settings(dataset_id,args.n_repeats,batches)
-                run_args.num_workers, run_args.device, run_args.seed = args.num_workers,args.device,args.seed+10000+i
-                run_args.no_wandb, run_args.combine_test, run_args.log1p = True,False,True
-                run_args.max_warmup=max(1,min(50,args.n_epochs)); run_args.bs=recommended_batch_size(batches,cap=args.batch_size)
-                run_args.cv_split_cache = str(args.output_dir/"cv_splits"/f"{dataset_id}.npz")
-                cfg=dict(best_config,batch_size=run_args.bs,cv_folds=run_args.resolved_n_repeats,
-                         num_workers=args.num_workers,lisi_enabled=False)
-                try:
-                    valid_score,valid_metrics=hp_search.run_trial(cfg,run_args,validation[dataset_id],
-                        f"global_shared_validation_{meta['wandb_run_id']}_{trial.number}_{dataset_id}",
-                        fixed_test_data=validation_fixed[dataset_id])
-                except Exception as exc:
-                    valid_score,valid_metrics=-1.0,{"error":f"{type(exc).__name__}: {exc}"}
-            validation_rows[dataset_id]={"valid_mcc":float(valid_score),
-                "test_mcc":float(valid_metrics.get("test_mcc",np.nan)),"fold_scores":_fold_scores_payload(valid_metrics)}
         record={"candidate_index":step,"trial_number":trial.number,"aggregate_valid_mcc":fitness,
-                "config":config,"datasets":rows,"validation":validation_rows,
-                "validation_uses_current_global_best":True,"monitoring_only_fixed_test":True}
+                "aggregate_test_mcc":aggregate_test_mcc,"config":config,"datasets":rows,
+                "test_mcc_role":"monitoring_only_excluded_from_selection",
+                "target_scores_observed":False}
         with (args.output_dir/"trials.jsonl").open("a") as f: f.write(json.dumps(record,default=str)+"\n")
-        if wandb_run: wandb_run.log({"candidate_index":step,"global/aggregate_valid_mcc":fitness})
+        if wandb_run:
+            wandb_run.log({
+                "candidate_index":step,
+                "global/aggregate_valid_mcc":fitness,
+                "global/aggregate_test_mcc":aggregate_test_mcc,
+                **{f"global/{dataset_id}/valid_mcc":rows[dataset_id]["valid_mcc"] for dataset_id in train_ids},
+                **{f"global/{dataset_id}/test_mcc":rows[dataset_id]["test_mcc"] for dataset_id in train_ids},
+            })
+    best_config = dict(study.best_trial.user_attrs["config"])
+    recommendation = {
+        "selection_protocol": "source_only_final_budget",
+        "source_candidates": int(args.n_trials),
+        "target_scores_observed": False,
+        "source_best_trial_number": int(study.best_trial.number),
+        "source_best_aggregate_valid_mcc": float(study.best_value),
+        "target_configs": {dataset_id: best_config for dataset_id in validation_ids},
+    }
+    _atomic(args.output_dir/"final_recommendations.json", recommendation)
+    if wandb_run:
+        wandb_run.summary["selection_protocol"] = "source_only_final_budget"
+        wandb_run.summary["target_scores_observed_after_contract_fix"] = False
     if wandb_run: wandb_run.finish()
     return 0
 

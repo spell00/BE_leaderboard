@@ -5,9 +5,14 @@ ROOT=Path(__file__).resolve().parents[1]
 def test_orchestrator_budget_and_order():
     text=(ROOT/"scripts/run_three_arm_experiment.py").read_text()
     assert text.index('"meta_evolution"') < text.index('"dataset_conditional"') < text.index('"global_shared"')
-    for token in ('"--population-size","6"','"--generations","5"','"--n-trials","30"'): assert token in text
+    assert '"--candidate-budget",type=int,default=30' in text
+    assert "math.ceil(a.candidate_budget/population_size)" in text
+    assert '"--n-trials",str(a.candidate_budget)' in text
 def test_scripts_parse():
-    for name in ("run_three_arm_experiment.py","run_global_shared_optuna.py"):
+    for name in (
+        "run_three_arm_experiment.py", "run_global_shared_optuna.py",
+        "run_alzheimer_optuna_control.py", "evaluate_alzheimer_final_once.py",
+    ):
         ast.parse((ROOT/"scripts"/name).read_text())
 def test_global_contract():
     text=(ROOT/"scripts/run_global_shared_optuna.py").read_text()
@@ -15,6 +20,9 @@ def test_global_contract():
     assert 'validation_ids != ("massbench_alzheimer",)' in text
     assert 'importlib.metadata.version("bernn") != "1.0.6"' in text
     assert 'run_args.log1p = True' in text
+    assert "fixed_test_data=fixed_tests[dataset_id]" in text
+    assert '"cross_test":1' in text
+    assert '"target_scores_observed":False' in text
 def test_orchestrator_production_defaults():
     text=(ROOT/"scripts/run_three_arm_experiment.py").read_text()
     assert 'default=1000' in text and 'default=4' in text
@@ -52,10 +60,68 @@ def test_resume_requires_arm_specific_artifacts():
     assert 'rec["status"]=="running"' not in text
 
 
+def test_target_scores_do_not_enter_search_or_selection():
+    evolution=(ROOT/"scripts/evolve_meta_model.py").read_text()
+    conditional=(ROOT/"scripts/run_optuna_comparison.py").read_text()
+    global_shared=(ROOT/"scripts/run_global_shared_optuna.py").read_text()
+    assert "selection_protocol\": \"source_only_best_fitness" in evolution
+    assert "validation_results = [evaluate(champion" not in evolution
+    assert 'choices=("never", "on-source-improvement", "every-trial")' in conditional
+    assert 'args.validation_eval_policy == "every-trial"' in conditional
+    assert "joint_meta_validation_" in conditional
+    validation_block = conditional[conditional.index("should_validate = ("):]
+    assert "study.tell" not in validation_block
+    assert "global_shared_validation_" not in global_shared
+    for text in (evolution, conditional, global_shared):
+        assert "final_recommendations.json" in text
+
+
+def test_orchestrator_forwards_validation_policy():
+    text=(ROOT/"scripts/run_three_arm_experiment.py").read_text()
+    assert '"--validation-eval-policy", a.validation_eval_policy' in text
+    assert 'default="never"' in text
+
+
+def test_alzheimer_control_reports_monitoring_only_fixed_test():
+    text=(ROOT/"scripts/run_alzheimer_optuna_control.py").read_text()
+    assert "massbench_alzheimer" in text
+    assert "fixed_test_data=fixed_test" in text
+    assert "load_fixed_test_dataset" in text
+    assert "monitoring_only_excluded_from_selection" in text
+    final=(ROOT/"scripts/evaluate_alzheimer_final_once.py").read_text()
+    assert "--confirm-final-test" in final
+    assert "FINAL_TEST_OPENED.json" in final
+    assert "load_fixed_test_dataset" in final
+
+
+def test_evolution_exact_budget_can_resume_mid_generation():
+    text=(ROOT/"scripts/evolve_meta_model.py").read_text()
+    assert '"--candidate-budget"' in text
+    assert "if solution_step >= candidate_budget" in text
+    assert "Generation {generation} durable records are not a contiguous prefix" in text
+    assert "_replay_source_champion" in text
+
+
 def test_fixed_test_labels_never_enter_bernn_fit():
     text=(ROOT/"scripts/hp_search.py").read_text()
     assert 'fit_kwargs["y_test"]' not in text
     assert "X_fixed.copy(),\n                None," in text
+
+
+def test_every_search_arm_uses_monitoring_only_cross_test():
+    hp=(ROOT/"scripts/hp_search.py").read_text()
+    assert '"cross_test": bool(X_test is not None)' in hp
+    assert 'f"cross_test={int(X_fixed is not None)} "' in hp
+    assert "fold_args.trainer_n_repeats = 1" in hp
+    expectations = {
+        "evolve_meta_model.py": "fixed_test_data=fixed_tests[dataset_id]",
+        "run_optuna_comparison.py": "fixed_test_data=fixed_tests[dataset_id]",
+        "run_global_shared_optuna.py": "fixed_test_data=fixed_tests[dataset_id]",
+    }
+    for filename, token in expectations.items():
+        text=(ROOT/"scripts"/filename).read_text()
+        assert token in text
+        assert "monitoring_only_excluded_from" in text
 
 
 def test_fixed_test_is_scored_and_reported_after_cv():

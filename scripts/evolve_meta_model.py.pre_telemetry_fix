@@ -655,18 +655,11 @@ def main(argv=None) -> int:
                 config_telemetry = {}
                 for dataset_id, dataset_config in decoded.items():
                     config_telemetry.update(_numeric_config_telemetry(dataset_id, dataset_config))
-                figure_telemetry = {
-                    f"solutions/mcc/{dataset_id}": _score_figure(
-                        dataset_id, score_history[dataset_id]
-                    )
-                    for dataset_id in partitions.train
-                }
                 wandb_run.log({
                     "solution_step": solution_step,
                     "solutions/train_fitness": float(fitness),
                     "solutions/mean_mcc": float(np.mean(scores)),
                     "solutions/worst_mcc": float(np.min(scores)),
-                    "solutions/total_valid_mcc": solution_record["total_valid_mcc"],
                     **{
                         f"solutions/metrics/{name}/valid_mcc": float(score)
                         for name, score in zip(partitions.train, scores)
@@ -677,7 +670,6 @@ def main(argv=None) -> int:
                     },
                     "solutions/total_test_mcc": solution_record["total_test_mcc"],
                     **config_telemetry,
-                    **figure_telemetry,
                 })
             print(f"[evolution] source solution {solution_step} complete", flush=True)
             solution_step += 1

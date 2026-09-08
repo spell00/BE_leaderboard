@@ -269,9 +269,13 @@ def build_trainer_config(cfg: dict, args, exp_id: str):
         update_grid=bool(cfg["kan"]),  # KAN-only; enabling with MLP crashes bernn
         groupkfold=True,
         n_epochs=int(args.n_epochs),
-        # BERNN itself uses n_repeats as split count/retry state; hp_search adds
-        # an outer CV wrapper and passes the resolved fold count through.
-        n_repeats=int(getattr(args, "resolved_n_repeats", args.n_repeats)),
+        # hp_search owns the outer CV loop.  BERNN's cross_test=True path also
+        # interprets n_repeats as an internal fit loop, so external folds set
+        # trainer_n_repeats=1 to ensure one BERNN fit per explicit fold.
+        n_repeats=int(getattr(
+            args, "trainer_n_repeats",
+            getattr(args, "resolved_n_repeats", args.n_repeats),
+        )),
         bs=int(args.bs),
         num_workers=int(getattr(args, "num_workers", 0)),
         device=args.device,
@@ -520,7 +524,10 @@ def _fit_one(cfg, args, data, exp_id: str, seed: int, keep_models: bool):
         "groups_train": batches.copy(),
         "params": bernn_params_from_cfg(cfg),
         "cross_validation": False,
-        "cross_test": False,
+        # A supplied external test matrix is the fully transductive cross-test
+        # path.  Its labels stay outside BERNN and are scored after fit, so this
+        # flag changes data coverage only, never optimization/model selection.
+        "cross_test": bool(X_test is not None),
     }
     # The outer CV fold is the real supervised validation set. Passing it into
     # BERNN prevents its sklearn-style fallback from cloning training rows into
@@ -766,6 +773,7 @@ def run_trial(cfg: dict, args, data, exp_id: str, fixed_test_data=None):
         fold_args = argparse.Namespace(**vars(args))
         fold_args.n_repeats = resolved_n_repeats
         fold_args.resolved_n_repeats = resolved_n_repeats
+        fold_args.trainer_n_repeats = 1
         fit_data = (
             fold_data[0],
             fold_data[1],
@@ -786,7 +794,8 @@ def run_trial(cfg: dict, args, data, exp_id: str, fixed_test_data=None):
         print(
             f"[trial split] fold {fold_idx + 1}/{resolved_n_repeats} "
             f"train={len(train_idx)} valid={len(test_idx)} "
-            f"cross_test={0 if X_fixed is None else len(X_fixed)} "
+            f"cross_test={int(X_fixed is not None)} "
+            f"cross_test_samples={0 if X_fixed is None else len(X_fixed)} "
             f"train_batches={sorted(train_batch_values)} "
             f"valid_batches={sorted(valid_batch_values)} "
             f"test_batches={sorted(fixed_batch_values)}",
@@ -856,6 +865,7 @@ def run_trial(cfg: dict, args, data, exp_id: str, fixed_test_data=None):
             flush=True,
         )
     metrics["resolved_n_repeats"] = float(resolved_n_repeats)
+    metrics["cross_test"] = float(fixed_test_data is not None)
     if is_alzheimer:
         metrics["supervised_samples"] = float(len(supervised_indices))
         metrics["pooled_unsupervised_samples"] = float(len(pool_indices))

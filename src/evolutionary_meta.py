@@ -69,6 +69,19 @@ def initialize_population(shape: PolicyShape, config: EvolutionConfig, rng: np.r
     return rng.normal(0.0, scale, size=(config.population_size, shape.genome_size)).astype(np.float32)
 
 
+def genome_from_config(config: dict, shape: PolicyShape) -> np.ndarray:
+    out=np.zeros(shape.n_outputs,dtype=np.float32); c=0
+    out[c+DLOSSES.index(config.get('dloss','no'))]=8; c+=len(DLOSSES)
+    out[c+SCALERS.index(config.get('scaler','standard'))]=8; c+=len(SCALERS)
+    out[c+DEPTHS.index(int(config.get('n_layers',3)))]=8; c+=len(DEPTHS)
+    out[c:c+3]=[8 if config.get('variational') else -8,8 if config.get('class_triplet') else -8,8 if config.get('log1p') else -8]; c+=3
+    def inv(v,lo,hi):
+        x=np.clip((float(v)-lo)/(hi-lo),1e-5,1-1e-5); return float(np.log(x/(1-x)))
+    def il(v,lo,hi): return inv(np.log(max(float(v),lo)),np.log(lo),np.log(hi))
+    out[c:c+12]=[il(config.get('lr',1e-3),1e-4,1e-2),il(config.get('wd',1e-5),1e-6,1e-3),il(config.get('nu',1),1e-4,1e2),inv(config.get('smoothing',.05),0,.2),inv(config.get('margin',1),0,10),inv(config.get('dropout',.2),0,.5),inv(config.get('thres',0),0,.1),inv(config.get('warmup',20),1,50),inv(config.get('layer1',768),512,1024),il(config.get('gamma',.1) or .1,.01,100),il(config.get('beta',.1) or .1,.01,100),il(config.get('class_triplet_w',.1) or .1,1e-4,10)]
+    g=np.zeros(shape.genome_size,dtype=np.float32); g[-shape.n_outputs:]=out; return g
+
+
 def _unpack(genome: np.ndarray, shape: PolicyShape):
     flat = np.asarray(genome, dtype=np.float32)
     if flat.shape != (shape.genome_size,):
