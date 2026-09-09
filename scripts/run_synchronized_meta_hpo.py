@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Synchronized four-dataset HPO with benchmark-selected direct meta-learning."""
-import argparse,json,os,sys,time,uuid
+import argparse,json,os,sys,threading,time,uuid
 from pathlib import Path
 import numpy as np
 ROOT=Path(__file__).resolve().parent.parent; sys.path.insert(0,str(ROOT))
@@ -10,6 +10,42 @@ from src.meta_hpo_bank import BankTrial,config_feature_vector
 from src.meta_hpo_models import train_direct_meta_model,normalize_source_meta,_decode_direct
 from src.meta_leaderboard import update_best
 from src.zero_shot_recommender.meta_features import extract_meta_features,META_FEATURE_NAMES
+
+class WandbHeartbeat:
+    """Keep long BERNN fits visibly alive in W&B between round-level logs."""
+    def __init__(self, run, interval_seconds):
+        self.run = run
+        self.interval_seconds = max(15.0, float(interval_seconds))
+        self.stop_event = threading.Event()
+        self.state_lock = threading.Lock()
+        self.state = {"round": 0, "dataset": "initializing", "phase": "startup"}
+        self.thread = threading.Thread(target=self._loop, name="wandb-heartbeat", daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def update(self, *, round_number, dataset, phase):
+        with self.state_lock:
+            self.state = {"round": int(round_number), "dataset": str(dataset), "phase": str(phase)}
+
+    def _loop(self):
+        while not self.stop_event.wait(self.interval_seconds):
+            with self.state_lock:
+                state = dict(self.state)
+            try:
+                self.run.log({
+                    "runtime/heartbeat_unix": time.time(),
+                    "runtime/active_round": state["round"],
+                    "runtime/active_dataset": state["dataset"],
+                    "runtime/phase": state["phase"],
+                })
+            except Exception as exc:
+                print(f"[wandb-heartbeat] warning: {type(exc).__name__}: {exc}", flush=True)
+
+    def stop(self):
+        self.stop_event.set()
+        self.thread.join(timeout=min(5.0, self.interval_seconds))
+
 def payload(t):
  a=dict(t.user_attrs); return {"trial_number":int(t.number),"valid_mcc":float(t.value),"test_mcc":float(a.get("test_mcc",np.nan)),"fit_seconds":float(a.get("fit_seconds",np.nan)),"config":a["config"],"valid_mcc_folds":tuple(a.get("valid_mcc_folds",())),"test_mcc_folds":tuple(a.get("test_mcc_folds",())),"error":a.get("error")}
 def all_dataset_telemetry(current, best):
@@ -29,7 +65,7 @@ def all_dataset_telemetry(current, best):
     return telemetry
 
 def main():
- p=argparse.ArgumentParser(); p.add_argument("--output-dir",type=Path,required=True); p.add_argument("--n-trials",type=int,default=100); p.add_argument("--n-epochs",type=int,default=1000); p.add_argument("--n-repeats",type=int,default=3); p.add_argument("--batch-size",type=int,default=32); p.add_argument("--num-workers",type=int,default=4); p.add_argument("--device",default="cuda"); p.add_argument("--seed",type=int,default=42); p.add_argument("--resume",action="store_true"); p.add_argument("--no-wandb",action="store_true"); p.add_argument("--wandb-project",default="BE_leaderboard_meta_evolution"); p.add_argument("--wandb-run-name",default="synchronized-meta-hpo-benchmark-selected")
+ p=argparse.ArgumentParser(); p.add_argument("--output-dir",type=Path,required=True); p.add_argument("--n-trials",type=int,default=100); p.add_argument("--n-epochs",type=int,default=1000); p.add_argument("--n-repeats",type=int,default=3); p.add_argument("--batch-size",type=int,default=32); p.add_argument("--num-workers",type=int,default=4); p.add_argument("--device",default="cuda"); p.add_argument("--seed",type=int,default=42); p.add_argument("--resume",action="store_true"); p.add_argument("--no-wandb",action="store_true"); p.add_argument("--wandb-project",default="BE_leaderboard_meta_evolution"); p.add_argument("--wandb-run-name",default="synchronized-meta-hpo-benchmark-selected"); p.add_argument("--wandb-heartbeat-seconds",type=float,default=60.0)
  p.add_argument("--wandb-id",default=None); a=p.parse_args()
  import optuna
  a.output_dir.mkdir(parents=True,exist_ok=True); datasets=("normal_tissue_878","colon_3041","massbench_adenocarcinoma","massbench_benchmark"); train_ids=datasets[:3]; valid_id=datasets[3]; alz="massbench_alzheimer"
@@ -38,10 +74,13 @@ def main():
   f=extract_meta_features(X,y,b); meta[d]=np.asarray([f[n] for n in META_FEATURE_NAMES],dtype=np.float32)
  storage=optuna.storages.RDBStorage(url=f"sqlite:///{(a.output_dir/'optuna.sqlite3').resolve()}"); studies={d:optuna.create_study(study_name="sync_"+d,direction="maximize",sampler=optuna.samplers.TPESampler(seed=a.seed),storage=storage,load_if_exists=True) for d in datasets}
  ledger=a.output_dir/"rounds.jsonl"; old=[json.loads(x) for x in ledger.open()] if a.resume and ledger.exists() else []; done={int(x["round"]) for x in old}; hp=hp_search.parse_args([]); hp.n_epochs=a.n_epochs; hp.n_repeats=a.n_repeats; hp.num_workers=a.num_workers; hp.device=a.device
- import wandb; wr=None if a.no_wandb else wandb.init(project=a.wandb_project,name=a.wandb_run_name,id=a.wandb_id,resume="allow" if a.wandb_id else None,config={"protocol":"synchronized_four_dataset_hpo_benchmark_meta_selection","train_datasets":datasets,"meta_train_datasets":train_ids,"meta_validation_dataset":valid_id,"target_dataset":alz,"n_trials":a.n_trials})
+ import wandb; wr=None if a.no_wandb else wandb.init(project=a.wandb_project,name=a.wandb_run_name,id=a.wandb_id,resume="allow" if a.wandb_id else None,config={"protocol":"synchronized_four_dataset_hpo_benchmark_meta_selection","train_datasets":datasets,"meta_train_datasets":train_ids,"meta_validation_dataset":valid_id,"target_dataset":alz,"n_trials":a.n_trials,"wandb_heartbeat_seconds":a.wandb_heartbeat_seconds})
+ heartbeat = None if wr is None else WandbHeartbeat(wr, a.wandb_heartbeat_seconds)
+ if heartbeat: heartbeat.start()
  for step in range(a.n_trials):
   current={}
   for j,d in enumerate(datasets):
+   if heartbeat: heartbeat.update(round_number=step+1,dataset=d,phase="dataset_hpo")
    complete=[t for t in studies[d].trials if t.state==optuna.trial.TrialState.COMPLETE and t.value is not None]
    if len(complete)<=step:
     t=studies[d].ask(); X,y,b=data[d]; run=argparse.Namespace(**vars(hp)); run.dataset=d; run.seed=a.seed+step*10+j; run.bs=min(a.batch_size,max(1,len(y))); run.results_dir=str(a.output_dir/d); run.cv_split_cache=str(a.output_dir/"cv_splits"/(d+".npz")); run.resolved_n_repeats=hp_search.resolve_n_repeats(run.n_repeats,b)
@@ -52,6 +91,7 @@ def main():
    current[d]=payload(complete[step])
   if step in done: continue
   best={d:max([payload(t) for t in studies[d].trials if t.state==optuna.trial.TrialState.COMPLETE and t.value is not None],key=lambda r:r["valid_mcc"]) for d in datasets}
+  if heartbeat: heartbeat.update(round_number=step+1,dataset=valid_id,phase="meta_model_selection")
   dataset_telemetry = all_dataset_telemetry(current, best)
   source_meta,mean,scale=normalize_source_meta(meta,train_ids); zmeta={d:(meta[d]-mean)/scale for d in (valid_id,alz)}; candidates=[]
   for h,ml in ((32,1e-3),(64,3e-3),(128,1e-2)):
@@ -62,6 +102,7 @@ def main():
    candidates.append((err,h,ml,model,diag))
   valerr,h,ml,model,diag=min(candidates,key=lambda x:x[0]); model.eval()
   with __import__("torch").no_grad(): alzcfg=_decode_direct(model.forward(__import__("torch").tensor(zmeta[alz][None,:],dtype=__import__("torch").float32)),0,max(1,min(50,a.n_epochs)),{})
+  if heartbeat: heartbeat.update(round_number=step+1,dataset=alz,phase="target_evaluation")
   X,y,b=data[alz]; run=argparse.Namespace(**vars(hp)); run.dataset=alz; run.seed=a.seed+10000+step; run.results_dir=str(a.output_dir/"alzheimer"); run.cv_split_cache=str(a.output_dir/"cv_splits"/"massbench_alzheimer.npz"); run.resolved_n_repeats=hp_search.resolve_n_repeats(run.n_repeats,b)
   try: score,metrics=hp_search.run_trial(alzcfg,run,(X,y,b),f"sync_meta_alzheimer_{step}",fixed_test_data=hp_search.load_fixed_test_dataset(alz))
   except Exception as e: score=-1.; metrics={"error":f"{type(e).__name__}: {e}"}
@@ -70,5 +111,6 @@ def main():
   with ledger.open("a") as f: f.write(json.dumps(rec,default=str)+chr(10)); f.flush(); os.fsync(f.fileno())
   if wr: wr.log({"round":step,"benchmark_hparam_error":valerr,"alzheimer_valid_mcc":float(score),"best_alzheimer_valid_mcc":best_alz,"leaderboard/best_alzheimer_valid_mcc":float(universal_best["score"]),"leaderboard/is_current_best":int(universal_is_best),"meta_hidden_size":h,"meta_lr":ml,**dataset_telemetry,**{"alzheimer/"+k:v for k,v in alzcfg.items() if isinstance(v,(int,float,bool))}})
   print(f"[sync-meta] round={step+1}/{a.n_trials} benchmark_error={valerr:.4f} Alzheimer={float(score):.4f}",flush=True); old.append(rec)
+ if heartbeat: heartbeat.stop()
  if wr: wr.finish()
 if __name__=="__main__": main()
