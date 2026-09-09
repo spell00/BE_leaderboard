@@ -39,6 +39,7 @@ from src.zero_shot_recommender.meta_features import (
     extract_meta_features,
 )
 from src.meta_policy import META_POLICY_REPO, load_policy_metadata, publish_policy_if_improved
+from src.meta_leaderboard import update_best
 from src.meta_hpo_utils import apply_fixed_categories, load_fixed_categories
 
 SCORE_THRESHOLDS = {
@@ -738,6 +739,7 @@ def main(argv=None) -> int:
             solution_record["validation_configs"] = {
                 name: result[2] for name, result in validation_results.items()
             }
+            universal_best, universal_is_best = update_best(args.output_dir.parent / "best_alzheimer.json", score=float(next(iter(validation_results.values()))[0]), strategy="evolve_meta_model_every_trial", trial=solution_step + 1, config=next(iter(validation_results.values()))[2], run_name=args.wandb_run_name, output_dir=str(args.output_dir), extra={"generation": generation, "population_index": population_index, "train_fitness": float(fitness)})
             solution_record["target_scores_observed"] = True
             solution_record["target_scores_used_for_selection"] = False
             with (args.output_dir / "validation_solutions.jsonl").open("a", encoding="utf-8") as stream:
@@ -751,6 +753,8 @@ def main(argv=None) -> int:
                     "validation_configs": solution_record["validation_configs"],
                     "used_for_source_fitness_or_selection": False,
                 }, default=str) + "\n")
+            solution_record["universal_best_alzheimer"] = universal_best
+            solution_record["universal_best_is_current"] = bool(universal_is_best)
             _append_solution_record(args.output_dir, solution_record, list(partitions.train))
 
             if fitness > best_train_fitness:
@@ -794,6 +798,8 @@ def main(argv=None) -> int:
                         for name in partitions.train
                     },
                     "solutions/total_test_mcc": solution_record["total_test_mcc"],
+                    "leaderboard/best_alzheimer_valid_mcc": float(universal_best["score"]),
+                    "leaderboard/is_current_best": int(universal_is_best),
                     **{
                         f"validation/{name}/valid_mcc": solution_record["validation_scores"][name]
                         for name in partitions.validation
