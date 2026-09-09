@@ -87,6 +87,7 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--seed-bank", type=Path, default=None)
+    parser.add_argument("--initial-policy", type=Path, default=None, help="Optional saved best_policy.npz used only to seed population member 0; omitted means random initialization.")
     parser.add_argument("--smoke-evaluator", action="store_true", help="Exercise evolution without training BERNN")
     parser.add_argument("--no-wandb", action="store_true", help="Disable live Weights & Biases telemetry")
     parser.add_argument("--wandb-project", default="BE_leaderboard_meta_evolution")
@@ -479,6 +480,18 @@ def main(argv=None) -> int:
             rows.sort(key=lambda r: float(r.get("valid_mcc", -1)), reverse=True)
             for i, row in enumerate(rows[:len(population)]): population[i] = genome_from_config(row["config"], shape)
             print(f"[evolution] seeded {min(len(rows), len(population))} members from bank", flush=True)
+        if args.initial_policy is not None:
+            initial_policy = Path(args.initial_policy)
+            saved_policy = np.load(initial_policy)
+            if "genome" not in saved_policy.files:
+                saved_policy.close()
+                raise ValueError(f"Initial policy {initial_policy} is missing genome")
+            initial_genome = np.asarray(saved_policy["genome"], dtype=np.float32)
+            saved_policy.close()
+            if initial_genome.shape != population[0].shape:
+                raise ValueError(f"Initial policy genome shape {initial_genome.shape} does not match population shape {population[0].shape}")
+            population[0] = initial_genome
+            print(f"[evolution] seeded population member 0 from {initial_policy}", flush=True)
 
     hp_args = hp_search.parse_args([])
     hp_args.n_epochs = args.n_epochs
