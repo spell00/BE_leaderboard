@@ -82,21 +82,28 @@ _ACTIVE_REAL_RUNS: dict[str, dict] = {}
 _ACTIVE_REAL_RUNS_LOCK = threading.Lock()
 
 
-def _launch_port() -> int | None:
+def _launch_options() -> tuple[int | None, str | None]:
+    """Parse app launch overrides while ignoring unrelated Gradio/HF arguments."""
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--port", type=int, default=None)
+    parser.add_argument("--meta-checkpoint", default=None)
     args, _ = parser.parse_known_args()
-    if args.port is not None:
-        return args.port
 
-    env_port = os.environ.get("PORT") or os.environ.get("GRADIO_SERVER_PORT")
-    if not env_port:
-        return None
-    try:
-        return int(env_port)
-    except ValueError:
-        print(f"Ignoring invalid port value: {env_port!r}")
-        return None
+    port = args.port
+    if port is None:
+        env_port = os.environ.get("PORT") or os.environ.get("GRADIO_SERVER_PORT")
+        if env_port:
+            try:
+                port = int(env_port)
+            except ValueError:
+                print(f"Ignoring invalid port value: {env_port!r}")
+
+    checkpoint = args.meta_checkpoint or os.environ.get("BERNN_META_CHECKPOINT")
+    if checkpoint:
+        checkpoint = str(Path(checkpoint).expanduser().resolve())
+        os.environ["BERNN_META_CHECKPOINT"] = checkpoint
+
+    return port, checkpoint
 
 db = DatabaseManager(ROOT / "data" / "leaderboard.db")
 
@@ -1519,9 +1526,11 @@ if __name__ == "__main__":
         "show_error": True,
         "ssr_mode": False,
     }
-    port = _launch_port()
+    port, meta_checkpoint = _launch_options()
     if port is not None:
         launch_kwargs["server_port"] = port
         print(f"Launching Gradio on port {port}")
+    if meta_checkpoint:
+        print(f"Using BERNN meta-network checkpoint: {meta_checkpoint}")
 
     demo.queue(default_concurrency_limit=1).launch(**launch_kwargs)
