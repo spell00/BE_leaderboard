@@ -1362,7 +1362,7 @@ Datasets are ordered by submission date.
                 outputs=[dataset_selector_modal, r_dataset_in, r_board_out, r_dataset_info, r_train_download, r_test_download]
             )
 
-        with gr.TabItem("BERNN Recommender"):
+        with gr.TabItem("BERNN Recommender", render_children=True):
             gr.Markdown("""
 ## Zero-shot BERNN hyperparameter recommender
 
