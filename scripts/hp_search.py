@@ -97,6 +97,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from src.dataset_tasks import (
     ALZHEIMER_DATASET,
     ALZHEIMER_SUPERVISED_LABELS,
@@ -104,10 +108,6 @@ from src.dataset_tasks import (
     alzheimer_supervised_mask,
     prepare_alzheimer_development_labels,
 )
-
-ROOT = Path(__file__).resolve().parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
 
 # Quiet the heavy TF/CUDA/Ax import noise before bernn is imported.
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
