@@ -31,6 +31,8 @@ from src.dataset_tasks import (
     ALZHEIMER_DATASET,
     ALZHEIMER_SUPERVISED_LABELS,
     UNSUPERVISED_LABEL,
+    META_HPO_N_REPEATS,
+    META_HPO_CV_RANDOM_STATE,
     alzheimer_supervised_mask,
     model_labels_for_alzheimer,
     prepare_builtin_training_frame,
@@ -1396,8 +1398,8 @@ def _run_user_model(
     )
 
 
-CV_N_SPLITS = 5
-CV_RANDOM_STATE = 42
+CV_N_SPLITS = META_HPO_N_REPEATS
+CV_RANDOM_STATE = META_HPO_CV_RANDOM_STATE
 
 
 def _aligned_proba_frame(
@@ -1463,9 +1465,10 @@ def _submission_cv_splits(
         if len(supervised_indices) == 0:
             raise CodeValidationError("Alzheimer task has no CU/DEM-AD development rows.")
 
-        if supervised_groups.nunique() >= CV_N_SPLITS:
+        if supervised_groups.nunique() > 1:
+            n_splits = min(CV_N_SPLITS, int(supervised_groups.nunique()))
             splitter = StratifiedGroupKFold(
-                n_splits=CV_N_SPLITS,
+                n_splits=n_splits,
                 shuffle=True,
                 random_state=CV_RANDOM_STATE,
             )
@@ -1478,13 +1481,14 @@ def _submission_cv_splits(
             )
             protocol = (
                 "Alzheimer semi-supervised StratifiedGroupKFold("
-                "n_splits=5, shuffle=True, random_state=42)"
+                f"n_splits={n_splits}, shuffle=True, "
+                f"random_state={CV_RANDOM_STATE})"
             )
         else:
             if int(supervised_labels.value_counts().min()) < CV_N_SPLITS:
                 raise CodeValidationError(
-                    "Five-fold Alzheimer validation requires at least five "
-                    "samples in each supervised class."
+                    f"{CV_N_SPLITS}-fold Alzheimer validation requires at least "
+                    f"{CV_N_SPLITS} samples in each supervised class."
                 )
             splitter = StratifiedKFold(
                 n_splits=CV_N_SPLITS,
@@ -1497,7 +1501,8 @@ def _submission_cv_splits(
             ))
             protocol = (
                 "Alzheimer semi-supervised StratifiedKFold("
-                "n_splits=5, shuffle=True, random_state=42)"
+                f"n_splits={CV_N_SPLITS}, shuffle=True, "
+                f"random_state={CV_RANDOM_STATE})"
             )
 
         expanded_splits: list[tuple[np.ndarray, np.ndarray]] = []
@@ -1523,18 +1528,24 @@ def _submission_cv_splits(
 
         return protocol, expanded_splits
 
-    if groups.nunique() >= CV_N_SPLITS:
+    if groups.nunique() > 1:
+        n_splits = min(CV_N_SPLITS, int(groups.nunique()))
         splitter = StratifiedGroupKFold(
-            n_splits=CV_N_SPLITS,
+            n_splits=n_splits,
             shuffle=True,
             random_state=CV_RANDOM_STATE,
         )
         splits = list(splitter.split(X_train, labels, groups))
-        return "StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)", splits
+        return (
+            f"StratifiedGroupKFold(n_splits={n_splits}, shuffle=True, "
+            f"random_state={CV_RANDOM_STATE})",
+            splits,
+        )
 
     if int(labels.value_counts().min()) < CV_N_SPLITS:
         raise CodeValidationError(
-            "Five-fold validation requires at least five samples in every class."
+            f"{CV_N_SPLITS}-fold validation requires at least "
+            f"{CV_N_SPLITS} samples in every class."
         )
     splitter = StratifiedKFold(
         n_splits=CV_N_SPLITS,
@@ -1542,7 +1553,11 @@ def _submission_cv_splits(
         random_state=CV_RANDOM_STATE,
     )
     splits = list(splitter.split(X_train, labels))
-    return "StratifiedKFold(n_splits=5, shuffle=True, random_state=42)", splits
+    return (
+        f"StratifiedKFold(n_splits={CV_N_SPLITS}, shuffle=True, "
+        f"random_state={CV_RANDOM_STATE})",
+        splits,
+    )
 
 def _cross_validate_submission(
     correction_code: str,
@@ -1570,6 +1585,7 @@ def _cross_validate_submission(
         if is_alzheimer
         else sorted(y_train.astype(str).unique().tolist())
     )
+    n_folds = len(splits)
     print(f"[submission-cv] Protocol: {protocol}")
     from src.baselines import set_bernn_seed
 
@@ -1675,7 +1691,7 @@ def _cross_validate_submission(
             test_proba_folds.append(proba_frame)
         elif fold_test_proba is not None:
             print(
-                f"[submission-cv][fold {fold}/{CV_N_SPLITS}] "
+                f"[submission-cv][fold {fold}/{n_folds}] "
                 "Ignoring predict_proba because its class labels do not align with decoded labels; "
                 "using vote consensus for test predictions if any fold is unsafe."
             )
@@ -1692,7 +1708,7 @@ def _cross_validate_submission(
         }
         fold_details.append(detail)
         print(
-            f"[submission-cv][fold {fold}/{CV_N_SPLITS}] "
+            f"[submission-cv][fold {fold}/{n_folds}] "
             f"validation MCC={fold_mcc:.4f}, "
             f"n_train={len(train_idx)}, n_valid={len(valid_idx)}, "
             f"fixed_test={len(X_test)}"
@@ -1828,7 +1844,11 @@ def run_code_submission(
 
     print(f"[submission-runner] Computed batch effect metrics: {batch_effect_metrics}")
 
-    print(f"[submission-runner] Model predictions completed from {CV_N_SPLITS}-fold ensemble. Number of predictions: {len(preds)}")
+    actual_cv_folds = len(cv_metrics.get("valid_mcc_folds", []))
+    print(
+        f"[submission-runner] Model predictions completed from {actual_cv_folds}-fold "
+        f"ensemble. Number of predictions: {len(preds)}"
+    )
 
     # Hidden labels are loaded only after all submitted code has finished.
     # Align by sample name so task-specific inference subsets remain exact.
@@ -1883,7 +1903,7 @@ def run_code_submission(
     official_test_mcc_now = float(metrics.get("test_mcc", metrics.get("mcc", 0.0)))
     print(
         f"[submission-test] Official fixed-test ensemble MCC={official_test_mcc_now:.4f} "
-        f"(computed after all {CV_N_SPLITS} folds; hidden y_test is never passed to fit)"
+        f"(computed after all {actual_cv_folds} folds; hidden y_test is never passed to fit)"
     )
     metrics["prediction_unique_labels"] = int(pred_df["prediction"].astype(str).nunique(dropna=False))
     metrics["reference_unique_labels"] = int(reference["prediction"].astype(str).nunique(dropna=False))
