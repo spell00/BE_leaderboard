@@ -207,7 +207,7 @@ def load_datasets_and_meta_features():
     """Load all source/validation/target datasets and compute meta-features."""
     dataset_ids = DATASETS + (TARGET_DATASET,)
     data = {
-        dataset_id: hp_search.load_dataset(dataset_id)
+        dataset_id: hp_search.load_cyclic_dataset(dataset_id)
         for dataset_id in dataset_ids
     }
 
@@ -250,10 +250,7 @@ def make_run_args(base_hp_args, args, dataset_id, seed, batch_count):
     run.cv_split_cache = str(
         args.output_dir / "cv_splits" / f"{dataset_id}.npz"
     )
-    run.resolved_n_repeats = hp_search.resolve_n_repeats(
-        run.n_repeats,
-        batch_count,
-    )
+    run.resolved_n_repeats = int(len(np.unique(np.asarray(batch_count).astype(str))))
     return run
 
 
@@ -285,12 +282,11 @@ def execute_dataset_trial(
     metrics = {}
 
     try:
-        score, metrics = hp_search.run_trial(
+        score, metrics = hp_search.run_cyclic_batch_trial(
             config,
             run,
             (X, y, batches),
             f"sync_meta_{step}_{dataset_id}",
-            fixed_test_data=hp_search.load_fixed_test_dataset(dataset_id),
         )
     except Exception as exc:
         score = -1.0
@@ -454,12 +450,11 @@ def evaluate_target(
     )
 
     try:
-        score, metrics = hp_search.run_trial(
+        score, metrics = hp_search.run_cyclic_batch_trial(
             target_config,
             run,
             (X, y, batches),
             f"sync_meta_alzheimer_{step}",
-            fixed_test_data=hp_search.load_fixed_test_dataset(TARGET_DATASET),
         )
     except Exception as exc:
         score = -1.0
@@ -610,6 +605,7 @@ def main():
                 "meta_lr": learning_rate,
                 "meta_epochs": META_MODEL_EPOCHS,
                 "benchmark_prediction_error": float(validation_error),
+                "evaluation_protocol": "cyclic_train_valid_test_by_batch_v1",
                 "best_source": best,
                 "alzheimer_config": target_config,
                 "training_diagnostics": diagnostics,
