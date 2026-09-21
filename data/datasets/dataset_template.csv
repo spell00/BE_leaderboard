@@ -1,0 +1,5 @@
+name,batch,label,feature_1,feature_2
+sample_001,batch_1,case,12.4,0.82
+sample_002,batch_1,control,10.1,0.77
+sample_003,batch_2,case,13.0,0.91
+sample_004,batch_2,control,9.8,0.73
