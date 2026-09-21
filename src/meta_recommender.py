@@ -56,6 +56,22 @@ def load_recommender(path: str | Path | None = None):
     return _load_cached_checkpoint(str(checkpoint_path))
 
 
+def recommender_evaluation_protocol(
+    checkpoint_path: str | Path | None = None,
+) -> str:
+    """Return the data/evaluation protocol recorded in the selected checkpoint."""
+    _, checkpoint = load_recommender(checkpoint_path)
+    raw = str(
+        checkpoint.get("metadata", {}).get(
+            "evaluation_protocol",
+            "fixed_external_test_v1",
+        )
+    )
+    if raw in {"cyclic_batches", "cyclic_train_valid_test_by_batch_v1"}:
+        return "cyclic_batches"
+    return "fixed_external"
+
+
 def validate_recommender_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """Validate and normalize a dataframe for zero-shot BERNN recommendation."""
     if not isinstance(df, pd.DataFrame) or df.empty:
