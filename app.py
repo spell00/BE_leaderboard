@@ -65,6 +65,11 @@ from src.real_results_store import (
     normalize_real_result_row,
     upload_real_result_rows,
 )
+from src.meta_recommender import (
+    recommend_bernn_config,
+    recommendation_tables,
+    resolve_checkpoint_path,
+)
 
 print(f"Gradio version: {gr.__version__}, Pandas version: {pd.__version__}")
 # print(f"Using SQLite version: {DatabaseManager.get_sqlite_version()}")
@@ -978,6 +983,74 @@ Available preloaded libraries:
     return content
 
 
+
+def _load_recommender_input(dataset: str, uploaded_file) -> tuple[pd.DataFrame, str]:
+    """Load either an uploaded CSV or the selected benchmark training split."""
+    if uploaded_file:
+        path = getattr(uploaded_file, "name", uploaded_file)
+        return pd.read_csv(path), f"uploaded file: {Path(path).name}"
+
+    path = ROOT / "data" / "datasets" / dataset / f"{dataset}_train.csv"
+    if not path.exists():
+        raise FileNotFoundError(f"Training split not found: {path}")
+    return pd.read_csv(path), DATASET_LABELS.get(dataset, dataset)
+
+
+def run_meta_recommendation(dataset: str, uploaded_file):
+    """Run zero-shot BERNN hyperparameter recommendation for the UI."""
+    try:
+        frame, source_name = _load_recommender_input(dataset, uploaded_file)
+        result = recommend_bernn_config(frame)
+        config_table, meta_table = recommendation_tables(result)
+
+        decoded = result["config"]
+        full_config = bernn_config(**decoded)
+        generated_code = build_bernn_code(full_config)
+
+        metadata = result.get("checkpoint_metadata", {})
+        checkpoint_name = Path(result["checkpoint_path"]).name
+        round_number = metadata.get("round")
+        benchmark_error = metadata.get("benchmark_prediction_error")
+
+        details = [
+            f"Recommendation generated for {source_name}.",
+            f"Checkpoint: {checkpoint_name}",
+            f"Input: {len(frame)} samples, {max(len(frame.columns) - 3, 0)} features",
+            f"Meta-features: {len(result.get('meta_features', {}))}",
+        ]
+        if round_number is not None:
+            details.append(f"Checkpoint round: {round_number}")
+        if benchmark_error is not None:
+            details.append(
+                f"Benchmark hyperparameter prediction error: {float(benchmark_error):.4f}"
+            )
+
+        return (
+            config_table,
+            meta_table,
+            "\n".join(details),
+            generated_code,
+        )
+    except Exception as exc:
+        return (
+            pd.DataFrame(columns=["hyperparameter", "value"]),
+            pd.DataFrame(columns=["meta_feature", "value"]),
+            _format_exec_error(exc),
+            "",
+        )
+
+
+def recommender_checkpoint_status() -> str:
+    path = resolve_checkpoint_path()
+    if path.exists():
+        return f"Checkpoint ready: {path}"
+    return (
+        f"Checkpoint not found: {path}\n"
+        "Set BERNN_META_CHECKPOINT to an existing .pt file or copy the selected "
+        "checkpoint to models/meta_bernn/best_meta_model.pt."
+    )
+
+
 with gr.Blocks(title="MassBench Batch Effects Leaderboard") as demo:
     gr.Markdown(f"""
 # MassBench Batch Effects Classification Leaderboard
@@ -1265,6 +1338,79 @@ Datasets are ordered by submission date.
                 fn=confirm_dataset_selection,
                 inputs=[ds_selector_dropdown],
                 outputs=[dataset_selector_modal, r_dataset_in, r_board_out, r_dataset_info, r_train_download, r_test_download]
+            )
+
+        with gr.TabItem("BERNN Recommender"):
+            gr.Markdown("""
+## Zero-shot BERNN hyperparameter recommender
+
+Use the pretrained meta-network to predict a BERNN configuration directly from
+dataset-level statistics. No Optuna search is run here.
+
+Choose an existing benchmark training split, or upload a CSV whose first columns
+include `name`, `batch`, and `label`, followed by numeric feature columns.
+""")
+
+            meta_checkpoint_status = gr.Textbox(
+                label="Meta-network checkpoint",
+                value=recommender_checkpoint_status(),
+                interactive=False,
+                lines=3,
+            )
+
+            with gr.Row():
+                meta_dataset = gr.Dropdown(
+                    choices=[(label, key) for key, label in DATASET_LABELS.items()],
+                    value="massbench_benchmark",
+                    label="Existing dataset",
+                )
+                meta_upload = gr.File(
+                    label="Or upload dataset CSV",
+                    file_types=[".csv"],
+                )
+
+            meta_run = gr.Button(
+                "Recommend BERNN configuration",
+                variant="primary",
+            )
+
+            meta_status = gr.Textbox(
+                label="Recommendation status",
+                interactive=False,
+                lines=6,
+            )
+
+            meta_config = gr.Dataframe(
+                headers=["hyperparameter", "value"],
+                label="Recommended hyperparameters",
+                interactive=False,
+                wrap=True,
+            )
+
+            with gr.Accordion("Dataset meta-features", open=False):
+                meta_features_table = gr.Dataframe(
+                    headers=["meta_feature", "value"],
+                    label="Computed dataset descriptors",
+                    interactive=False,
+                    wrap=True,
+                )
+
+            meta_code = gr.Code(
+                label="Generated BERNN model code",
+                language="python",
+                lines=20,
+            )
+
+            meta_run.click(
+                fn=run_meta_recommendation,
+                inputs=[meta_dataset, meta_upload],
+                outputs=[
+                    meta_config,
+                    meta_features_table,
+                    meta_status,
+                    meta_code,
+                ],
+                api_name="recommend_bernn",
             )
 
         with gr.TabItem("Add a Dataset"):
