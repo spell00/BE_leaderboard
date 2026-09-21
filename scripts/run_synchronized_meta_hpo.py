@@ -117,6 +117,16 @@ def parse_args():
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--evaluation-protocol",
+        choices=("fixed_external", "cyclic_batches"),
+        default="fixed_external",
+        help=(
+            "fixed_external keeps the historical untouched external test split; "
+            "cyclic_batches combines labeled batches and rotates each batch through "
+            "validation and test exactly once."
+        ),
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--no-wandb", action="store_true")
 
@@ -203,11 +213,16 @@ def all_dataset_telemetry(current, best):
     return telemetry
 
 
-def load_datasets_and_meta_features():
-    """Load all source/validation/target datasets and compute meta-features."""
+def load_datasets_and_meta_features(evaluation_protocol: str):
+    """Load datasets using the data universe implied by the evaluation protocol."""
     dataset_ids = DATASETS + (TARGET_DATASET,)
+    loader = (
+        hp_search.load_cyclic_dataset
+        if evaluation_protocol == "cyclic_batches"
+        else hp_search.load_dataset
+    )
     data = {
-        dataset_id: hp_search.load_cyclic_dataset(dataset_id)
+        dataset_id: loader(dataset_id)
         for dataset_id in dataset_ids
     }
 
@@ -250,7 +265,11 @@ def make_run_args(base_hp_args, args, dataset_id, seed, batch_count):
     run.cv_split_cache = str(
         args.output_dir / "cv_splits" / f"{dataset_id}.npz"
     )
-    run.resolved_n_repeats = int(len(np.unique(np.asarray(batch_count).astype(str))))
+    run.resolved_n_repeats = (
+        int(len(np.unique(np.asarray(batch_count).astype(str))))
+        if args.evaluation_protocol == "cyclic_batches"
+        else hp_search.resolve_n_repeats(run.n_repeats, batch_count)
+    )
     return run
 
 
@@ -282,12 +301,21 @@ def execute_dataset_trial(
     metrics = {}
 
     try:
-        score, metrics = hp_search.run_cyclic_batch_trial(
-            config,
-            run,
-            (X, y, batches),
-            f"sync_meta_{step}_{dataset_id}",
-        )
+        if args.evaluation_protocol == "cyclic_batches":
+            score, metrics = hp_search.run_cyclic_batch_trial(
+                config,
+                run,
+                (X, y, batches),
+                f"sync_meta_{step}_{dataset_id}",
+            )
+        else:
+            score, metrics = hp_search.run_trial(
+                config,
+                run,
+                (X, y, batches),
+                f"sync_meta_{step}_{dataset_id}",
+                fixed_test_data=hp_search.load_fixed_test_dataset(dataset_id),
+            )
     except Exception as exc:
         score = -1.0
         error = f"{type(exc).__name__}: {exc}"
@@ -450,12 +478,21 @@ def evaluate_target(
     )
 
     try:
-        score, metrics = hp_search.run_cyclic_batch_trial(
-            target_config,
-            run,
-            (X, y, batches),
-            f"sync_meta_alzheimer_{step}",
-        )
+        if args.evaluation_protocol == "cyclic_batches":
+            score, metrics = hp_search.run_cyclic_batch_trial(
+                target_config,
+                run,
+                (X, y, batches),
+                f"sync_meta_alzheimer_{step}",
+            )
+        else:
+            score, metrics = hp_search.run_trial(
+                target_config,
+                run,
+                (X, y, batches),
+                f"sync_meta_alzheimer_{step}",
+                fixed_test_data=hp_search.load_fixed_test_dataset(TARGET_DATASET),
+            )
     except Exception as exc:
         score = -1.0
         metrics = {"error": f"{type(exc).__name__}: {exc}"}
@@ -475,7 +512,7 @@ def main():
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    data, meta = load_datasets_and_meta_features()
+    data, meta = load_datasets_and_meta_features(args.evaluation_protocol)
     studies = create_studies(args.output_dir, args.seed)
 
     ledger_path = args.output_dir / "rounds.jsonl"
@@ -515,6 +552,7 @@ def main():
                 "meta_validation_dataset": META_VALIDATION_DATASET,
                 "target_dataset": TARGET_DATASET,
                 "n_trials": args.n_trials,
+                "evaluation_protocol": args.evaluation_protocol,
                 "wandb_heartbeat_seconds": args.wandb_heartbeat_seconds,
             },
         )
@@ -605,7 +643,11 @@ def main():
                 "meta_lr": learning_rate,
                 "meta_epochs": META_MODEL_EPOCHS,
                 "benchmark_prediction_error": float(validation_error),
-                "evaluation_protocol": "cyclic_train_valid_test_by_batch_v1",
+                "evaluation_protocol": (
+                    "cyclic_train_valid_test_by_batch_v1"
+                    if args.evaluation_protocol == "cyclic_batches"
+                    else "fixed_external_test_v1"
+                ),
                 "best_source": best,
                 "alzheimer_config": target_config,
                 "training_diagnostics": diagnostics,
