@@ -120,12 +120,21 @@ APP_PORT, APP_META_CHECKPOINT = _launch_options()
 db = DatabaseManager(ROOT / "data" / "leaderboard.db")
 
 DATASET_LABELS = {
+    "normal_tissue_878": "Normal Tissue 878",
+    "colon_3041": "Colon 3041",
     "massbench_adenocarcinoma": "MassBench Adenocarcinoma",
     "massbench_alzheimer": "MassBench Alzheimer",
     "massbench_benchmark": "MassBench Benchmark",
 }
 
 HF_TOKEN_SET = bool(os.getenv("HF_TOKEN"))
+RESEARCH_CYCLIC_ENABLED = (
+    os.getenv(
+        "ENABLE_RESEARCH_CYCLIC",
+        "0" if os.getenv("SPACE_ID") else "1",
+    ).strip().lower()
+    in {"1", "true", "yes", "on"}
+)
 
 DEFAULT_CORRECTION_CODE = BATCH_CORRECTION_EXAMPLES["none"]["code"]
 DEFAULT_MODEL_CODE = MODEL_EXAMPLES["gaussian_nb"]["code"]
@@ -415,6 +424,7 @@ def _run_code_submission_cancellable(
     dataset: str,
     correction_code: str,
     model_code: str,
+    evaluation_protocol: str = "fixed_external",
 ) -> dict:
     with _ACTIVE_REAL_RUNS_LOCK:
         existing = _ACTIVE_REAL_RUNS.get(run_key)
@@ -443,6 +453,7 @@ def _run_code_submission_cancellable(
                         "dataset": dataset,
                         "correction_code": correction_code,
                         "model_code": model_code,
+                        "evaluation_protocol": evaluation_protocol,
                     },
                     fh,
                     protocol=pickle.HIGHEST_PROTOCOL,
@@ -584,9 +595,11 @@ def get_dataset_info(dataset: str) -> str:
 
 # Dataset submission order metadata
 DATASET_SUBMISSION_ORDER = {
-    "massbench_benchmark": 1,
-    "massbench_adenocarcinoma": 2,
-    "massbench_alzheimer": 3,
+    "normal_tissue_878": 1,
+    "colon_3041": 2,
+    "massbench_adenocarcinoma": 3,
+    "massbench_benchmark": 4,
+    "massbench_alzheimer": 5,
 }
 
 def get_dataset_dropdown_choices():
@@ -668,6 +681,7 @@ def submit_real(
     correction_code: str,
     model_code: str,
     custom_pip: str = "",
+    evaluation_protocol: str = "fixed_external",
     profile: gr.OAuthProfile | None = None,
     request: gr.Request | None = None,
 ) -> tuple[pd.DataFrame, str, str]:
@@ -678,6 +692,7 @@ def submit_real(
     correction_code = str(correction_code or "")
     model_code = str(model_code or "")
     custom_pip = str(custom_pip or "")
+    evaluation_protocol = str(evaluation_protocol or "fixed_external")
     print(f"[submission] Received submission from {team.strip() or 'anonymous'} / {model_name.strip() or 'unnamed'} on {dataset}", flush=True)
     if not dataset.strip():
         return get_real_board(dataset), "Dataset is required.", ""
@@ -730,7 +745,14 @@ def submit_real(
 
     print(f"[submission] boarded dataset: {dataset}", flush=True)
 
-    if not HF_TOKEN_SET:
+    if evaluation_protocol == "cyclic_batches" and not RESEARCH_CYCLIC_ENABLED:
+        return _finish(
+            get_real_board(dataset),
+            "Cyclic batch rotation is disabled on this deployment. "
+            "Enable it for local research with ENABLE_RESEARCH_CYCLIC=1.",
+        )
+
+    if evaluation_protocol == "fixed_external" and not HF_TOKEN_SET:
         print(f"[submission] HF_TOKEN is not configured for submission on {dataset}", flush=True)
         return _finish(get_real_board(dataset), "HF_TOKEN is not configured on this Space. The evaluator cannot access private data — contact the organiser.")
 
@@ -744,6 +766,7 @@ def submit_real(
                 dataset=dataset,
                 correction_code=correction_code,
                 model_code=model_code,
+                evaluation_protocol=evaluation_protocol,
             )
         except CodeValidationError as exc:
             return _finish(get_real_board(dataset), f"Submission rejected: {exc}")
@@ -751,6 +774,35 @@ def submit_real(
             return _finish(get_real_board(dataset), str(exc))
 
         print(f"[submission] Code submission completed for {team.strip()} / {model_name.strip()} on {dataset}", flush=True)
+
+        if evaluation_protocol == "cyclic_batches":
+            valid_mcc = float(metrics.get("valid_mcc", -1.0))
+            test_mcc = float(metrics.get("test_mcc", metrics.get("mcc", -1.0)))
+            fold_valid = metrics.get("valid_mcc_folds", [])
+            fold_test = metrics.get("test_mcc_folds", [])
+            msg = (
+                f"Research cyclic batch result on {DATASET_LABELS.get(dataset, dataset)}. "
+                f"Valid MCC={valid_mcc:.4f}, global OOF Test MCC={test_mcc:.4f}, "
+                f"N={metrics.get('n_samples', 0)}. "
+                "This run is not written to the official leaderboard."
+            )
+            if fold_valid:
+                msg += "\n\nRotating batch rounds:"
+                details = metrics.get("valid_fold_details", [])
+                for idx, valid_score in enumerate(fold_valid):
+                    test_score = fold_test[idx] if idx < len(fold_test) else float("nan")
+                    detail = details[idx] if idx < len(details) else {}
+                    msg += (
+                        f"\n- R{idx + 1}: train={detail.get('train_batches', [])}, "
+                        f"valid={detail.get('valid_batches', [])} MCC={float(valid_score):.4f}, "
+                        f"test={detail.get('test_batches', [])} MCC={float(test_score):.4f}"
+                    )
+                if "test_mcc_fold_mean" in metrics:
+                    msg += (
+                        f"\n- Mean test MCC={float(metrics['test_mcc_fold_mean']):.4f} "
+                        f"± {float(metrics.get('test_mcc_fold_std', 0.0)):.4f}"
+                    )
+            return _finish(get_real_board(dataset), msg)
 
         submission = db.create_submission(
             username=team.strip(),
@@ -1278,6 +1330,19 @@ Submit batch correction and model code. Evaluation runs server-side.
                 value=get_dataset_info("massbench_benchmark"),
                 label="Dataset Information"
             )
+            r_eval_protocol = gr.Radio(
+                choices=[
+                    ("Fixed external test — official leaderboard", "fixed_external"),
+                    ("Cyclic batch rotation — research only", "cyclic_batches"),
+                ],
+                value="fixed_external",
+                label="Evaluation protocol",
+                info=(
+                    "Fixed external keeps the hidden test set untouched. "
+                    "Cyclic rotates each batch through validation and test once; "
+                    "it is a research analysis and is not saved to the official leaderboard."
+                ),
+            )
             r_board_out = gr.Dataframe(
                 label=f"Real Leaderboard (top {LEADERBOARD_UI_LIMIT} rows)",
                 value=get_real_board("massbench_benchmark"),
@@ -1477,7 +1542,14 @@ Datasets are ordered by submission date.
 
             r_submit_btn.click(
                 fn=submit_real,
-                inputs=[r_model_in, r_dataset_in, r_correction_code, r_model_code, r_pip_pkg],
+                inputs=[
+                    r_model_in,
+                    r_dataset_in,
+                    r_correction_code,
+                    r_model_code,
+                    r_pip_pkg,
+                    r_eval_protocol,
+                ],
                 outputs=[r_board_out, r_status_out, r_logs_out],
                 api_name="submit_real",
             )
