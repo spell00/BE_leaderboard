@@ -1643,6 +1643,13 @@ def _cross_validate_submission(
             model_y_valid = model_y_valid.loc[valid_supervised].reset_index(drop=True)
             model_batches_valid = model_batches_valid.loc[valid_supervised].reset_index(drop=True)
 
+        print(
+            f"[submission-cv][fold {fold}/{n_folds}] "
+            f"train labels={model_y_train.astype(str).value_counts().to_dict()} "
+            f"valid labels={model_y_valid.astype(str).value_counts().to_dict()}",
+            flush=True,
+        )
+
         fold_test_preds, fold_extra, fold_test_proba = _run_user_model(
             model_code,
             model_X_train,
@@ -1674,6 +1681,12 @@ def _cross_validate_submission(
                 f"CV fold {fold} returned {len(fold_test_preds)} test predictions "
                 f"for {len(X_test)} fixed test rows."
             )
+
+        print(
+            f"[submission-cv][fold {fold}/{n_folds}] fixed-test prediction counts="
+            f"{fold_test_preds.astype(str).value_counts().to_dict()}",
+            flush=True,
+        )
 
         score_y_valid = model_y_valid
         score_valid_preds = fold_valid_preds
@@ -1727,6 +1740,11 @@ def _cross_validate_submission(
         consensus_predictions = votes.mode(axis=1).iloc[:, 0].astype(str).reset_index(drop=True)
         consensus_proba_value = None
 
+    print(
+        f"[submission-cv] Ensemble fixed-test prediction counts="
+        f"{consensus_predictions.astype(str).value_counts().to_dict()}",
+        flush=True,
+    )
     print(
         f"[submission-cv] Mean validation MCC={mean_mcc:.4f} +/- "
         f"{std_mcc:.4f}; folds={fold_scores}"
