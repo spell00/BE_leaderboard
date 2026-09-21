@@ -1062,6 +1062,7 @@ def run_meta_recommendation(dataset: str, uploaded_file):
             meta_text,
             "\n".join(details),
             generated_code,
+            gr.update(interactive=True),
         )
     except Exception as exc:
         print(
@@ -1073,6 +1074,7 @@ def run_meta_recommendation(dataset: str, uploaded_file):
             "",
             _format_exec_error(exc),
             "",
+            gr.update(interactive=False),
         )
 
 
@@ -1156,6 +1158,12 @@ Run a reproducible server-side benchmark or propose a matrix-ready dataset.
                 interactive=False,
             )
 
+        meta_apply = gr.Button(
+            "Use recommended BERNN configuration",
+            variant="secondary",
+            interactive=False,
+        )
+
         meta_run.click(
             fn=run_meta_recommendation,
             inputs=[meta_dataset, meta_upload],
@@ -1164,6 +1172,7 @@ Run a reproducible server-side benchmark or propose a matrix-ready dataset.
                 meta_features_table,
                 meta_status,
                 meta_code,
+                meta_apply,
             ],
             api_name="recommend_bernn",
             queue=False,
@@ -1316,6 +1325,13 @@ Datasets are ordered by submission date.
                 fn=lambda x: load_baseline(x, False),
                 inputs=[r_model_baseline],
                 outputs=[r_model_code],
+            )
+
+            meta_apply.click(
+                fn=lambda code: code,
+                inputs=[meta_code],
+                outputs=[r_model_code],
+                queue=False,
             )
 
             with gr.Accordion("Run logs", open=False):
