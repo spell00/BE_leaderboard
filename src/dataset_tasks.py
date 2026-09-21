@@ -10,6 +10,11 @@ ALZHEIMER_SUPERVISED_LABELS = frozenset({"CU", "DEM-AD"})
 POOL_LABEL = "pool"
 UNSUPERVISED_LABEL = "-1"
 
+# Synchronized meta-HPO uses three grouped folds by default. Datasets with fewer
+# technical batches automatically reduce the fold count (e.g. adenocarcinoma: 2).
+META_HPO_N_REPEATS = 3
+META_HPO_CV_RANDOM_STATE = 0
+
 
 def normalized_labels(labels) -> pd.Series:
     """Return stripped nullable-string labels without changing row order."""
