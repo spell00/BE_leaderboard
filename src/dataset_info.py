@@ -14,8 +14,8 @@ DATASET_DESCRIPTIONS = {
     },
     "massbench_alzheimer": {
         "title": "MassBench Alzheimer",
-        "description": "Mass spectrometry proteomics data for Alzheimer's disease classification across multiple diagnostic groups.",
-        "task": "Multi-class classification of cognitive status and disease type",
+        "description": "Mass spectrometry proteomics data for a semi-supervised Alzheimer's task. CU and DEM-AD are supervised; all other development diagnoses are pooled for unsupervised reconstruction/domain learning.",
+        "task": "Binary supervised classification: CU versus DEM-AD, with other development diagnoses retained as pooled unlabeled samples",
     },
     "massbench_benchmark": {
         "title": "MassBench Benchmark",
@@ -42,22 +42,18 @@ DATASET_METADATA = {
     },
     "massbench_alzheimer": {
         "train_samples": 768,
-        "test_samples": 211,
+        "test_samples": 39,
         "train_features": 899,
         "test_features": 898,
         "classes": {
-            "MCI-AD": 162,
+            "pool (unsupervised)": 500,
             "CU": 142,
-            "MCI-other": 132,
             "DEM-AD": 126,
-            "NPH": 96,
-            "pool": 64,
-            "DEM-other": 42,
         },
-        "train_classes": 7,
-        "test_classes": 6,
+        "train_classes": 2,
+        "test_classes": 2,
         "train_batches": 16,
-        "test_batches": 6,
+        "test_batches": 4,
         "train_batch_info": {
             "Batch-05": 48, "Batch-06": 48, "Batch-07": 48, "Batch-08": 48,
             "Batch-09": 48, "Batch-10": 48, "Batch-11": 48, "Batch-12": 48,
@@ -65,8 +61,10 @@ DATASET_METADATA = {
             "Batch-18": 48, "Batch-19": 48, "Batch-20": 48, "Batch-21": 48
         },
         "test_batch_info": {
-            "Batch-00": 2, "Batch-03": 48, "Batch-04": 48, "Batch-13": 47,
-            "Batch-22": 38, "Batch-23": 28
+            "Batch-03": 8,
+            "Batch-04": 16,
+            "Batch-13": 11,
+            "Batch-22": 4,
         },
         "domain": "Proteomics / Mass Spectrometry",
     },
