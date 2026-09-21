@@ -1012,6 +1012,11 @@ def _load_recommender_input(dataset: str, uploaded_file) -> tuple[pd.DataFrame, 
 
 def run_meta_recommendation(dataset: str, uploaded_file):
     """Run zero-shot BERNN hyperparameter recommendation for the UI."""
+    print(
+        f"[meta-recommender] click received dataset={dataset!r} "
+        f"uploaded={bool(uploaded_file)}",
+        flush=True,
+    )
     try:
         frame, source_name = _load_recommender_input(dataset, uploaded_file)
         result = recommend_bernn_config(frame)
@@ -1047,6 +1052,11 @@ def run_meta_recommendation(dataset: str, uploaded_file):
             f"{row.meta_feature}: {row.value:.6g}"
             for row in meta_table.itertuples(index=False)
         )
+        print(
+            f"[meta-recommender] completed source={source_name!r} "
+            f"samples={len(frame)} features={max(len(frame.columns) - 3, 0)}",
+            flush=True,
+        )
         return (
             config_text,
             meta_text,
@@ -1054,6 +1064,10 @@ def run_meta_recommendation(dataset: str, uploaded_file):
             generated_code,
         )
     except Exception as exc:
+        print(
+            f"[meta-recommender] failed: {type(exc).__name__}: {exc}",
+            flush=True,
+        )
         return (
             "",
             "",
@@ -1434,6 +1448,8 @@ include `name`, `batch`, and `label`, followed by numeric feature columns.
                     meta_code,
                 ],
                 api_name="recommend_bernn",
+                queue=False,
+                show_progress="full",
             )
 
         with gr.TabItem("Add a Dataset"):
