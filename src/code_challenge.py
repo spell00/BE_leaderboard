@@ -1815,7 +1815,12 @@ def _load_cyclic_research_dataset(
     X = _clean_features(combined, feature_cols)
     y = combined["label"].astype(str).reset_index(drop=True)
     batches = combined["batch"].astype(str).reset_index(drop=True)
-    cyclic_train_valid_test_splits(batches)
+    eligible = (
+        y.astype(str).isin(ALZHEIMER_SUPERVISED_LABELS).to_numpy()
+        if dataset == ALZHEIMER_DATASET
+        else None
+    )
+    cyclic_train_valid_test_splits(batches, eligible_mask=eligible)
     return X, y, batches, names
 
 
@@ -1834,8 +1839,13 @@ def _cross_validate_cyclic_submission(
     batches train the model. Test labels are never passed to fit in their test
     round, but because batches rotate, those same labels are used in other rounds.
     """
-    splits = cyclic_train_valid_test_splits(batches)
     is_alzheimer = dataset == ALZHEIMER_DATASET
+    eligible = (
+        y.astype(str).isin(ALZHEIMER_SUPERVISED_LABELS).to_numpy()
+        if is_alzheimer
+        else None
+    )
+    splits = cyclic_train_valid_test_splits(batches, eligible_mask=eligible)
     is_bernn_model = any(
         token in model_code
         for token in ("TrainAEClassifierHoldout", "TrainAEThenClassifierHoldout", "AEHeadPredictor")
