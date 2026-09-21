@@ -105,6 +105,9 @@ def _launch_options() -> tuple[int | None, str | None]:
 
     return port, checkpoint
 
+
+APP_PORT, APP_META_CHECKPOINT = _launch_options()
+
 db = DatabaseManager(ROOT / "data" / "leaderboard.db")
 
 DATASET_LABELS = {
@@ -1526,11 +1529,10 @@ if __name__ == "__main__":
         "show_error": True,
         "ssr_mode": False,
     }
-    port, meta_checkpoint = _launch_options()
-    if port is not None:
-        launch_kwargs["server_port"] = port
-        print(f"Launching Gradio on port {port}")
-    if meta_checkpoint:
-        print(f"Using BERNN meta-network checkpoint: {meta_checkpoint}")
+    if APP_PORT is not None:
+        launch_kwargs["server_port"] = APP_PORT
+        print(f"Launching Gradio on port {APP_PORT}")
+    if APP_META_CHECKPOINT:
+        print(f"Using BERNN meta-network checkpoint: {APP_META_CHECKPOINT}")
 
     demo.queue(default_concurrency_limit=1).launch(**launch_kwargs)
