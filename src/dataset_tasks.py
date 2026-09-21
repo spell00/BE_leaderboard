@@ -84,22 +84,33 @@ def _natural_batch_key(value: object):
     )
 
 
-def cyclic_train_valid_test_splits(batches):
-    """Rotate batch roles so every batch is validation once and test once.
+def cyclic_train_valid_test_splits(batches, eligible_mask=None):
+    """Rotate eligible batch roles so each is validation once and test once.
 
-    For ordered batches [1, 2, 3], this yields:
+    Batches with no eligible/scorable rows remain training-only in every round.
+    With ordered eligible batches [1, 2, 3], this yields:
       round 1: train=[1], valid=[2], test=[3]
       round 2: train=[2], valid=[3], test=[1]
       round 3: train=[3], valid=[1], test=[2]
 
-    With >3 batches, all batches other than the current validation/test batches
-    are used for training. At least three distinct batches are required.
+    With >3 eligible batches, all batches other than the current validation/test
+    batches are used for training. At least three evaluable batches are required.
     """
     values = np.asarray(pd.Series(batches).astype(str))
-    ordered = sorted(set(values.tolist()), key=_natural_batch_key)
+    all_batches = sorted(set(values.tolist()), key=_natural_batch_key)
+
+    if eligible_mask is None:
+        eligible_values = values
+    else:
+        eligible_mask = np.asarray(eligible_mask, dtype=bool)
+        if eligible_mask.shape != values.shape:
+            raise ValueError("eligible_mask must have one boolean per sample")
+        eligible_values = values[eligible_mask]
+
+    ordered = sorted(set(eligible_values.tolist()), key=_natural_batch_key)
     if len(ordered) < 3:
         raise ValueError(
-            "Cyclic train/valid/test batch CV requires at least 3 distinct batches; "
+            "Cyclic train/valid/test batch CV requires at least 3 evaluable batches; "
             f"found {len(ordered)}: {ordered}"
         )
 
@@ -108,7 +119,7 @@ def cyclic_train_valid_test_splits(batches):
         valid_batch = ordered[(round_index + 1) % len(ordered)]
         test_batch = ordered[(round_index + 2) % len(ordered)]
         train_batches = [
-            batch for batch in ordered
+            batch for batch in all_batches
             if batch not in {valid_batch, test_batch}
         ]
 
@@ -134,8 +145,8 @@ def cyclic_train_valid_test_splits(batches):
     valid_roles = [row["valid_batch"] for row in splits]
     test_roles = [row["test_batch"] for row in splits]
     if sorted(valid_roles, key=_natural_batch_key) != ordered:
-        raise AssertionError("Each batch must appear exactly once as validation")
+        raise AssertionError("Each evaluable batch must appear exactly once as validation")
     if sorted(test_roles, key=_natural_batch_key) != ordered:
-        raise AssertionError("Each batch must appear exactly once as test")
+        raise AssertionError("Each evaluable batch must appear exactly once as test")
 
     return splits
