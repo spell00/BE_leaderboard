@@ -10,6 +10,7 @@ from src.dataset_tasks import (
     UNSUPERVISED_LABEL,
     model_labels_for_alzheimer,
     prepare_alzheimer_development_labels,
+    cyclic_train_valid_test_splits,
 )
 
 
@@ -101,3 +102,42 @@ def test_adenocarcinoma_uses_two_batch_holdout_folds():
         assert train_batches.isdisjoint(valid_batches)
         assert len(train_batches) == 1
         assert len(valid_batches) == 1
+
+
+
+def test_cyclic_three_batches_matches_requested_rotation():
+    batches = pd.Series(["1"] * 2 + ["2"] * 2 + ["3"] * 2)
+    splits = cyclic_train_valid_test_splits(batches)
+
+    assert len(splits) == 3
+    assert [
+        (row["train_batches"], row["valid_batch"], row["test_batch"])
+        for row in splits
+    ] == [
+        (["1"], "2", "3"),
+        (["2"], "3", "1"),
+        (["3"], "1", "2"),
+    ]
+
+
+def test_cyclic_each_batch_is_valid_and_test_once():
+    batches = pd.Series(
+        ["B1"] * 2 + ["B2"] * 2 + ["B3"] * 2 + ["B4"] * 2 + ["B5"] * 2
+    )
+    splits = cyclic_train_valid_test_splits(batches)
+
+    assert len(splits) == 5
+    assert sorted(row["valid_batch"] for row in splits) == ["B1", "B2", "B3", "B4", "B5"]
+    assert sorted(row["test_batch"] for row in splits) == ["B1", "B2", "B3", "B4", "B5"]
+    assert all(len(row["train_batches"]) == 3 for row in splits)
+
+
+def test_cyclic_unscorable_batch_remains_training_only():
+    batches = pd.Series(["B1"] * 2 + ["B2"] * 2 + ["B3"] * 2 + ["POOL"] * 2)
+    eligible = np.array([True] * 6 + [False] * 2)
+    splits = cyclic_train_valid_test_splits(batches, eligible_mask=eligible)
+
+    assert len(splits) == 3
+    assert all("POOL" in row["train_batches"] for row in splits)
+    assert "POOL" not in {row["valid_batch"] for row in splits}
+    assert "POOL" not in {row["test_batch"] for row in splits}
