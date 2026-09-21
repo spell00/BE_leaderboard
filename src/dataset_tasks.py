@@ -70,3 +70,72 @@ def clean_task_features(frame: pd.DataFrame, feature_columns: list[str]) -> pd.D
     """Match hp_search feature preprocessing: float conversion and non-finite -> 0."""
     values = frame[feature_columns].astype(float).reset_index(drop=True)
     return values.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+
+def _natural_batch_key(value: object):
+    """Deterministic human/numeric ordering for batch identifiers."""
+    import re
+
+    text = str(value)
+    return tuple(
+        int(part) if part.isdigit() else part.lower()
+        for part in re.split(r"(\d+)", text)
+        if part != ""
+    )
+
+
+def cyclic_train_valid_test_splits(batches):
+    """Rotate batch roles so every batch is validation once and test once.
+
+    For ordered batches [1, 2, 3], this yields:
+      round 1: train=[1], valid=[2], test=[3]
+      round 2: train=[2], valid=[3], test=[1]
+      round 3: train=[3], valid=[1], test=[2]
+
+    With >3 batches, all batches other than the current validation/test batches
+    are used for training. At least three distinct batches are required.
+    """
+    values = np.asarray(pd.Series(batches).astype(str))
+    ordered = sorted(set(values.tolist()), key=_natural_batch_key)
+    if len(ordered) < 3:
+        raise ValueError(
+            "Cyclic train/valid/test batch CV requires at least 3 distinct batches; "
+            f"found {len(ordered)}: {ordered}"
+        )
+
+    splits = []
+    for round_index in range(len(ordered)):
+        valid_batch = ordered[(round_index + 1) % len(ordered)]
+        test_batch = ordered[(round_index + 2) % len(ordered)]
+        train_batches = [
+            batch for batch in ordered
+            if batch not in {valid_batch, test_batch}
+        ]
+
+        train_idx = np.flatnonzero(np.isin(values, train_batches))
+        valid_idx = np.flatnonzero(values == valid_batch)
+        test_idx = np.flatnonzero(values == test_batch)
+        if not len(train_idx) or not len(valid_idx) or not len(test_idx):
+            raise ValueError(
+                "Cyclic batch CV produced an empty split: "
+                f"train={len(train_idx)} valid={len(valid_idx)} test={len(test_idx)}"
+            )
+
+        splits.append({
+            "round": round_index + 1,
+            "train_idx": train_idx,
+            "valid_idx": valid_idx,
+            "test_idx": test_idx,
+            "train_batches": train_batches,
+            "valid_batch": valid_batch,
+            "test_batch": test_batch,
+        })
+
+    valid_roles = [row["valid_batch"] for row in splits]
+    test_roles = [row["test_batch"] for row in splits]
+    if sorted(valid_roles, key=_natural_batch_key) != ordered:
+        raise AssertionError("Each batch must appear exactly once as validation")
+    if sorted(test_roles, key=_natural_batch_key) != ordered:
+        raise AssertionError("Each batch must appear exactly once as test")
+
+    return splits
