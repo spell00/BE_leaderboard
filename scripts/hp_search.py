@@ -107,6 +107,7 @@ from src.dataset_tasks import (
     POOL_LABEL,
     alzheimer_supervised_mask,
     prepare_alzheimer_development_labels,
+    cyclic_train_valid_test_splits,
 )
 
 # Quiet the heavy TF/CUDA/Ax import noise before bernn is imported.
@@ -251,6 +252,248 @@ def load_fixed_test_dataset(name: str):
     X = df[feature_cols].astype(float).reset_index(drop=True)
     X = X.replace([np.inf, -np.inf], np.nan).fillna(0.0)
     return X, df["label"].astype(str).to_numpy(), df["batch"].astype(str).to_numpy()
+
+
+def load_cyclic_dataset(name: str):
+    """Load every labeled batch for cyclic train/valid/test evaluation.
+
+    Public training rows and the local labeled inference rows are combined.
+    For Alzheimer, CU/DEM-AD remain supervised and every other diagnosis is
+    mapped to the pooled unsupervised class, exactly as in the development set.
+    """
+    base = DATASETS_DIR / name
+    train_path = base / f"{name}_train.csv"
+    inference_path = base / f"{name}_inference.csv"
+    if not train_path.exists():
+        raise FileNotFoundError(f"No train CSV for dataset '{name}' at {train_path}")
+    if not inference_path.exists():
+        raise FileNotFoundError(
+            f"No labeled inference CSV for cyclic CV dataset '{name}' at {inference_path}"
+        )
+
+    train = pd.read_csv(train_path)
+    inference = pd.read_csv(inference_path)
+
+    if name == ALZHEIMER_DATASET:
+        train_labels, _ = prepare_alzheimer_development_labels(train["label"])
+        inference_labels, _ = prepare_alzheimer_development_labels(inference["label"])
+        train = train.copy()
+        inference = inference.copy()
+        train["label"] = train_labels
+        inference["label"] = inference_labels
+    else:
+        train_labeled = train["label"].notna() & train["label"].astype("string").str.strip().ne("")
+        inf_labeled = (
+            inference["label"].notna()
+            & inference["label"].astype("string").str.strip().ne("")
+        )
+        train = train.loc[train_labeled].copy()
+        inference = inference.loc[inf_labeled].copy()
+
+    feature_cols = [column for column in train.columns if column not in _META_COLS]
+    missing = [column for column in feature_cols if column not in inference.columns]
+    if missing:
+        raise ValueError(
+            f"Inference file for {name} is missing {len(missing)} training feature columns"
+        )
+
+    combined = pd.concat(
+        [
+            train[["name", "batch", "label", *feature_cols]],
+            inference[["name", "batch", "label", *feature_cols]],
+        ],
+        ignore_index=True,
+    )
+    if combined["name"].astype(str).duplicated().any():
+        duplicates = (
+            combined.loc[combined["name"].astype(str).duplicated(), "name"]
+            .astype(str)
+            .head(5)
+            .tolist()
+        )
+        raise ValueError(f"Duplicate sample names in cyclic dataset {name}: {duplicates}")
+
+    X = (
+        combined[feature_cols]
+        .astype(float)
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
+        .reset_index(drop=True)
+    )
+    y = combined["label"].astype(str).to_numpy()
+    batches = combined["batch"].astype(str).to_numpy()
+
+    # Fail early if the requested symmetric protocol is impossible.
+    cyclic_train_valid_test_splits(batches)
+    return X, y, batches
+
+
+def run_cyclic_batch_trial(cfg: dict, args, data, exp_id: str):
+    """Evaluate one BERNN config with symmetric cyclic batch roles.
+
+    Every batch is validation exactly once and test exactly once. For N>3,
+    all remaining N-2 batches are training batches. The Optuna objective is the
+    mean validation MCC; test MCC is monitoring-only and is the mean per-batch
+    test MCC, with a global out-of-fold MCC also retained for diagnostics.
+    """
+    from sklearn.metrics import matthews_corrcoef
+
+    X, y, batches = data
+    X = X.copy()
+    y = np.asarray(y).astype(str)
+    batches = np.asarray(batches).astype(str)
+
+    if bool(cfg.get("log1p", False)):
+        X = _apply_log1p_preprocessing(X)
+
+    splits = cyclic_train_valid_test_splits(batches)
+    n_rounds = len(splits)
+    is_alzheimer = getattr(args, "dataset", "") == ALZHEIMER_DATASET
+
+    model_y = y.astype(object).copy()
+    if is_alzheimer:
+        supervised_mask = np.isin(y, list(ALZHEIMER_SUPERVISED_LABELS))
+        model_y[~supervised_mask] = "-1"
+        if not np.any(~supervised_mask):
+            raise ValueError("Alzheimer cyclic task requires pooled unsupervised samples")
+    else:
+        supervised_mask = np.ones(len(y), dtype=bool)
+
+    valid_scores = []
+    test_scores = []
+    fold_metrics = []
+    epoch_traces_by_fold = {}
+    oof_test_predictions = np.full(len(y), "", dtype=object)
+    oof_test_mask = np.zeros(len(y), dtype=bool)
+
+    for fold_idx, split in enumerate(splits):
+        train_idx = split["train_idx"]
+        valid_idx = split["valid_idx"]
+        test_idx = split["test_idx"]
+
+        fold_args = argparse.Namespace(**vars(args))
+        fold_args.n_repeats = n_rounds
+        fold_args.resolved_n_repeats = n_rounds
+        fold_args.trainer_n_repeats = 1
+
+        fit_data = (
+            X.iloc[train_idx].reset_index(drop=True),
+            model_y[train_idx],
+            batches[train_idx],
+            X.iloc[valid_idx].reset_index(drop=True),
+            model_y[valid_idx],
+            batches[valid_idx],
+            X.iloc[test_idx].reset_index(drop=True),
+            None,
+            batches[test_idx],
+        )
+
+        print(
+            f"[cyclic split] round {fold_idx + 1}/{n_rounds} "
+            f"train_batches={split['train_batches']} "
+            f"valid_batch={split['valid_batch']} "
+            f"test_batch={split['test_batch']} "
+            f"n_train={len(train_idx)} n_valid={len(valid_idx)} n_test={len(test_idx)}",
+            flush=True,
+        )
+
+        fold_exp_id = f"{exp_id}_fold{fold_idx}"
+        trainer, valid_mcc = _fit_one(
+            cfg,
+            fold_args,
+            fit_data,
+            fold_exp_id,
+            seed=int(getattr(args, "seed", 42)) + fold_idx,
+            keep_models=False,
+        )
+
+        try:
+            predictions = trainer.predict(
+                X.iloc[test_idx].reset_index(drop=True),
+                groups_test=batches[test_idx],
+            )
+        except TypeError:
+            predictions = trainer.predict(X.iloc[test_idx].reset_index(drop=True))
+
+        predictions = np.asarray(predictions).astype(str).reshape(-1)
+        if len(predictions) != len(test_idx):
+            raise ValueError(
+                f"Cyclic test prediction length mismatch: {len(predictions)} != {len(test_idx)}"
+            )
+
+        test_labeled = supervised_mask[test_idx]
+        if not np.any(test_labeled):
+            raise ValueError(
+                f"Test batch {split['test_batch']} contains no supervised labels"
+            )
+        test_mcc = float(
+            matthews_corrcoef(
+                y[test_idx][test_labeled],
+                predictions[test_labeled],
+            )
+        )
+
+        valid_scores.append(float(valid_mcc))
+        test_scores.append(test_mcc)
+        oof_test_predictions[test_idx[test_labeled]] = predictions[test_labeled]
+        oof_test_mask[test_idx[test_labeled]] = True
+
+        metrics = extract_mlflow_metrics(fold_exp_id)
+        epoch_traces = extract_mlflow_epoch_traces(fold_exp_id)
+        if epoch_traces:
+            metrics["_epoch_traces"] = epoch_traces
+            epoch_traces_by_fold[str(fold_idx)] = epoch_traces
+        metrics.update({
+            "fold": float(fold_idx),
+            "valid_mcc": float(valid_mcc),
+            "test_mcc": test_mcc,
+        })
+        fold_metrics.append(metrics)
+
+        print(
+            f"[cyclic cv] round {fold_idx + 1}/{n_rounds} "
+            f"valid MCC={valid_mcc:.4f} test MCC={test_mcc:.4f}",
+            flush=True,
+        )
+
+    if not np.all(oof_test_mask[supervised_mask]):
+        missing = int(np.sum(supervised_mask & ~oof_test_mask))
+        raise AssertionError(
+            f"Cyclic test predictions missing for {missing} supervised sample(s)"
+        )
+
+    metrics = _aggregate_fold_metrics(fold_metrics)
+    if epoch_traces_by_fold:
+        metrics["_epoch_traces_by_fold"] = epoch_traces_by_fold
+
+    metrics["valid_mcc"] = float(np.mean(valid_scores))
+    metrics["valid_mcc_std"] = float(np.std(valid_scores))
+    metrics["valid_mcc_folds"] = [float(v) for v in valid_scores]
+    metrics["test_mcc"] = float(np.mean(test_scores))
+    metrics["test_mcc_std"] = float(np.std(test_scores))
+    metrics["test_mcc_folds"] = [float(v) for v in test_scores]
+    metrics["test_mcc_global_oof"] = float(
+        matthews_corrcoef(
+            y[supervised_mask],
+            oof_test_predictions[supervised_mask].astype(str),
+        )
+    )
+    metrics["resolved_n_repeats"] = float(n_rounds)
+    metrics["cyclic_batch_cv"] = 1.0
+    metrics["n_batches"] = float(len(np.unique(batches)))
+
+    if is_alzheimer:
+        metrics["supervised_samples"] = float(np.sum(supervised_mask))
+        metrics["pooled_unsupervised_samples"] = float(np.sum(~supervised_mask))
+
+    print(
+        f"[cyclic summary] valid={metrics['valid_mcc']:.4f} +/- "
+        f"{metrics['valid_mcc_std']:.4f}; "
+        f"test={metrics['test_mcc']:.4f} +/- {metrics['test_mcc_std']:.4f}; "
+        f"global_oof_test={metrics['test_mcc_global_oof']:.4f}",
+        flush=True,
+    )
+    return float(metrics["valid_mcc"]), metrics
 
 
 def build_trainer_config(cfg: dict, args, exp_id: str):
