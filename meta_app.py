@@ -23,6 +23,8 @@ from src.meta_recommender import (
 )
 
 DATASET_LABELS = {
+    "normal_tissue_878": "Normal Tissue 878",
+    "colon_3041": "Colon 3041",
     "massbench_adenocarcinoma": "MassBench Adenocarcinoma",
     "massbench_alzheimer": "MassBench Alzheimer",
     "massbench_benchmark": "MassBench Benchmark",
