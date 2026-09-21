@@ -37,6 +37,7 @@ from src.dataset_tasks import (
     model_labels_for_alzheimer,
     prepare_builtin_training_frame,
     task_feature_columns,
+    cyclic_train_valid_test_splits,
 )
 
 
@@ -1760,12 +1761,351 @@ def _cross_validate_submission(
     }
 
 
+def _load_cyclic_research_dataset(
+    dataset: str,
+) -> tuple[pd.DataFrame, pd.Series, pd.Series, pd.Series]:
+    """Combine public development rows and hidden labeled batches for local research CV.
+
+    This must never be used for the public leaderboard because labels from the
+    normally hidden external split become train/validation labels in some rounds.
+    """
+    train_path = ROOT / "data" / "datasets" / dataset / f"{dataset}_train.csv"
+    if not train_path.exists():
+        raise FileNotFoundError(f"Public train split not found: {train_path}")
+
+    public = prepare_builtin_training_frame(dataset, pd.read_csv(train_path))
+    private = load_private_inference(dataset).copy()
+    labels = load_private_labels(dataset).copy()
+    if not {"name", "prediction"}.issubset(labels.columns):
+        raise ValueError(
+            f"Private labels for dataset '{dataset}' must contain name and prediction"
+        )
+
+    private["name"] = private["name"].astype(str)
+    labels["name"] = labels["name"].astype(str)
+    labels["prediction"] = labels["prediction"].astype(str)
+    private = private.drop(columns=["label"], errors="ignore").merge(
+        labels[["name", "prediction"]].rename(columns={"prediction": "label"}),
+        on="name",
+        how="inner",
+        validate="one_to_one",
+        sort=False,
+    )
+    private = prepare_builtin_training_frame(dataset, private)
+
+    feature_cols = task_feature_columns(public)
+    missing = [column for column in feature_cols if column not in private.columns]
+    if missing:
+        raise ValueError(
+            f"Private cyclic split for {dataset} is missing {len(missing)} feature columns"
+        )
+
+    combined = pd.concat(
+        [
+            public[["name", "batch", "label", *feature_cols]],
+            private[["name", "batch", "label", *feature_cols]],
+        ],
+        ignore_index=True,
+    )
+    names = combined["name"].astype(str).reset_index(drop=True)
+    if names.duplicated().any():
+        duplicates = names[names.duplicated()].head(5).tolist()
+        raise ValueError(f"Duplicate sample names in cyclic dataset: {duplicates}")
+
+    X = _clean_features(combined, feature_cols)
+    y = combined["label"].astype(str).reset_index(drop=True)
+    batches = combined["batch"].astype(str).reset_index(drop=True)
+    cyclic_train_valid_test_splits(batches)
+    return X, y, batches, names
+
+
+def _cross_validate_cyclic_submission(
+    correction_code: str,
+    model_code: str,
+    dataset: str,
+    X: pd.DataFrame,
+    y: pd.Series,
+    batches: pd.Series,
+    names: pd.Series,
+) -> dict:
+    """Research-only symmetric batch rotation.
+
+    Every technical batch is validation once and test once; all remaining
+    batches train the model. Test labels are never passed to fit in their test
+    round, but because batches rotate, those same labels are used in other rounds.
+    """
+    splits = cyclic_train_valid_test_splits(batches)
+    is_alzheimer = dataset == ALZHEIMER_DATASET
+    is_bernn_model = any(
+        token in model_code
+        for token in ("TrainAEClassifierHoldout", "TrainAEThenClassifierHoldout", "AEHeadPredictor")
+    )
+    supervised_labels = (
+        set(ALZHEIMER_SUPERVISED_LABELS)
+        if is_alzheimer
+        else set(y.astype(str).unique())
+    )
+    all_labels = sorted(supervised_labels)
+
+    model_y_all = (
+        model_labels_for_alzheimer(y).astype(str).reset_index(drop=True)
+        if is_alzheimer
+        else y.astype(str).reset_index(drop=True)
+    )
+
+    valid_scores: list[float] = []
+    test_scores: list[float] = []
+    fold_details: list[dict[str, object]] = []
+    oof_predictions = pd.Series(index=np.arange(len(X)), dtype=object)
+    oof_proba = pd.DataFrame(np.nan, index=np.arange(len(X)), columns=all_labels)
+    all_proba_available = True
+
+    from src.baselines import set_bernn_seed
+
+    print(
+        f"[submission-cyclic] Protocol: cyclic train/valid/test by batch "
+        f"({len(splits)} rounds)",
+        flush=True,
+    )
+
+    for fold, split in enumerate(splits, start=1):
+        set_bernn_seed(CV_RANDOM_STATE + fold)
+        train_idx = split["train_idx"]
+        valid_idx = split["valid_idx"]
+        test_idx = split["test_idx"]
+
+        fold_X_train = X.iloc[train_idx].reset_index(drop=True)
+        fold_X_valid = X.iloc[valid_idx].reset_index(drop=True)
+        fold_X_test = X.iloc[test_idx].reset_index(drop=True)
+        fold_y_train = model_y_all.iloc[train_idx].reset_index(drop=True)
+        fold_y_valid = model_y_all.iloc[valid_idx].reset_index(drop=True)
+        fold_y_test_score = y.iloc[test_idx].astype(str).reset_index(drop=True)
+        fold_batches_train = batches.iloc[train_idx].reset_index(drop=True)
+        fold_batches_valid = batches.iloc[valid_idx].reset_index(drop=True)
+        fold_batches_test = batches.iloc[test_idx].reset_index(drop=True)
+
+        fold_X_eval = pd.concat([fold_X_valid, fold_X_test], ignore_index=True)
+        fold_batches_eval = pd.concat(
+            [fold_batches_valid, fold_batches_test],
+            ignore_index=True,
+        )
+        corrected_train, corrected_eval = _apply_user_batch_correction(
+            correction_code,
+            fold_X_train,
+            fold_batches_train,
+            fold_X_eval,
+            fold_batches_eval,
+            plot_capture=None,
+        )
+        n_valid = len(fold_X_valid)
+        corrected_valid = corrected_eval.iloc[:n_valid].reset_index(drop=True)
+        corrected_test = corrected_eval.iloc[n_valid:].reset_index(drop=True)
+
+        model_X_train = corrected_train
+        model_y_train = fold_y_train
+        model_batches_train = fold_batches_train
+        model_X_valid = corrected_valid
+        model_y_valid = fold_y_valid
+        model_batches_valid = fold_batches_valid
+
+        if is_alzheimer and not is_bernn_model:
+            train_supervised = model_y_train.ne(UNSUPERVISED_LABEL).to_numpy()
+            valid_supervised = model_y_valid.ne(UNSUPERVISED_LABEL).to_numpy()
+            model_X_train = model_X_train.loc[train_supervised].reset_index(drop=True)
+            model_y_train = model_y_train.loc[train_supervised].reset_index(drop=True)
+            model_batches_train = model_batches_train.loc[train_supervised].reset_index(drop=True)
+            model_X_valid = model_X_valid.loc[valid_supervised].reset_index(drop=True)
+            model_y_valid = model_y_valid.loc[valid_supervised].reset_index(drop=True)
+            model_batches_valid = model_batches_valid.loc[valid_supervised].reset_index(drop=True)
+
+        print(
+            f"[submission-cyclic][round {fold}/{len(splits)}] "
+            f"train_batches={split['train_batches']} "
+            f"valid_batch={split['valid_batch']} test_batch={split['test_batch']}",
+            flush=True,
+        )
+
+        test_preds, extra, test_proba = _run_user_model(
+            model_code,
+            model_X_train,
+            model_y_train,
+            corrected_test,
+            dataset,
+            model_batches_train,
+            fold_batches_test,
+            X_valid=model_X_valid,
+            y_valid=model_y_valid,
+            batches_valid=model_batches_valid,
+            y_test=None,
+            plot_capture=None,
+        )
+
+        valid_preds = extra.pop("_valid_predictions", None) if isinstance(extra, dict) else None
+        if valid_preds is None:
+            raise CodeValidationError(
+                "fit() must return a trained model with predict() so cyclic validation can be scored."
+            )
+        valid_preds = pd.Series(valid_preds).astype(str).reset_index(drop=True)
+        test_preds = pd.Series(test_preds).astype(str).reset_index(drop=True)
+
+        if len(valid_preds) != len(model_y_valid):
+            raise CodeValidationError(
+                f"Cyclic round {fold} returned {len(valid_preds)} validation predictions "
+                f"for {len(model_y_valid)} rows."
+            )
+        if len(test_preds) != len(test_idx):
+            raise CodeValidationError(
+                f"Cyclic round {fold} returned {len(test_preds)} test predictions "
+                f"for {len(test_idx)} rows."
+            )
+
+        score_y_valid = model_y_valid
+        score_valid_preds = valid_preds
+        if is_alzheimer and is_bernn_model:
+            keep_valid = score_y_valid.ne(UNSUPERVISED_LABEL).to_numpy()
+            score_y_valid = score_y_valid.loc[keep_valid].reset_index(drop=True)
+            score_valid_preds = score_valid_preds.loc[keep_valid].reset_index(drop=True)
+        if len(score_y_valid) == 0:
+            raise CodeValidationError(
+                f"Cyclic validation batch {split['valid_batch']} has no supervised rows."
+            )
+
+        test_keep = fold_y_test_score.isin(supervised_labels).to_numpy()
+        if not np.any(test_keep):
+            raise CodeValidationError(
+                f"Cyclic test batch {split['test_batch']} has no supervised rows."
+            )
+
+        valid_mcc = float(matthews_corrcoef(score_y_valid, score_valid_preds))
+        test_mcc = float(
+            matthews_corrcoef(
+                fold_y_test_score.loc[test_keep].reset_index(drop=True),
+                test_preds.loc[test_keep].reset_index(drop=True),
+            )
+        )
+        valid_scores.append(valid_mcc)
+        test_scores.append(test_mcc)
+
+        scored_global_idx = np.asarray(test_idx)[test_keep]
+        oof_predictions.loc[scored_global_idx] = test_preds.loc[test_keep].to_numpy()
+
+        classes = extra.get("_model_classes") if isinstance(extra, dict) else None
+        aligned = _aligned_proba_frame(test_proba, classes, all_labels, len(test_idx))
+        if aligned is None:
+            all_proba_available = False
+        else:
+            oof_proba.loc[scored_global_idx, all_labels] = aligned.loc[test_keep, all_labels].to_numpy()
+
+        fold_details.append({
+            "fold": fold,
+            "valid_mcc": valid_mcc,
+            "test_mcc": test_mcc,
+            "n_train": int(len(train_idx)),
+            "n_valid": int(len(valid_idx)),
+            "n_test": int(np.sum(test_keep)),
+            "train_batches": list(split["train_batches"]),
+            "valid_batches": [split["valid_batch"]],
+            "test_batches": [split["test_batch"]],
+        })
+        print(
+            f"[submission-cyclic][round {fold}/{len(splits)}] "
+            f"valid MCC={valid_mcc:.4f} test MCC={test_mcc:.4f}",
+            flush=True,
+        )
+
+    supervised_all = y.astype(str).isin(supervised_labels).to_numpy()
+    supervised_idx = np.flatnonzero(supervised_all)
+    if oof_predictions.loc[supervised_idx].isna().any():
+        raise AssertionError("Every supervised sample must receive exactly one cyclic test prediction")
+
+    pred_df = pd.DataFrame({
+        "name": names.iloc[supervised_idx].astype(str).to_numpy(),
+        "prediction": oof_predictions.loc[supervised_idx].astype(str).to_numpy(),
+    })
+    reference = pd.DataFrame({
+        "name": names.iloc[supervised_idx].astype(str).to_numpy(),
+        "prediction": y.iloc[supervised_idx].astype(str).to_numpy(),
+    })
+    groups = pd.DataFrame({
+        "name": names.iloc[supervised_idx].astype(str).to_numpy(),
+        "group": batches.iloc[supervised_idx].astype(str).to_numpy(),
+    })
+
+    predicted_proba = (
+        oof_proba.loc[supervised_idx, all_labels].to_numpy()
+        if all_proba_available and not oof_proba.loc[supervised_idx, all_labels].isna().any().any()
+        else None
+    )
+    metrics = evaluate_predictions(
+        pred_df,
+        reference,
+        predicted_proba=predicted_proba,
+        groups=groups,
+    )
+    metrics.update({
+        "valid_mcc": float(np.mean(valid_scores)),
+        "valid_mcc_std": float(np.std(valid_scores)),
+        "valid_mcc_folds": [float(v) for v in valid_scores],
+        "test_mcc_folds": [float(v) for v in test_scores],
+        "test_mcc_fold_mean": float(np.mean(test_scores)),
+        "test_mcc_fold_std": float(np.std(test_scores)),
+        "cv_protocol": "cyclic_train_valid_test_by_batch_v1",
+        "valid_fold_details": fold_details,
+        "evaluation_protocol": "cyclic_batches",
+    })
+
+    print(
+        f"[submission-cyclic] Mean valid MCC={metrics['valid_mcc']:.4f}; "
+        f"mean per-batch test MCC={metrics['test_mcc_fold_mean']:.4f}; "
+        f"global OOF test MCC={float(metrics.get('test_mcc', metrics.get('mcc', 0.0))):.4f}",
+        flush=True,
+    )
+    return {
+        "pred_df": pred_df,
+        "reference": reference,
+        "groups": groups,
+        "metrics": metrics,
+    }
+
+
+def run_cyclic_research_submission(
+    team: str,
+    model_name: str,
+    dataset: str,
+    correction_code: str,
+    model_code: str,
+) -> tuple[pd.DataFrame, dict[str, float | int], str, str]:
+    """Run the optional local/research cyclic batch protocol."""
+    print(
+        f"[submission-runner] Running RESEARCH cyclic batch evaluation for "
+        f"'{team}' / '{model_name}' on {dataset}",
+        flush=True,
+    )
+    X, y, batches, names = _load_cyclic_research_dataset(dataset)
+    result = _cross_validate_cyclic_submission(
+        correction_code,
+        model_code,
+        dataset,
+        X,
+        y,
+        batches,
+        names,
+    )
+    metrics = result["metrics"]
+    metrics["train_batches"] = int(batches.nunique())
+    metrics["test_batches"] = int(batches.nunique())
+    metrics["train_samples"] = int(len(X))
+    metrics["test_samples"] = int(metrics.get("n_samples", len(result["pred_df"])))
+    return result["pred_df"], metrics, "", ""
+
+
 def run_code_submission(
     team: str,
     model_name: str,
     dataset: str,
     correction_code: str,
     model_code: str,
+    evaluation_protocol: str = "fixed_external",
     # groups: pd.Series = None,
 ) -> tuple[pd.DataFrame, dict[str, float | int], str, str]:
     """
@@ -1777,6 +2117,17 @@ def run_code_submission(
         - plot_html: HTML display of plots (shown publicly)
         - plots_json: JSON serialized plots (stored privately in database, used when displaying)
     """
+    if evaluation_protocol == "cyclic_batches":
+        return run_cyclic_research_submission(
+            team=team,
+            model_name=model_name,
+            dataset=dataset,
+            correction_code=correction_code,
+            model_code=model_code,
+        )
+    if evaluation_protocol != "fixed_external":
+        raise ValueError(f"Unknown evaluation protocol: {evaluation_protocol}")
+
     print(f"[submission-runner] Running code submission for team '{team}', model '{model_name}', dataset '{dataset}'")
     plot_capture = PlotCapture()
     print(f"[submission-runner] Capturing plots for submission display and storage.")
