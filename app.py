@@ -1123,7 +1123,7 @@ Submit batch correction and model code. Evaluation runs server-side.
             r_board_out = gr.Dataframe(
                 label=f"Real Leaderboard (top {LEADERBOARD_UI_LIMIT} rows)",
                 value=get_real_board("massbench_benchmark"),
-                wrap=False,
+                wrap=True,
                 interactive=False,
             )
             r_dataset_in.change(
@@ -1376,22 +1376,17 @@ Datasets are ordered by submission date.
                 outputs=[dataset_selector_modal, r_dataset_in, r_board_out, r_dataset_info, r_train_download, r_test_download]
             )
 
-        with gr.TabItem("BERNN Recommender", render_children=True):
-            gr.Markdown("""
-## Zero-shot BERNN hyperparameter recommender
-
-Use the pretrained meta-network to predict a BERNN configuration directly from
-dataset-level statistics. No Optuna search is run here.
-
-Choose an existing benchmark training split, or upload a CSV whose first columns
-include `name`, `batch`, and `label`, followed by numeric feature columns.
-""")
+        with gr.TabItem("BERNN Recommender"):
+            gr.Markdown(
+                "## Zero-shot BERNN hyperparameter recommender\n\n"
+                "Use the pretrained meta-network to predict a BERNN configuration directly from "
+                "dataset-level statistics. No Optuna search is run here."
+            )
 
             meta_checkpoint_status = gr.Textbox(
-                label="Meta-network checkpoint",
+                label="Checkpoint",
                 value=recommender_checkpoint_status(),
                 interactive=False,
-                lines=3,
             )
 
             with gr.Row():
@@ -1401,7 +1396,7 @@ include `name`, `batch`, and `label`, followed by numeric feature columns.
                     label="Existing dataset",
                 )
                 meta_upload = gr.File(
-                    label="Or upload dataset CSV",
+                    label="Or upload CSV",
                     file_types=[".csv"],
                 )
 
@@ -1411,32 +1406,32 @@ include `name`, `batch`, and `label`, followed by numeric feature columns.
             )
 
             meta_status = gr.Textbox(
-                label="Recommendation status",
-                interactive=False,
+                label="Status",
                 lines=6,
+                interactive=False,
             )
-
             meta_config = gr.Textbox(
                 label="Recommended hyperparameters",
+                lines=16,
+                max_lines=24,
                 interactive=False,
-                lines=14,
-                max_lines=20,
             )
 
             with gr.Accordion("Dataset meta-features", open=False):
                 meta_features_table = gr.Textbox(
-                    label="Computed dataset descriptors",
+                    label="Computed descriptors",
+                    lines=18,
+                    max_lines=30,
                     interactive=False,
-                    lines=14,
-                    max_lines=24,
                 )
 
-            meta_code = gr.Textbox(
-                label="Generated BERNN model code",
-                interactive=False,
-                lines=16,
-                max_lines=24,
-            )
+            with gr.Accordion("Generated BERNN code", open=False):
+                meta_code = gr.Textbox(
+                    label="Model code",
+                    lines=20,
+                    max_lines=30,
+                    interactive=False,
+                )
 
             meta_run.click(
                 fn=run_meta_recommendation,
