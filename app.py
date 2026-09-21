@@ -1095,6 +1095,39 @@ def run_meta_recommendation(dataset: str, uploaded_file):
                 f"Benchmark hyperparameter prediction error: {float(benchmark_error):.4f}"
             )
 
+        source_reference = metadata.get("best_source", {}).get(dataset)
+        if isinstance(source_reference, dict):
+            if source_reference.get("valid_mcc") is not None:
+                details.append(
+                    f"Original HPO source valid MCC: "
+                    f"{float(source_reference['valid_mcc']):.4f}"
+                )
+            if source_reference.get("test_mcc") is not None:
+                details.append(
+                    f"Original HPO source fixed-test MCC: "
+                    f"{float(source_reference['test_mcc']):.4f}"
+                )
+            reference_config = source_reference.get("config")
+            if isinstance(reference_config, dict):
+                shared_keys = sorted(set(decoded) & set(reference_config))
+                differing = [
+                    key for key in shared_keys
+                    if (
+                        not np.isclose(decoded[key], reference_config[key], rtol=1e-6, atol=1e-9)
+                        if isinstance(decoded[key], (int, float, np.integer, np.floating))
+                           and isinstance(reference_config[key], (int, float, np.integer, np.floating))
+                        else decoded[key] != reference_config[key]
+                    )
+                ]
+                details.append(
+                    f"Predicted vs original HPO config: "
+                    f"{len(shared_keys) - len(differing)}/{len(shared_keys)} shared fields match"
+                )
+                if differing:
+                    details.append(
+                        "Different fields: " + ", ".join(differing)
+                    )
+
         config_text = "\n".join(
             f"{row.hyperparameter}: {row.value}"
             for row in config_table.itertuples(index=False)
