@@ -1109,7 +1109,7 @@ Submit batch correction and model code. Evaluation runs server-side.
             r_board_out = gr.Dataframe(
                 label=f"Real Leaderboard (top {LEADERBOARD_UI_LIMIT} rows)",
                 value=get_real_board("massbench_benchmark"),
-                wrap=True,
+                wrap=False,
                 interactive=False,
             )
             r_dataset_in.change(
