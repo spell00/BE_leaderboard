@@ -15,6 +15,8 @@ import pandas as pd
 import numpy as np
 from huggingface_hub import HfApi
 
+from src.zero_shot_recommender.meta_features import META_FEATURE_NAMES, extract_meta_features
+
 ROOT = Path(__file__).resolve().parent.parent
 STAGING_ROOT = ROOT / "data" / "dataset_submissions"
 MAX_DATASET_BYTES = 50 * 1024 * 1024
@@ -132,8 +134,18 @@ def validate_dataset_proposal(
 
 
 def stage_dataset_proposal(csv_path: str | Path, submitted_by: str, **metadata) -> dict:
-    """Validate and stage a proposal locally and, when configured, on the Hub."""
-    _, record = validate_dataset_proposal(csv_path, **metadata)
+    """Validate, describe, and stage a proposal locally and, when configured, on the Hub."""
+    frame, record = validate_dataset_proposal(csv_path, **metadata)
+    feature_columns = [column for column in frame.columns if column not in REQUIRED_COLUMNS]
+    meta_features = extract_meta_features(
+        frame[feature_columns],
+        frame["label"],
+        frame["batch"],
+    )
+    record["meta_feature_names"] = list(META_FEATURE_NAMES)
+    record["meta_features"] = {
+        name: float(meta_features[name]) for name in META_FEATURE_NAMES
+    }
     submission_id = f"{_slug(record['title'])}-{uuid.uuid4().hex[:12]}"
     destination = STAGING_ROOT / submission_id
     destination.mkdir(parents=True, exist_ok=False)
