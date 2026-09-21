@@ -694,7 +694,12 @@ def submit_real(
     model_code = str(model_code or "")
     custom_pip = str(custom_pip or "")
     evaluation_protocol = str(evaluation_protocol or "fixed_external")
-    print(f"[submission] Received submission from {team.strip() or 'anonymous'} / {model_name.strip() or 'unnamed'} on {dataset}", flush=True)
+    print(
+        f"[submission] Received submission from {team.strip() or 'anonymous'} / "
+        f"{model_name.strip() or 'unnamed'} on {dataset}; "
+        f"evaluation_protocol={evaluation_protocol}",
+        flush=True,
+    )
     if not dataset.strip():
         return get_real_board(dataset), "Dataset is required.", ""
     if not team:
@@ -757,7 +762,11 @@ def submit_real(
         print(f"[submission] HF_TOKEN is not configured for submission on {dataset}", flush=True)
         return _finish(get_real_board(dataset), "HF_TOKEN is not configured on this Space. The evaluator cannot access private data — contact the organiser.")
 
-    print(f"[submission] Running code submission for {team.strip()} / {model_name.strip()} on {dataset}", flush=True)
+    print(
+        f"[submission] Running code submission for {team.strip()} / "
+        f"{model_name.strip()} on {dataset}; protocol={evaluation_protocol}",
+        flush=True,
+    )
     try:
         try:
             metrics = _run_code_submission_cancellable(
@@ -1348,23 +1357,76 @@ Submit batch correction and model code. Evaluation runs server-side.
                 value="massbench_benchmark",
                 label="Dataset",
             )
+
+            gr.Markdown("#### Test / validation protocol")
+            r_eval_protocol = gr.Radio(
+                choices=[
+                    (
+                        "Never-seen external test — keep the designated test batch(es) "
+                        "out of train/validation",
+                        "fixed_external",
+                    ),
+                    (
+                        "Rotating batch LBO — each evaluable batch is validation once "
+                        "and test once",
+                        "cyclic_batches",
+                    ),
+                ],
+                value="fixed_external",
+                label="Choose protocol before running",
+                info=(
+                    "Adenocarcinoma example: never-seen mode uses batches 1/2 for "
+                    "train-validation and keeps batch 3 as external test (2 folds). "
+                    "Rotating LBO runs 3 rounds: 1→2→3, 2→3→1, 3→1→2. "
+                    "Rotating runs are research-only and are not written to the official leaderboard."
+                ),
+            )
+            r_protocol_summary = gr.Markdown(
+                "**Selected:** Never-seen external test. "
+                "For adenocarcinoma this means 2 train/validation folds and batch 3 is never "
+                "used for training or validation."
+            )
             r_dataset_info = gr.Markdown(
                 value=get_dataset_info("massbench_benchmark"),
                 label="Dataset Information"
             )
-            r_eval_protocol = gr.Radio(
-                choices=[
-                    ("Fixed external test — official leaderboard", "fixed_external"),
-                    ("Cyclic batch rotation — research only", "cyclic_batches"),
-                ],
-                value="fixed_external",
-                label="Evaluation protocol",
-                info=(
-                    "Fixed external keeps the hidden test set untouched. "
-                    "Cyclic rotates each batch through validation and test once; "
-                    "it is a research analysis and is not saved to the official leaderboard."
-                ),
+            def protocol_summary(protocol: str, dataset: str) -> str:
+                if protocol == "cyclic_batches":
+                    if dataset == "massbench_adenocarcinoma":
+                        return (
+                            "**Selected: Rotating batch LBO.** Adenocarcinoma runs 3 rounds: "
+                            "R1 train=1, valid=2, test=3; "
+                            "R2 train=2, valid=3, test=1; "
+                            "R3 train=3, valid=1, test=2."
+                        )
+                    return (
+                        "**Selected: Rotating batch LBO.** Each evaluable batch is used exactly "
+                        "once as validation and exactly once as test; all other batches train."
+                    )
+                if dataset == "massbench_adenocarcinoma":
+                    return (
+                        "**Selected: Never-seen external test.** Adenocarcinoma uses 2 "
+                        "train/validation folds across batches 1 and 2; batch 3 remains entirely "
+                        "outside train/validation and is used only as the external test."
+                    )
+                return (
+                    "**Selected: Never-seen external test.** The designated external test "
+                    "batch(es) are never used for training or validation."
+                )
+
+            r_eval_protocol.change(
+                fn=protocol_summary,
+                inputs=[r_eval_protocol, r_dataset_in],
+                outputs=[r_protocol_summary],
+                queue=False,
             )
+            r_dataset_in.change(
+                fn=protocol_summary,
+                inputs=[r_eval_protocol, r_dataset_in],
+                outputs=[r_protocol_summary],
+                queue=False,
+            )
+
             r_board_out = gr.Dataframe(
                 label=f"Real Leaderboard (top {LEADERBOARD_UI_LIMIT} rows)",
                 value=get_real_board("massbench_benchmark"),
