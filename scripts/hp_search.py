@@ -346,19 +346,23 @@ def run_cyclic_batch_trial(cfg: dict, args, data, exp_id: str):
     if bool(cfg.get("log1p", False)):
         X = _apply_log1p_preprocessing(X)
 
-    splits = cyclic_train_valid_test_splits(batches)
-    n_rounds = len(splits)
     is_alzheimer = getattr(args, "dataset", "") == ALZHEIMER_DATASET
+    supervised_mask = (
+        np.isin(y, list(ALZHEIMER_SUPERVISED_LABELS))
+        if is_alzheimer
+        else np.ones(len(y), dtype=bool)
+    )
+    splits = cyclic_train_valid_test_splits(
+        batches,
+        eligible_mask=supervised_mask if is_alzheimer else None,
+    )
+    n_rounds = len(splits)
 
     model_y = y.astype(object).copy()
     if is_alzheimer:
-        supervised_mask = np.isin(y, list(ALZHEIMER_SUPERVISED_LABELS))
         model_y[~supervised_mask] = "-1"
         if not np.any(~supervised_mask):
             raise ValueError("Alzheimer cyclic task requires pooled unsupervised samples")
-    else:
-        supervised_mask = np.ones(len(y), dtype=bool)
-
     valid_scores = []
     test_scores = []
     fold_metrics = []
