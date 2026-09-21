@@ -61,7 +61,7 @@ def test_alzheimer_cv_splits_on_supervised_rows_then_expands_whole_batches():
     )
 
     assert "Alzheimer semi-supervised" in protocol
-    assert len(splits) == 5
+    assert len(splits) == 3
 
     all_indices = set(range(len(rows)))
     for train_idx, valid_idx in splits:
@@ -78,3 +78,26 @@ def test_alzheimer_cv_splits_on_supervised_rows_then_expands_whole_batches():
         for batch in set(batches):
             batch_indices = set(np.flatnonzero(batches.to_numpy() == batch))
             assert batch_indices <= train_set or batch_indices <= valid_set
+
+
+def test_adenocarcinoma_uses_two_batch_holdout_folds():
+    batches = pd.Series(["1"] * 6 + ["2"] * 6)
+    labels = pd.Series(["1", "1", "QC", "0", "1", "1"] * 2)
+    X = pd.DataFrame({"feature": np.arange(len(labels), dtype=float)})
+
+    protocol, splits = _submission_cv_splits(
+        "massbench_adenocarcinoma",
+        X,
+        labels,
+        batches,
+    )
+
+    assert "StratifiedGroupKFold(n_splits=2" in protocol
+    assert len(splits) == 2
+
+    for train_idx, valid_idx in splits:
+        train_batches = set(batches.iloc[train_idx].astype(str))
+        valid_batches = set(batches.iloc[valid_idx].astype(str))
+        assert train_batches.isdisjoint(valid_batches)
+        assert len(train_batches) == 1
+        assert len(valid_batches) == 1
