@@ -86,13 +86,23 @@ def validate_recommender_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     if normalized["label"].nunique() < 2:
         raise ValueError("At least two classes are required.")
 
-    numeric = normalized[feature_columns].apply(pd.to_numeric, errors="coerce")
-    invalid = ~np.isfinite(numeric.to_numpy(dtype=float))
-    if invalid.any():
-        bad_count = int(invalid.sum())
+    original = normalized[feature_columns]
+    numeric = original.apply(pd.to_numeric, errors="coerce")
+
+    # Missing/non-finite numeric values are intentional inputs to
+    # extract_meta_features(): that function measures missingness and replaces
+    # non-finite values only for geometry calculations. Reject only cells that
+    # contained a non-empty, non-numeric value.
+    original_nonempty = original.notna() & original.astype(str).apply(
+        lambda column: column.str.strip().ne("")
+    )
+    failed_parse = original_nonempty & numeric.isna()
+    if failed_parse.to_numpy().any():
+        bad_count = int(failed_parse.to_numpy().sum())
+        bad_columns = list(failed_parse.columns[failed_parse.any(axis=0)][:5])
         raise ValueError(
-            f"Feature matrix contains {bad_count} missing, non-numeric, or "
-            "infinite values."
+            f"Feature matrix contains {bad_count} non-numeric values "
+            f"(example columns: {bad_columns}). Missing numeric values are allowed."
         )
 
     normalized.loc[:, feature_columns] = numeric
