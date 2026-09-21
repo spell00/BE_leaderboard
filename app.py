@@ -76,6 +76,7 @@ from src.meta_recommender import (
     recommend_bernn_config,
     recommendation_tables,
     resolve_checkpoint_path,
+    recommender_evaluation_protocol,
 )
 from src.zero_shot_recommender.meta_features import META_FEATURE_NAMES
 
@@ -1064,6 +1065,25 @@ def _load_recommender_input(dataset: str, uploaded_file) -> tuple[pd.DataFrame, 
         path = getattr(uploaded_file, "name", uploaded_file)
         return pd.read_csv(path), f"uploaded file: {Path(path).name}"
 
+    protocol = recommender_evaluation_protocol()
+    if protocol == "cyclic_batches":
+        from scripts.hp_search import load_cyclic_dataset
+
+        X, y, batches = load_cyclic_dataset(dataset)
+        normalized = pd.DataFrame({
+            "name": [f"{dataset}_{index}" for index in range(len(X))],
+            "batch": pd.Series(batches).astype(str),
+            "label": pd.Series(y).astype(str),
+        })
+        normalized = pd.concat(
+            [normalized.reset_index(drop=True), X.reset_index(drop=True)],
+            axis=1,
+        )
+        return (
+            normalized,
+            f"{DATASET_LABELS.get(dataset, dataset)} (cyclic batch universe)",
+        )
+
     path = ROOT / "data" / "datasets" / dataset / f"{dataset}_train.csv"
     if not path.exists():
         raise FileNotFoundError(f"Training split not found: {path}")
@@ -1129,12 +1149,14 @@ def run_meta_recommendation(dataset: str, uploaded_file):
                     )
 
         checkpoint_name = Path(result["checkpoint_path"]).name
+        checkpoint_protocol = metadata.get("evaluation_protocol", "fixed_external_test_v1")
         round_number = metadata.get("round")
         benchmark_error = metadata.get("benchmark_prediction_error")
 
         details = [
             f"Recommendation generated for {source_name}.",
             f"Checkpoint: {checkpoint_name}",
+            f"Checkpoint evaluation protocol: {checkpoint_protocol}",
             f"Input: {len(frame)} samples, {max(len(frame.columns) - 3, 0)} features",
             f"Meta-features: {len(result.get('meta_features', {}))}",
         ]
