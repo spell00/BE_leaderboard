@@ -97,6 +97,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from src.dataset_tasks import (
+    ALZHEIMER_DATASET,
+    ALZHEIMER_SUPERVISED_LABELS,
+    POOL_LABEL,
+    alzheimer_supervised_mask,
+    prepare_alzheimer_development_labels,
+)
+
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -121,10 +129,6 @@ def _default_device():
 
 # Non-searched columns in the dataset CSVs (name,batch,label,<features...>).
 _META_COLS = ("name", "names", "batch", "batches", "label", "labels", "group")
-
-ALZHEIMER_DATASET = "massbench_alzheimer"
-ALZHEIMER_SUPERVISED_LABELS = frozenset({"CU", "DEM-AD"})
-POOL_LABEL = "pool"
 
 # revTriplet re-enabled: was broken in bernn 0.5.8 but fixed in 0.6.3.
 ADVERSARIAL_DLOSS = {"DANN", "revDANN", "inverseTriplet", "normae", "revTriplet"}
@@ -202,10 +206,9 @@ def load_dataset(name: str, combine_test: bool = False, path: str | None = None,
         # Alzheimer is a binary supervised task (DEM-AD vs CU). Every other
         # diagnosis and missing label remains available to BERNN's
         # reconstruction/domain losses as an unlabeled pooled sample.
-        labels = df["label"].astype("string").str.strip()
-        supervised = labels.isin(ALZHEIMER_SUPERVISED_LABELS)
+        mapped_labels, supervised = prepare_alzheimer_development_labels(df["label"])
         df = df.copy()
-        df["label"] = labels.where(supervised, POOL_LABEL)
+        df["label"] = mapped_labels
         print(
             f"[data] Alzheimer semi-supervised task: {int(supervised.sum())} "
             f"DEM-AD/CU rows + {int((~supervised).sum())} pooled rows"
@@ -242,7 +245,7 @@ def load_fixed_test_dataset(name: str):
     df = pd.read_csv(csv_path)
     labelled = df["label"].notna() & df["label"].astype("string").str.strip().ne("")
     if name == ALZHEIMER_DATASET:
-        labelled &= df["label"].astype("string").str.strip().isin(ALZHEIMER_SUPERVISED_LABELS)
+        labelled &= alzheimer_supervised_mask(df["label"]).to_numpy()
     df = df.loc[labelled].copy()
     feature_cols = [column for column in df.columns if column not in _META_COLS]
     X = df[feature_cols].astype(float).reset_index(drop=True)
