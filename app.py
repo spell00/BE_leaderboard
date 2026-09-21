@@ -28,6 +28,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import gradio as gr
+import numpy as np
 import pandas as pd
 import json
 import math
@@ -60,6 +61,11 @@ from src.code_challenge import CodeValidationError
 from src.database import DatabaseManager, PROJECT_VERSION, real_leaderboard_score
 from src.dataset_info import get_dataset_info_markdown
 from src.dataset_submission import DatasetSubmissionError, stage_dataset_proposal
+from src.dataset_tasks import (
+    clean_task_features,
+    prepare_builtin_training_frame,
+    task_feature_columns,
+)
 from src.real_results_store import (
     load_real_result_rows,
     merge_real_result_rows,
@@ -71,6 +77,7 @@ from src.meta_recommender import (
     recommendation_tables,
     resolve_checkpoint_path,
 )
+from src.zero_shot_recommender.meta_features import META_FEATURE_NAMES
 
 print(f"Gradio version: {gr.__version__}, Pandas version: {pd.__version__}")
 # print(f"Using SQLite version: {DatabaseManager.get_sqlite_version()}")
@@ -1000,7 +1007,7 @@ Available preloaded libraries:
 
 
 def _load_recommender_input(dataset: str, uploaded_file) -> tuple[pd.DataFrame, str]:
-    """Load either an uploaded CSV or the selected benchmark training split."""
+    """Load recommendation input using the same built-in preprocessing as HPO."""
     if uploaded_file:
         path = getattr(uploaded_file, "name", uploaded_file)
         return pd.read_csv(path), f"uploaded file: {Path(path).name}"
@@ -1008,7 +1015,16 @@ def _load_recommender_input(dataset: str, uploaded_file) -> tuple[pd.DataFrame, 
     path = ROOT / "data" / "datasets" / dataset / f"{dataset}_train.csv"
     if not path.exists():
         raise FileNotFoundError(f"Training split not found: {path}")
-    return pd.read_csv(path), DATASET_LABELS.get(dataset, dataset)
+
+    frame = prepare_builtin_training_frame(dataset, pd.read_csv(path))
+    feature_columns = task_feature_columns(frame)
+    cleaned = clean_task_features(frame, feature_columns)
+
+    normalized = frame[["name", "batch", "label"]].reset_index(drop=True).copy()
+    for column in feature_columns:
+        normalized[column] = cleaned[column]
+
+    return normalized, DATASET_LABELS.get(dataset, dataset)
 
 
 def run_meta_recommendation(dataset: str, uploaded_file):
@@ -1034,6 +1050,32 @@ def run_meta_recommendation(dataset: str, uploaded_file):
         )
 
         metadata = result.get("checkpoint_metadata", {})
+        if not uploaded_file:
+            reference_meta = metadata.get("raw_meta_features", {}).get(dataset)
+            if reference_meta is not None:
+                current_meta = np.asarray(
+                    [result["meta_features"][name] for name in META_FEATURE_NAMES],
+                    dtype=np.float32,
+                )
+                reference_meta = np.asarray(reference_meta, dtype=np.float32)
+                if current_meta.shape != reference_meta.shape or not np.allclose(
+                    current_meta,
+                    reference_meta,
+                    rtol=1e-6,
+                    atol=1e-8,
+                    equal_nan=True,
+                ):
+                    max_abs = (
+                        float(np.nanmax(np.abs(current_meta - reference_meta)))
+                        if current_meta.shape == reference_meta.shape
+                        else float("inf")
+                    )
+                    raise RuntimeError(
+                        f"Built-in dataset '{dataset}' does not reproduce the "
+                        "meta-features stored in this checkpoint "
+                        f"(max absolute difference={max_abs:.6g})."
+                    )
+
         checkpoint_name = Path(result["checkpoint_path"]).name
         round_number = metadata.get("round")
         benchmark_error = metadata.get("benchmark_prediction_error")
@@ -1044,6 +1086,8 @@ def run_meta_recommendation(dataset: str, uploaded_file):
             f"Input: {len(frame)} samples, {max(len(frame.columns) - 3, 0)} features",
             f"Meta-features: {len(result.get('meta_features', {}))}",
         ]
+        if not uploaded_file and metadata.get("raw_meta_features", {}).get(dataset) is not None:
+            details.append("Training-data meta-feature parity: verified")
         if round_number is not None:
             details.append(f"Checkpoint round: {round_number}")
         if benchmark_error is not None:
@@ -1072,6 +1116,7 @@ def run_meta_recommendation(dataset: str, uploaded_file):
             gr.update(interactive=True),
             gr.update(value=model_choice),
             generated_code,
+            gr.update(value=dataset) if not uploaded_file else gr.update(),
         )
     except Exception as exc:
         print(
@@ -1084,6 +1129,7 @@ def run_meta_recommendation(dataset: str, uploaded_file):
             _format_exec_error(exc),
             "",
             gr.update(interactive=False),
+            gr.update(),
             gr.update(),
             gr.update(),
         )
@@ -1335,6 +1381,7 @@ Datasets are ordered by submission date.
                     meta_apply,
                     r_model_baseline,
                     r_model_code,
+                    r_dataset_in,
                 ],
                 api_name="recommend_bernn",
                 queue=False,
