@@ -53,6 +53,7 @@ from src.baselines import (
     BERNN_KNOBS,
     bernn_config,
     build_bernn_code,
+    family_for_config,
     maybe_register_tuned,
 )
 from src.code_challenge import CodeValidationError
@@ -1025,6 +1026,12 @@ def run_meta_recommendation(dataset: str, uploaded_file):
         decoded = result["config"]
         full_config = bernn_config(**decoded)
         generated_code = build_bernn_code(full_config)
+        family = family_for_config(full_config)
+        model_choice = (
+            f"bernn_{family}"
+            if family and f"bernn_{family}" in MODEL_EXAMPLES
+            else "bernn"
+        )
 
         metadata = result.get("checkpoint_metadata", {})
         checkpoint_name = Path(result["checkpoint_path"]).name
@@ -1063,6 +1070,8 @@ def run_meta_recommendation(dataset: str, uploaded_file):
             "\n".join(details),
             generated_code,
             gr.update(interactive=True),
+            gr.update(value=model_choice),
+            generated_code,
         )
     except Exception as exc:
         print(
@@ -1075,6 +1084,8 @@ def run_meta_recommendation(dataset: str, uploaded_file):
             _format_exec_error(exc),
             "",
             gr.update(interactive=False),
+            gr.update(),
+            gr.update(),
         )
 
 
@@ -1164,20 +1175,6 @@ Run a reproducible server-side benchmark or propose a matrix-ready dataset.
             interactive=False,
         )
 
-        meta_run.click(
-            fn=run_meta_recommendation,
-            inputs=[meta_dataset, meta_upload],
-            outputs=[
-                meta_config,
-                meta_features_table,
-                meta_status,
-                meta_code,
-                meta_apply,
-            ],
-            api_name="recommend_bernn",
-            queue=False,
-            show_progress="full",
-        )
 
 
 
@@ -1321,10 +1318,27 @@ Datasets are ordered by submission date.
                 inputs=[r_model_baseline],
                 outputs=[r_model_code],
             )
-            r_model_baseline.change(
+            r_model_baseline.input(
                 fn=lambda x: load_baseline(x, False),
                 inputs=[r_model_baseline],
                 outputs=[r_model_code],
+            )
+
+            meta_run.click(
+                fn=run_meta_recommendation,
+                inputs=[meta_dataset, meta_upload],
+                outputs=[
+                    meta_config,
+                    meta_features_table,
+                    meta_status,
+                    meta_code,
+                    meta_apply,
+                    r_model_baseline,
+                    r_model_code,
+                ],
+                api_name="recommend_bernn",
+                queue=False,
+                show_progress="full",
             )
 
             meta_apply.click(
