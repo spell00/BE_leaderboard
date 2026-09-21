@@ -411,3 +411,61 @@ python scripts/summarize_meta_hpo_results.py \
 ```
 
 This writes `summary_alzheimer_optuna_baseline.csv` and `summary_scenario_results.csv`.
+
+# 7. Synchronized meta-network checkpoints and recovery
+
+`scripts/run_synchronized_meta_hpo.py` now saves the selected meta network before
+each round's Alzheimer BERNN evaluation. Under its `--output-dir`:
+
+- `meta_checkpoints/round_0028.pt` is the selected network for zero-based round 28
+  (round 29 in the console).
+- `meta_checkpoints/best_benchmark.pt` has the lowest benchmark hyperparameter
+  prediction error among saved rounds.
+- `meta_checkpoints/best_alzheimer.pt` has the highest measured Alzheimer
+  validation MCC among saved rounds.
+- `rounds.jsonl` links each new result to its `meta_checkpoint`.
+
+Every checkpoint includes CPU model weights, architecture, feature names/order,
+inference normalization, hyperparameter decoding schema, source configurations,
+raw dataset meta-features, seed, and training settings. Scores are added after
+evaluation. Writes are atomic; with W&B enabled, checkpoints are also queued for
+upload to the run's Files tab. Local saving works with `--no-wandb`.
+An already running Python process must be restarted with the existing resume
+arguments to use the updated saving code.
+
+Earlier runs saved trial records but no meta-network weights. Recover all recorded
+rounds of this run without repeating BERNN HPO or Alzheimer training:
+
+```bash
+python scripts/recover_synchronized_meta_model.py \
+  --output-dir results/synchronized_meta_hpo_vm2_v1 --all
+```
+
+Use `--round 28` for a specific zero-based round, or omit both selectors to recover
+the highest Alzheimer validation MCC round. `--seed` (default 42) and `--n-epochs`
+(default 1000) must match the original run. Recovery uses each round's recorded
+source winners, selected hidden size and learning rate, and 200 meta-training
+epochs. It preserves the historical runner's training/inference transforms.
+It verifies the decoded Alzheimer configuration and benchmark error against the
+ledger (`rtol=1e-5`, `atol=1e-8`), then verifies save/reload prediction equality.
+Mismatches are reported without saving that round.
+
+Recovered checkpoints are explicitly marked `reconstructed` and stored separately
+under `recovered/meta_checkpoints/`, with the same filenames and best-by-metric
+aliases. Matching predictions do not establish that every weight is identical to
+the unavailable original checkpoint. The Alzheimer MCC remains the historical
+measurement; recovery does not repeat its BERNN evaluation.
+
+Load a checkpoint to recommend BERNN hyperparameters for a new dataset:
+
+```python
+from src.direct_meta_checkpoint import predict_from_checkpoint
+
+config = predict_from_checkpoint(
+    "results/synchronized_meta_hpo_vm2_v1/recovered/meta_checkpoints/round_0028.pt",
+    X_train, y_train, batches_train,
+)
+```
+
+This loads the meta network and returns a BERNN configuration. Training BERNN on
+that configuration is a separate step.
