@@ -7,6 +7,16 @@ ROOT = Path(__file__).resolve().parent.parent
 DATASETS_DIR = ROOT / "data" / "datasets"
 
 DATASET_DESCRIPTIONS = {
+    "normal_tissue_878": {
+        "title": "Normal Tissue 878",
+        "description": "Source dataset used by synchronized BERNN hyperparameter optimization and meta-learning.",
+        "task": "Supervised classification under technical batch effects",
+    },
+    "colon_3041": {
+        "title": "Colon 3041",
+        "description": "Source dataset used by synchronized BERNN hyperparameter optimization and meta-learning.",
+        "task": "Supervised classification under technical batch effects",
+    },
     "massbench_adenocarcinoma": {
         "title": "MassBench Adenocarcinoma",
         "description": "Mass spectrometry dataset for adenocarcinoma classification with batch effects.",
@@ -89,13 +99,58 @@ DATASET_METADATA = {
 }
 
 
+def _runtime_metadata(dataset_key: str) -> dict:
+    """Compute basic metadata when a dataset is present locally but not statically listed."""
+    base = DATASETS_DIR / dataset_key
+    train_path = base / f"{dataset_key}_train.csv"
+    test_path = base / f"{dataset_key}_test.csv"
+    if not train_path.exists():
+        return {}
+
+    train = pd.read_csv(train_path)
+    test = pd.read_csv(test_path) if test_path.exists() else pd.DataFrame()
+
+    feature_cols = [
+        column for column in train.columns
+        if column not in {"name", "batch", "label", "names", "batches", "labels", "group"}
+    ]
+    train_labels = train["label"].astype(str) if "label" in train.columns else pd.Series(dtype=str)
+    return {
+        "train_samples": int(len(train)),
+        "test_samples": int(len(test)),
+        "train_features": int(len(feature_cols)),
+        "test_features": int(len([
+            column for column in test.columns
+            if column not in {"name", "batch", "label", "names", "batches", "labels", "group"}
+        ])) if len(test) else 0,
+        "classes": train_labels.value_counts().to_dict(),
+        "train_classes": int(train_labels.nunique()) if len(train_labels) else 0,
+        "test_classes": int(test["label"].astype(str).nunique()) if "label" in test.columns else 0,
+        "train_batches": int(train["batch"].astype(str).nunique()) if "batch" in train.columns else 0,
+        "test_batches": int(test["batch"].astype(str).nunique()) if "batch" in test.columns else 0,
+        "train_batch_info": (
+            train["batch"].astype(str).value_counts().sort_index().to_dict()
+            if "batch" in train.columns else {}
+        ),
+        "test_batch_info": (
+            test["batch"].astype(str).value_counts().sort_index().to_dict()
+            if "batch" in test.columns else {}
+        ),
+        "domain": "Batch-effects benchmark",
+    }
+
+
+def _fmt(value):
+    return f"{value:,}" if isinstance(value, (int, float)) else str(value)
+
+
 def get_dataset_info_markdown(dataset_key: str) -> str:
     """Generate markdown displaying dataset information and metrics."""
     if dataset_key not in DATASET_DESCRIPTIONS:
         return "Unknown dataset"
     
     desc = DATASET_DESCRIPTIONS[dataset_key]
-    meta = DATASET_METADATA.get(dataset_key, {})
+    meta = DATASET_METADATA.get(dataset_key) or _runtime_metadata(dataset_key)
     
     # Calculate basic statistics
     total_train = meta.get("train_samples", 0)
@@ -148,8 +203,8 @@ def get_dataset_info_markdown(dataset_key: str) -> str:
 | Total Samples (Train + Test) | {total_samples:,} |
 | Training Set | {total_train:,} samples |
 | Test Set | {total_test:,} |
-| Features (Train) | {meta.get('train_features', 'N/A'):,} |
-| Features (Test) | {meta.get('test_features', 'N/A'):,} |
+| Features (Train) | {_fmt(meta.get('train_features', 'N/A'))} |
+| Features (Test) | {_fmt(meta.get('test_features', 'N/A'))} |
 | Classes (Train) | {meta.get('train_classes', 'N/A')} |
 | Classes (Test) | {meta.get('test_classes', 'N/A')} |
 | Batches (Train) | {meta.get('train_batches', 'N/A')} |
