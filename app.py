@@ -1099,6 +1099,79 @@ Run a reproducible server-side benchmark or propose a matrix-ready dataset.
 """)
     gr.LoginButton()
 
+    with gr.Accordion("BERNN Recommender", open=True):
+        gr.Markdown(
+            "## Zero-shot BERNN hyperparameter recommender\n\n"
+            "Use the pretrained meta-network to predict a BERNN configuration directly from "
+            "dataset-level statistics. No Optuna search is run here."
+        )
+
+        meta_checkpoint_status = gr.Textbox(
+            label="Checkpoint",
+            value=recommender_checkpoint_status(),
+            interactive=False,
+        )
+
+        with gr.Row():
+            meta_dataset = gr.Dropdown(
+                choices=[(label, key) for key, label in DATASET_LABELS.items()],
+                value="massbench_benchmark",
+                label="Existing dataset",
+            )
+            meta_upload = gr.File(
+                label="Or upload CSV",
+                file_types=[".csv"],
+            )
+
+        meta_run = gr.Button(
+            "Recommend BERNN configuration",
+            variant="primary",
+        )
+
+        meta_status = gr.Textbox(
+            label="Status",
+            lines=6,
+            interactive=False,
+        )
+        meta_config = gr.Textbox(
+            label="Recommended hyperparameters",
+            lines=16,
+            max_lines=24,
+            interactive=False,
+        )
+
+        with gr.Accordion("Dataset meta-features", open=False):
+            meta_features_table = gr.Textbox(
+                label="Computed descriptors",
+                lines=18,
+                max_lines=30,
+                interactive=False,
+            )
+
+        with gr.Accordion("Generated BERNN code", open=False):
+            meta_code = gr.Textbox(
+                label="Model code",
+                lines=20,
+                max_lines=30,
+                interactive=False,
+            )
+
+        meta_run.click(
+            fn=run_meta_recommendation,
+            inputs=[meta_dataset, meta_upload],
+            outputs=[
+                meta_config,
+                meta_features_table,
+                meta_status,
+                meta_code,
+            ],
+            api_name="recommend_bernn",
+            queue=False,
+            show_progress="full",
+        )
+
+
+
     with gr.Tabs():
         with gr.TabItem("Real Leaderboard (Code Run)"):
             gr.Markdown("""
@@ -1374,77 +1447,6 @@ Datasets are ordered by submission date.
                 fn=confirm_dataset_selection,
                 inputs=[ds_selector_dropdown],
                 outputs=[dataset_selector_modal, r_dataset_in, r_board_out, r_dataset_info, r_train_download, r_test_download]
-            )
-
-        with gr.TabItem("BERNN Recommender"):
-            gr.Markdown(
-                "## Zero-shot BERNN hyperparameter recommender\n\n"
-                "Use the pretrained meta-network to predict a BERNN configuration directly from "
-                "dataset-level statistics. No Optuna search is run here."
-            )
-
-            meta_checkpoint_status = gr.Textbox(
-                label="Checkpoint",
-                value=recommender_checkpoint_status(),
-                interactive=False,
-            )
-
-            with gr.Row():
-                meta_dataset = gr.Dropdown(
-                    choices=[(label, key) for key, label in DATASET_LABELS.items()],
-                    value="massbench_benchmark",
-                    label="Existing dataset",
-                )
-                meta_upload = gr.File(
-                    label="Or upload CSV",
-                    file_types=[".csv"],
-                )
-
-            meta_run = gr.Button(
-                "Recommend BERNN configuration",
-                variant="primary",
-            )
-
-            meta_status = gr.Textbox(
-                label="Status",
-                lines=6,
-                interactive=False,
-            )
-            meta_config = gr.Textbox(
-                label="Recommended hyperparameters",
-                lines=16,
-                max_lines=24,
-                interactive=False,
-            )
-
-            with gr.Accordion("Dataset meta-features", open=False):
-                meta_features_table = gr.Textbox(
-                    label="Computed descriptors",
-                    lines=18,
-                    max_lines=30,
-                    interactive=False,
-                )
-
-            with gr.Accordion("Generated BERNN code", open=False):
-                meta_code = gr.Textbox(
-                    label="Model code",
-                    lines=20,
-                    max_lines=30,
-                    interactive=False,
-                )
-
-            meta_run.click(
-                fn=run_meta_recommendation,
-                inputs=[meta_dataset, meta_upload],
-                outputs=[
-                    meta_config,
-                    meta_features_table,
-                    meta_status,
-                    meta_code,
-                ],
-                api_name="recommend_bernn",
-                queue=False,
-                show_progress="full",
             )
 
         with gr.TabItem("Add a Dataset"):
