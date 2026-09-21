@@ -1150,11 +1150,11 @@ Run a reproducible server-side benchmark or propose a matrix-ready dataset.
                 interactive=False,
             )
 
-        with gr.Accordion("Generated BERNN code", open=False):
+        with gr.Accordion("Predicted BERNN model code", open=True):
             meta_code = gr.Textbox(
-                label="Model code",
-                lines=20,
-                max_lines=30,
+                label="Runnable fit(...) code using the predicted hyperparameters",
+                lines=28,
+                max_lines=40,
                 interactive=False,
             )
 
