@@ -78,6 +78,7 @@ RUN_LOG_DIR = ROOT / "logs" / "ui_runs"
 LATEST_RUN_LOG = RUN_LOG_DIR / "latest.log"
 UI_LOG_MAX_CHARS = 30_000
 UI_LOG_TRIM_AT_CHARS = UI_LOG_MAX_CHARS * 2
+LEADERBOARD_UI_LIMIT = 40
 _ACTIVE_REAL_RUNS: dict[str, dict] = {}
 _ACTIVE_REAL_RUNS_LOCK = threading.Lock()
 
@@ -560,7 +561,10 @@ def get_real_board(dataset: str | None = None) -> pd.DataFrame:
                 rounded_row[k] = v
         filtered.append(rounded_row)
 
-    return _json_safe_dataframe(pd.DataFrame(filtered))
+    frame = _json_safe_dataframe(pd.DataFrame(filtered))
+    if dataset is not None and len(frame) > LEADERBOARD_UI_LIMIT:
+        frame = frame.head(LEADERBOARD_UI_LIMIT)
+    return frame
 
 
 
@@ -1035,16 +1039,24 @@ def run_meta_recommendation(dataset: str, uploaded_file):
                 f"Benchmark hyperparameter prediction error: {float(benchmark_error):.4f}"
             )
 
+        config_text = "\n".join(
+            f"{row.hyperparameter}: {row.value}"
+            for row in config_table.itertuples(index=False)
+        )
+        meta_text = "\n".join(
+            f"{row.meta_feature}: {row.value:.6g}"
+            for row in meta_table.itertuples(index=False)
+        )
         return (
-            config_table,
-            meta_table,
+            config_text,
+            meta_text,
             "\n".join(details),
             generated_code,
         )
     except Exception as exc:
         return (
-            pd.DataFrame(columns=["hyperparameter", "value"]),
-            pd.DataFrame(columns=["meta_feature", "value"]),
+            "",
+            "",
             _format_exec_error(exc),
             "",
         )
@@ -1095,7 +1107,7 @@ Submit batch correction and model code. Evaluation runs server-side.
                 label="Dataset Information"
             )
             r_board_out = gr.Dataframe(
-                label="Real Leaderboard",
+                label=f"Real Leaderboard (top {LEADERBOARD_UI_LIMIT} rows)",
                 value=get_real_board("massbench_benchmark"),
                 wrap=True,
                 interactive=False,
@@ -1390,25 +1402,26 @@ include `name`, `batch`, and `label`, followed by numeric feature columns.
                 lines=6,
             )
 
-            meta_config = gr.Dataframe(
-                headers=["hyperparameter", "value"],
+            meta_config = gr.Textbox(
                 label="Recommended hyperparameters",
                 interactive=False,
-                wrap=True,
+                lines=14,
+                max_lines=20,
             )
 
             with gr.Accordion("Dataset meta-features", open=False):
-                meta_features_table = gr.Dataframe(
-                    headers=["meta_feature", "value"],
+                meta_features_table = gr.Textbox(
                     label="Computed dataset descriptors",
                     interactive=False,
-                    wrap=True,
+                    lines=14,
+                    max_lines=24,
                 )
 
-            meta_code = gr.Code(
+            meta_code = gr.Textbox(
                 label="Generated BERNN model code",
-                language="python",
-                lines=20,
+                interactive=False,
+                lines=16,
+                max_lines=24,
             )
 
             meta_run.click(
