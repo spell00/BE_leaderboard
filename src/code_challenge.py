@@ -27,6 +27,15 @@ from sklearn.svm import LinearSVC, SVC
 
 from src.hf_utils import load_private_inference, load_private_labels
 from src.leaderboard import evaluate_predictions, sorted_board
+from src.dataset_tasks import (
+    ALZHEIMER_DATASET,
+    ALZHEIMER_SUPERVISED_LABELS,
+    UNSUPERVISED_LABEL,
+    alzheimer_supervised_mask,
+    model_labels_for_alzheimer,
+    prepare_builtin_training_frame,
+    task_feature_columns,
+)
 
 
 def fit(
@@ -732,7 +741,7 @@ def _load_data_for_dataset(dataset: str) -> tuple[pd.DataFrame, pd.Series, pd.Se
     if not train_path.exists():
         raise FileNotFoundError(f"Public train split not found: {train_path}")
 
-    train = pd.read_csv(train_path)
+    train = prepare_builtin_training_frame(dataset, pd.read_csv(train_path))
     private_inference = load_private_inference(dataset)
 
     required_train = {"name", "batch", "label"}
@@ -742,24 +751,51 @@ def _load_data_for_dataset(dataset: str) -> tuple[pd.DataFrame, pd.Series, pd.Se
     if not required_inf.issubset(set(private_inference.columns)):
         raise ValueError(f"Private inference for {dataset} must contain name and batch")
 
-    feature_cols = [c for c in train.columns if c not in {"name", "batch", "label"}]
-    missing = [c for c in feature_cols if c not in private_inference.columns]
+    # The Alzheimer target used by HPO is explicitly CU vs DEM-AD. Other
+    # development diagnoses remain as pooled unsupervised rows, while the fixed
+    # inference set contains only the declared supervised target classes.
+    if dataset == ALZHEIMER_DATASET:
+        if "label" in private_inference.columns:
+            keep_test = alzheimer_supervised_mask(private_inference["label"]).to_numpy()
+        else:
+            private_labels = load_private_labels(dataset)
+            if not {"name", "prediction"}.issubset(private_labels.columns):
+                raise ValueError(
+                    "Private Alzheimer labels must contain name and prediction columns"
+                )
+            supervised_names = set(
+                private_labels.loc[
+                    alzheimer_supervised_mask(private_labels["prediction"]).to_numpy(),
+                    "name",
+                ].astype(str)
+            )
+            keep_test = private_inference["name"].astype(str).isin(supervised_names).to_numpy()
+
+        private_inference = private_inference.loc[keep_test].reset_index(drop=True)
+        print(
+            f"[data] Alzheimer online task: {int(alzheimer_supervised_mask(train['label']).sum())} "
+            f"CU/DEM-AD development rows + "
+            f"{int((~alzheimer_supervised_mask(train['label'])).sum())} pooled rows; "
+            f"{len(private_inference)} supervised fixed-test rows",
+            flush=True,
+        )
+
+    feature_cols = task_feature_columns(train)
+    missing = [column for column in feature_cols if column not in private_inference.columns]
     if missing:
-        raise ValueError(f"Private inference for {dataset} is missing {len(missing)} feature columns")
+        raise ValueError(
+            f"Private inference for {dataset} is missing {len(missing)} feature columns"
+        )
 
-    y_train = train["label"].astype(str)
-    non_pool = y_train.str.lower() != "pool"
-
-    X_train = _clean_features(train.loc[non_pool], feature_cols)
-    y_train = y_train.loc[non_pool].reset_index(drop=True)
-    batches_train = train.loc[non_pool, "batch"].astype(str).reset_index(drop=True)
+    X_train = _clean_features(train, feature_cols)
+    y_train = train["label"].astype(str).reset_index(drop=True)
+    batches_train = train["batch"].astype(str).reset_index(drop=True)
 
     X_test = _clean_features(private_inference, feature_cols)
     batches_test = private_inference["batch"].astype(str).reset_index(drop=True)
     test_names = private_inference["name"].astype(str).reset_index(drop=True)
 
     return X_train, y_train, batches_train, X_test, batches_test, test_names.to_frame(name="name")
-
 
 def _apply_user_batch_correction(
     correction_code: str,
@@ -1409,13 +1445,83 @@ def _aligned_proba_frame(
 
 
 def _submission_cv_splits(
+    dataset: str,
     X_train: pd.DataFrame,
     y_train: pd.Series,
     batches_train: pd.Series,
 ) -> tuple[str, list[tuple[np.ndarray, np.ndarray]]]:
-    """Return the single server-owned CV protocol shared by every submission."""
+    """Return the server-owned CV protocol, including task-specific split rules."""
     labels = y_train.astype(str).reset_index(drop=True)
     groups = batches_train.astype(str).reset_index(drop=True)
+
+    if dataset == ALZHEIMER_DATASET:
+        supervised_mask = alzheimer_supervised_mask(labels).to_numpy()
+        supervised_indices = np.flatnonzero(supervised_mask)
+        supervised_labels = labels.iloc[supervised_indices].reset_index(drop=True)
+        supervised_groups = groups.iloc[supervised_indices].reset_index(drop=True)
+
+        if len(supervised_indices) == 0:
+            raise CodeValidationError("Alzheimer task has no CU/DEM-AD development rows.")
+
+        if supervised_groups.nunique() >= CV_N_SPLITS:
+            splitter = StratifiedGroupKFold(
+                n_splits=CV_N_SPLITS,
+                shuffle=True,
+                random_state=CV_RANDOM_STATE,
+            )
+            base_splits = list(
+                splitter.split(
+                    X_train.iloc[supervised_indices].reset_index(drop=True),
+                    supervised_labels,
+                    supervised_groups,
+                )
+            )
+            protocol = (
+                "Alzheimer semi-supervised StratifiedGroupKFold("
+                "n_splits=5, shuffle=True, random_state=42)"
+            )
+        else:
+            if int(supervised_labels.value_counts().min()) < CV_N_SPLITS:
+                raise CodeValidationError(
+                    "Five-fold Alzheimer validation requires at least five "
+                    "samples in each supervised class."
+                )
+            splitter = StratifiedKFold(
+                n_splits=CV_N_SPLITS,
+                shuffle=True,
+                random_state=CV_RANDOM_STATE,
+            )
+            base_splits = list(splitter.split(
+                X_train.iloc[supervised_indices].reset_index(drop=True),
+                supervised_labels,
+            ))
+            protocol = (
+                "Alzheimer semi-supervised StratifiedKFold("
+                "n_splits=5, shuffle=True, random_state=42)"
+            )
+
+        expanded_splits: list[tuple[np.ndarray, np.ndarray]] = []
+        group_values = groups.to_numpy(dtype=str)
+        supervised_group_values = supervised_groups.to_numpy(dtype=str)
+
+        for train_sub, valid_sub in base_splits:
+            train_batches = set(supervised_group_values[train_sub])
+            valid_batches = set(supervised_group_values[valid_sub])
+            train_idx = np.flatnonzero(np.isin(group_values, list(train_batches)))
+            valid_idx = np.flatnonzero(np.isin(group_values, list(valid_batches)))
+            if len(train_idx) + len(valid_idx) != len(X_train):
+                omitted = sorted(
+                    set(group_values)
+                    - train_batches
+                    - valid_batches
+                )
+                raise CodeValidationError(
+                    "Alzheimer pooled rows include batches with no supervised "
+                    f"CU/DEM-AD samples: {omitted}"
+                )
+            expanded_splits.append((train_idx, valid_idx))
+
+        return protocol, expanded_splits
 
     if groups.nunique() >= CV_N_SPLITS:
         splitter = StratifiedGroupKFold(
@@ -1426,9 +1532,6 @@ def _submission_cv_splits(
         splits = list(splitter.split(X_train, labels, groups))
         return "StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)", splits
 
-    # Some datasets contain fewer than three batches. A three-fold group split is
-    # mathematically impossible there, so use one deterministic stratified protocol
-    # for every submission on that dataset.
     if int(labels.value_counts().min()) < CV_N_SPLITS:
         raise CodeValidationError(
             "Five-fold validation requires at least five samples in every class."
@@ -1441,7 +1544,6 @@ def _submission_cv_splits(
     splits = list(splitter.split(X_train, labels))
     return "StratifiedKFold(n_splits=5, shuffle=True, random_state=42)", splits
 
-
 def _cross_validate_submission(
     correction_code: str,
     model_code: str,
@@ -1453,12 +1555,21 @@ def _cross_validate_submission(
     batches_test: pd.Series,
 ) -> dict:
     """Evaluate the complete submitted pipeline on the shared outer CV folds."""
-    protocol, splits = _submission_cv_splits(X_train, y_train, batches_train)
+    protocol, splits = _submission_cv_splits(dataset, X_train, y_train, batches_train)
+    is_alzheimer = dataset == ALZHEIMER_DATASET
+    is_bernn_model = any(
+        token in model_code
+        for token in ("TrainAEClassifierHoldout", "TrainAEThenClassifierHoldout", "AEHeadPredictor")
+    )
     fold_scores: list[float] = []
     fold_details: list[dict[str, object]] = []
     test_prediction_folds: list[pd.Series] = []
     test_proba_folds: list[pd.DataFrame] = []
-    all_labels = sorted(y_train.astype(str).unique().tolist())
+    all_labels = (
+        sorted(ALZHEIMER_SUPERVISED_LABELS)
+        if is_alzheimer
+        else sorted(y_train.astype(str).unique().tolist())
+    )
     print(f"[submission-cv] Protocol: {protocol}")
     from src.baselines import set_bernn_seed
 
@@ -1466,11 +1577,17 @@ def _cross_validate_submission(
         set_bernn_seed(CV_RANDOM_STATE + fold)
 
         fold_X_train = X_train.iloc[train_idx].reset_index(drop=True)
-        fold_y_train = y_train.iloc[train_idx].reset_index(drop=True)
-        fold_batches_train = batches_train.iloc[train_idx].reset_index(drop=True)
         fold_X_valid = X_train.iloc[valid_idx].reset_index(drop=True)
-        fold_y_valid = y_train.iloc[valid_idx].astype(str).reset_index(drop=True)
+        fold_batches_train = batches_train.iloc[train_idx].reset_index(drop=True)
         fold_batches_valid = batches_train.iloc[valid_idx].reset_index(drop=True)
+
+        if is_alzheimer:
+            model_labels = model_labels_for_alzheimer(y_train)
+            fold_y_train = model_labels.iloc[train_idx].astype(str).reset_index(drop=True)
+            fold_y_valid = model_labels.iloc[valid_idx].astype(str).reset_index(drop=True)
+        else:
+            fold_y_train = y_train.iloc[train_idx].astype(str).reset_index(drop=True)
+            fold_y_valid = y_train.iloc[valid_idx].astype(str).reset_index(drop=True)
 
         fold_X_eval = pd.concat([fold_X_valid, X_test.reset_index(drop=True)], ignore_index=True)
         fold_batches_eval = pd.concat(
@@ -1493,17 +1610,34 @@ def _cross_validate_submission(
         corrected_valid = corrected_eval.iloc[:n_valid].reset_index(drop=True)
         corrected_test = corrected_eval.iloc[n_valid:].reset_index(drop=True)
 
+        model_X_train = corrected_train
+        model_y_train = fold_y_train
+        model_batches_train = fold_batches_train
+        model_X_valid = corrected_valid
+        model_y_valid = fold_y_valid
+        model_batches_valid = fold_batches_valid
+
+        if is_alzheimer and not is_bernn_model:
+            train_supervised = model_y_train.ne(UNSUPERVISED_LABEL).to_numpy()
+            valid_supervised = model_y_valid.ne(UNSUPERVISED_LABEL).to_numpy()
+            model_X_train = model_X_train.loc[train_supervised].reset_index(drop=True)
+            model_y_train = model_y_train.loc[train_supervised].reset_index(drop=True)
+            model_batches_train = model_batches_train.loc[train_supervised].reset_index(drop=True)
+            model_X_valid = model_X_valid.loc[valid_supervised].reset_index(drop=True)
+            model_y_valid = model_y_valid.loc[valid_supervised].reset_index(drop=True)
+            model_batches_valid = model_batches_valid.loc[valid_supervised].reset_index(drop=True)
+
         fold_test_preds, fold_extra, fold_test_proba = _run_user_model(
             model_code,
-            corrected_train,
-            fold_y_train,
+            model_X_train,
+            model_y_train,
             corrected_test,
             dataset,
-            fold_batches_train,
+            model_batches_train,
             batches_test,
-            X_valid=corrected_valid,
-            y_valid=fold_y_valid,
-            batches_valid=fold_batches_valid,
+            X_valid=model_X_valid,
+            y_valid=model_y_valid,
+            batches_valid=model_batches_valid,
             y_test=None,
             plot_capture=None,
         )
@@ -1514,10 +1648,10 @@ def _cross_validate_submission(
                 "fit() must return a trained model with predict() so the runner can score validation folds."
             )
         fold_valid_preds = pd.Series(fold_valid_preds).astype(str).reset_index(drop=True)
-        if len(fold_valid_preds) != len(fold_y_valid):
+        if len(fold_valid_preds) != len(model_y_valid):
             raise CodeValidationError(
                 f"CV fold {fold} returned {len(fold_valid_preds)} validation predictions "
-                f"for {len(fold_y_valid)} validation rows."
+                f"for {len(model_y_valid)} validation rows."
             )
         if len(fold_test_preds) != len(X_test):
             raise CodeValidationError(
@@ -1525,7 +1659,14 @@ def _cross_validate_submission(
                 f"for {len(X_test)} fixed test rows."
             )
 
-        fold_mcc = float(matthews_corrcoef(fold_y_valid, fold_valid_preds))
+        score_y_valid = model_y_valid
+        score_valid_preds = fold_valid_preds
+        if is_alzheimer and is_bernn_model:
+            supervised_valid = score_y_valid.ne(UNSUPERVISED_LABEL).to_numpy()
+            score_y_valid = score_y_valid.loc[supervised_valid].reset_index(drop=True)
+            score_valid_preds = score_valid_preds.loc[supervised_valid].reset_index(drop=True)
+
+        fold_mcc = float(matthews_corrcoef(score_y_valid, score_valid_preds))
         fold_scores.append(fold_mcc)
         test_prediction_folds.append(fold_test_preds.astype(str).reset_index(drop=True))
         classes = fold_extra.get("_model_classes") if isinstance(fold_extra, dict) else None
@@ -1690,20 +1831,50 @@ def run_code_submission(
     print(f"[submission-runner] Model predictions completed from {CV_N_SPLITS}-fold ensemble. Number of predictions: {len(preds)}")
 
     # Hidden labels are loaded only after all submitted code has finished.
-    y_test_real = load_private_labels(dataset)["prediction"].astype(str).reset_index(drop=True)
+    # Align by sample name so task-specific inference subsets remain exact.
+    private_labels = load_private_labels(dataset).copy()
+    if not {"name", "prediction"}.issubset(private_labels.columns):
+        raise ValueError(
+            f"Private labels for dataset '{dataset}' must contain name and prediction"
+        )
+    private_labels["name"] = private_labels["name"].astype(str)
+    private_labels["prediction"] = private_labels["prediction"].astype(str)
+    if private_labels["name"].duplicated().any():
+        raise ValueError(f"Private labels for dataset '{dataset}' contain duplicate names")
+
+    reference = test_meta[["name"]].copy()
+    reference["name"] = reference["name"].astype(str)
+    reference = reference.merge(
+        private_labels[["name", "prediction"]],
+        on="name",
+        how="left",
+        validate="one_to_one",
+        sort=False,
+    )
+    if reference["prediction"].isna().any():
+        missing_names = reference.loc[reference["prediction"].isna(), "name"].head(5).tolist()
+        raise ValueError(
+            f"Private labels are missing for {int(reference['prediction'].isna().sum())} "
+            f"inference rows (examples: {missing_names})"
+        )
+    if dataset == ALZHEIMER_DATASET:
+        unexpected = sorted(
+            set(reference["prediction"].astype(str)) - set(ALZHEIMER_SUPERVISED_LABELS)
+        )
+        if unexpected:
+            raise ValueError(
+                "Alzheimer fixed test contains labels outside the declared CU/DEM-AD "
+                f"task after filtering: {unexpected}"
+            )
+
+    y_test_real = reference["prediction"].astype(str).reset_index(drop=True)
     if len(y_test_real) == 0:
         raise ValueError(
             f"Private label split for dataset '{dataset}' is empty (0 rows). "
             "Evaluation cannot proceed until labels are populated."
         )
-    if len(y_test_real) != len(test_meta):
-        raise ValueError(
-            f"Private inference rows ({len(test_meta)}) and private labels "
-            f"({len(y_test_real)}) do not match"
-        )
 
     pred_df = pd.DataFrame({"name": test_meta["name"], "prediction": preds.astype(str)})
-    reference = pd.DataFrame({"name": test_meta["name"].astype(str), "prediction": y_test_real.astype(str)})
     group_df = test_meta.copy()
     group_df["group"] = batches_test.astype(str).reset_index(drop=True)
     metrics = evaluate_predictions(pred_df, reference, predicted_proba=pred_proba, groups=group_df)
