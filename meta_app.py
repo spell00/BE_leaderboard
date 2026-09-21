@@ -20,6 +20,12 @@ from src.meta_recommender import (
     recommend_bernn_config,
     recommendation_tables,
     resolve_checkpoint_path,
+    recommender_evaluation_protocol,
+)
+from src.dataset_tasks import (
+    clean_task_features,
+    prepare_builtin_training_frame,
+    task_feature_columns,
 )
 
 DATASET_LABELS = {
@@ -43,10 +49,28 @@ def load_input(dataset: str, uploaded_file):
         path = getattr(uploaded_file, "name", uploaded_file)
         return pd.read_csv(path), f"uploaded file: {Path(path).name}"
 
+    if recommender_evaluation_protocol() == "cyclic_batches":
+        from scripts.hp_search import load_cyclic_dataset
+
+        X, y, batches = load_cyclic_dataset(dataset)
+        frame = pd.DataFrame({
+            "name": [f"{dataset}_{index}" for index in range(len(X))],
+            "batch": pd.Series(batches).astype(str),
+            "label": pd.Series(y).astype(str),
+        })
+        frame = pd.concat([frame, X.reset_index(drop=True)], axis=1)
+        return frame, f"{DATASET_LABELS.get(dataset, dataset)} (cyclic batch universe)"
+
     path = ROOT / "data" / "datasets" / dataset / f"{dataset}_train.csv"
     if not path.exists():
         raise FileNotFoundError(f"Training split not found: {path}")
-    return pd.read_csv(path), DATASET_LABELS.get(dataset, dataset)
+    frame = prepare_builtin_training_frame(dataset, pd.read_csv(path))
+    feature_columns = task_feature_columns(frame)
+    cleaned = clean_task_features(frame, feature_columns)
+    normalized = frame[["name", "batch", "label"]].reset_index(drop=True).copy()
+    for column in feature_columns:
+        normalized[column] = cleaned[column]
+    return normalized, DATASET_LABELS.get(dataset, dataset)
 
 
 def format_result(dataset: str, uploaded_file):
