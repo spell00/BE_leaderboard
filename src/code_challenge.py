@@ -1020,6 +1020,7 @@ def _run_user_model(
     batches_valid: pd.Series | None = None,
     y_test: pd.Series | None = None,
     plot_capture: PlotCapture | None = None,
+    require_test_predictions: bool = True,
     # groups: pd.Series = None,
 ) -> tuple[pd.Series, dict, object | None]:
     if "AEHeadPredictor" in model_code:
@@ -1136,11 +1137,15 @@ def _run_user_model(
             y_train_str,
             X_valid=X_valid.copy() if X_valid is not None else None,
             y_valid=y_valid.astype(str).copy() if y_valid is not None else None,
-            X_test=X_test.copy(),
+            X_test=X_test.copy() if X_test is not None and len(X_test) > 0 else None,
             y_test=y_test_str.copy() if y_test_str is not None else None,
             groups_train=batches_train.copy() if batches_train is not None else None,
             groups_valid=batches_valid.copy() if batches_valid is not None else None,
-            groups_test=batches_test.copy() if batches_test is not None else None,
+            groups_test=(
+                batches_test.copy()
+                if batches_test is not None and X_test is not None and len(X_test) > 0
+                else None
+            ),
         )
         try:
             split_labels = getattr(trainer, "data", {}).get("labels", {})
@@ -1162,9 +1167,11 @@ def _run_user_model(
         extra_metrics = _bernn_trainer_metrics(trainer)
         return trainer, extra_metrics
 
-    if len(X_test) == 0:
+    has_test = X_test is not None and len(X_test) > 0
+    if require_test_predictions and not has_test:
         raise CodeValidationError(
-            "No inference samples are available for this dataset (X_test is empty), so model evaluation cannot run."
+            "No inference/test samples are available for this run, but test "
+            "predictions were requested."
         )
 
     env = _base_exec_env(plot_capture, dataset_name)
@@ -1213,7 +1220,7 @@ def _run_user_model(
         def _invoke_train_fn(
             train_x: pd.DataFrame,
             train_y: pd.Series,
-            test_x: pd.DataFrame,
+            test_x: pd.DataFrame | None,
             train_batches: pd.Series | None,
             test_batches: pd.Series | None,
             valid_x: pd.DataFrame | None = None,
@@ -1247,14 +1254,18 @@ def _run_user_model(
                 return train_fn(
                     train_x.copy(),
                     train_y.copy(),
-                    test_x.copy(),
+                    test_x.copy() if test_x is not None and len(test_x) > 0 else None,
                     train_batches.copy(),
                 )
             else:
                 return train_fn(
                     X_train=train_x.copy(),
                     y_train=train_y.copy(),
-                    X_test=test_x.copy(),
+                    X_test=(
+                        test_x.copy()
+                        if test_x is not None and len(test_x) > 0
+                        else None
+                    ),
                     **call_kwargs,
                 )
 
@@ -1296,27 +1307,46 @@ def _run_user_model(
             if hasattr(first, "predict") and callable(getattr(first, "predict", None)):
                 model = first
                 extra_metrics = second if isinstance(second, dict) else {}
-                preds = _call_method_with_optional_kwargs(getattr(model, "predict"), X_test, batches_test)
-                if hasattr(model, "predict_proba") and callable(getattr(model, "predict_proba", None)):
-                    try:
-                        pred_proba_raw = _call_method_with_optional_kwargs(getattr(model, "predict_proba"), X_test, batches_test)
-                    except Exception:
-                        pred_proba_raw = None
+                if has_test:
+                    preds = _call_method_with_optional_kwargs(
+                        getattr(model, "predict"), X_test, batches_test
+                    )
+                    if hasattr(model, "predict_proba") and callable(getattr(model, "predict_proba", None)):
+                        try:
+                            pred_proba_raw = _call_method_with_optional_kwargs(
+                                getattr(model, "predict_proba"), X_test, batches_test
+                            )
+                        except Exception:
+                            pred_proba_raw = None
+                else:
+                    preds = []
             else:
                 preds = first
                 extra_metrics = second if isinstance(second, dict) else {}
         elif hasattr(result, "predict") and callable(getattr(result, "predict", None)):
             model = result
             extra_metrics = _bernn_trainer_metrics(model)
-            preds = _call_method_with_optional_kwargs(getattr(model, "predict"), X_test, batches_test)
-            if hasattr(model, "predict_proba") and callable(getattr(model, "predict_proba", None)):
-                try:
-                    pred_proba_raw = _call_method_with_optional_kwargs(getattr(model, "predict_proba"), X_test, batches_test)
-                except Exception:
-                    pred_proba_raw = None
+            if has_test:
+                preds = _call_method_with_optional_kwargs(
+                    getattr(model, "predict"), X_test, batches_test
+                )
+                if hasattr(model, "predict_proba") and callable(getattr(model, "predict_proba", None)):
+                    try:
+                        pred_proba_raw = _call_method_with_optional_kwargs(
+                            getattr(model, "predict_proba"), X_test, batches_test
+                        )
+                    except Exception:
+                        pred_proba_raw = None
+            else:
+                preds = []
         else:
             if train_fn_name == "fit":
                 raise CodeValidationError("fit() must return a trained model with a callable predict() method.")
+            if not has_test:
+                raise CodeValidationError(
+                    "Validation-only evaluation requires fit() to return a trained "
+                    "model so the server can predict the validation fold."
+                )
             preds = result
             extra_metrics = {}
 
@@ -1337,8 +1367,10 @@ def _run_user_model(
 
         out = preds_raw.astype(str).reset_index(drop=True)
 
-        if len(out) != len(X_test):
-            raise CodeValidationError(f"{train_fn_name} output length does not match test set rows.")
+        if has_test and len(out) != len(X_test):
+            raise CodeValidationError(
+                f"{train_fn_name} output length does not match test set rows."
+            )
         if model is not None and X_valid is not None and len(X_valid) > 0:
             valid_preds = _call_method_with_optional_kwargs(getattr(model, "predict"), X_valid, batches_valid)
             valid_out = pd.Series(valid_preds).astype(str).reset_index(drop=True)
@@ -1370,14 +1402,22 @@ def _run_user_model(
         if "dataset_name" in sig.parameters:
             kwargs["dataset_name"] = dataset_name
 
-        preds_raw = predict_fn(trainer, X_test.copy(), **kwargs)
-        out_raw = pd.Series(preds_raw).reset_index(drop=True)
+        if has_test:
+            preds_raw = predict_fn(trainer, X_test.copy(), **kwargs)
+            out = pd.Series(preds_raw).astype(str).reset_index(drop=True)
+            if len(out) != len(X_test):
+                raise CodeValidationError("predict output length does not match test set rows.")
+        else:
+            out = pd.Series(dtype=str)
 
-        # BERNN predict already returns decoded labels.
-        out = out_raw.astype(str).reset_index(drop=True)
-
-        if len(out) != len(X_test):
-            raise CodeValidationError("predict output length does not match test set rows.")
+        if X_valid is not None and len(X_valid) > 0 and hasattr(trainer, "predict"):
+            valid_preds = trainer.predict(
+                X_valid.copy(),
+                groups_test=batches_valid.copy() if batches_valid is not None else None,
+            )
+            extra_metrics["_valid_predictions"] = (
+                pd.Series(valid_preds).astype(str).reset_index(drop=True)
+            )
         extra_metrics["model_kind"] = model_kind
         return out, extra_metrics, None
 
@@ -1398,11 +1438,22 @@ def _run_user_model(
             batches_test,
         )
         model.fit(X_train.copy(), y_train.copy())
-        preds = model.predict(X_test.copy())
-        out = pd.Series(preds).astype(str).reset_index(drop=True)
-        if len(out) != len(X_test):
-            raise CodeValidationError("Model predict() output length does not match test set rows.")
-        return out, {"model_kind": model_kind}, None
+        extra_metrics = {"model_kind": model_kind}
+        if has_test:
+            preds = model.predict(X_test.copy())
+            out = pd.Series(preds).astype(str).reset_index(drop=True)
+            if len(out) != len(X_test):
+                raise CodeValidationError(
+                    "Model predict() output length does not match test set rows."
+                )
+        else:
+            out = pd.Series(dtype=str)
+        if X_valid is not None and len(X_valid) > 0:
+            valid_preds = model.predict(X_valid.copy())
+            extra_metrics["_valid_predictions"] = (
+                pd.Series(valid_preds).astype(str).reset_index(drop=True)
+            )
+        return out, extra_metrics, None
 
     raise CodeValidationError(
         "Model code must define one of: "
