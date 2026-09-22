@@ -255,73 +255,55 @@ def load_fixed_test_dataset(name: str):
 
 
 def load_cyclic_dataset(name: str):
-    """Load the labeled universe used by offline cyclic batch evaluation.
+    """Load every labeled batch for cyclic train/valid/test evaluation.
 
-    The hosted reconstructed GEO datasets use their public labeled development
-    split only. Other datasets retain the original behavior of combining public
-    training rows with a local labeled inference split.
+    Public training rows and the local labeled inference rows are combined.
+    For Alzheimer, CU/DEM-AD remain supervised and every other diagnosis is
+    mapped to the pooled unsupervised class, exactly as in the development set.
     """
     base = DATASETS_DIR / name
     train_path = base / f"{name}_train.csv"
     inference_path = base / f"{name}_inference.csv"
     if not train_path.exists():
         raise FileNotFoundError(f"No train CSV for dataset '{name}' at {train_path}")
+    if not inference_path.exists():
+        raise FileNotFoundError(
+            f"No labeled inference CSV for cyclic CV dataset '{name}' at {inference_path}"
+        )
 
     train = pd.read_csv(train_path)
-    public_only = name in {"normal_tissue_878", "colon_3041"}
+    inference = pd.read_csv(inference_path)
 
     if name == ALZHEIMER_DATASET:
         train_labels, _ = prepare_alzheimer_development_labels(train["label"])
+        inference_labels, _ = prepare_alzheimer_development_labels(inference["label"])
         train = train.copy()
+        inference = inference.copy()
         train["label"] = train_labels
+        inference["label"] = inference_labels
     else:
-        train_labeled = (
-            train["label"].notna()
-            & train["label"].astype("string").str.strip().ne("")
+        train_labeled = train["label"].notna() & train["label"].astype("string").str.strip().ne("")
+        inf_labeled = (
+            inference["label"].notna()
+            & inference["label"].astype("string").str.strip().ne("")
         )
         train = train.loc[train_labeled].copy()
+        inference = inference.loc[inf_labeled].copy()
 
     feature_cols = [column for column in train.columns if column not in _META_COLS]
-
-    if public_only:
-        combined = train[["name", "batch", "label", *feature_cols]].copy()
-    else:
-        if not inference_path.exists():
-            raise FileNotFoundError(
-                f"No labeled inference CSV for cyclic CV dataset '{name}' at "
-                f"{inference_path}"
-            )
-        inference = pd.read_csv(inference_path)
-        if name == ALZHEIMER_DATASET:
-            inference_labels, _ = prepare_alzheimer_development_labels(
-                inference["label"]
-            )
-            inference = inference.copy()
-            inference["label"] = inference_labels
-        else:
-            inf_labeled = (
-                inference["label"].notna()
-                & inference["label"].astype("string").str.strip().ne("")
-            )
-            inference = inference.loc[inf_labeled].copy()
-
-        missing = [
-            column for column in feature_cols if column not in inference.columns
-        ]
-        if missing:
-            raise ValueError(
-                f"Inference file for {name} is missing "
-                f"{len(missing)} training feature columns"
-            )
-
-        combined = pd.concat(
-            [
-                train[["name", "batch", "label", *feature_cols]],
-                inference[["name", "batch", "label", *feature_cols]],
-            ],
-            ignore_index=True,
+    missing = [column for column in feature_cols if column not in inference.columns]
+    if missing:
+        raise ValueError(
+            f"Inference file for {name} is missing {len(missing)} training feature columns"
         )
 
+    combined = pd.concat(
+        [
+            train[["name", "batch", "label", *feature_cols]],
+            inference[["name", "batch", "label", *feature_cols]],
+        ],
+        ignore_index=True,
+    )
     if combined["name"].astype(str).duplicated().any():
         duplicates = (
             combined.loc[combined["name"].astype(str).duplicated(), "name"]
@@ -341,8 +323,10 @@ def load_cyclic_dataset(name: str):
     y = combined["label"].astype(str).to_numpy()
     batches = combined["batch"].astype(str).to_numpy()
 
+    # Fail early if the requested symmetric protocol is impossible.
     cyclic_train_valid_test_splits(batches)
     return X, y, batches
+
 
 def run_cyclic_batch_trial(cfg: dict, args, data, exp_id: str):
     """Evaluate one BERNN config with symmetric cyclic batch roles.
