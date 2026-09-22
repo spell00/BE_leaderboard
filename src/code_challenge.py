@@ -2403,6 +2403,7 @@ def run_cyclic_research_submission(
     dataset: str,
     correction_code: str,
     model_code: str,
+    dataset_file: str | None = None,
     cyclic_cv_folds: int = -1,
 ) -> tuple[pd.DataFrame, dict[str, float | int], str, str]:
     """Run the optional local/research cyclic batch protocol."""
@@ -2411,7 +2412,7 @@ def run_cyclic_research_submission(
         f"'{team}' / '{model_name}' on {dataset}",
         flush=True,
     )
-    X, y, batches, names = _load_cyclic_research_dataset(dataset)
+    X, y, batches, names = _load_cyclic_research_dataset(dataset, dataset_file)
     result = _cross_validate_cyclic_submission(
         correction_code,
         model_code,
@@ -2427,6 +2428,7 @@ def run_cyclic_research_submission(
     metrics["test_batches"] = int(batches.nunique())
     metrics["train_samples"] = int(len(X))
     metrics["test_samples"] = int(metrics.get("n_samples", len(result["pred_df"])))
+    metrics["source_file"] = str(dataset_file or _default_research_source_filename(dataset))
     return result["pred_df"], metrics, "", ""
 
 
@@ -2438,6 +2440,7 @@ def run_code_submission(
     model_code: str,
     evaluation_protocol: str = "fixed_external",
     cyclic_cv_folds: int = -1,
+    dataset_file: str | None = None,
     # groups: pd.Series = None,
 ) -> tuple[pd.DataFrame, dict[str, float | int], str, str]:
     """
@@ -2456,6 +2459,17 @@ def run_code_submission(
             dataset=dataset,
             correction_code=correction_code,
             model_code=model_code,
+            dataset_file=dataset_file,
+            cyclic_cv_folds=cyclic_cv_folds,
+        )
+    if evaluation_protocol == "validation_only":
+        return run_validation_research_submission(
+            team=team,
+            model_name=model_name,
+            dataset=dataset,
+            correction_code=correction_code,
+            model_code=model_code,
+            dataset_file=dataset_file,
             cyclic_cv_folds=cyclic_cv_folds,
         )
     if evaluation_protocol != "fixed_external":
