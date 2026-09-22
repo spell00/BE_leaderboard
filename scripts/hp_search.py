@@ -101,12 +101,15 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from src.dataset_files import ensure_all_dataset_file
 from src.dataset_tasks import (
     ALZHEIMER_DATASET,
     ALZHEIMER_SUPERVISED_LABELS,
     POOL_LABEL,
     alzheimer_supervised_mask,
     prepare_alzheimer_development_labels,
+    prepare_research_source_frame,
+    task_feature_columns,
     cyclic_train_valid_test_splits,
 )
 
@@ -254,77 +257,48 @@ def load_fixed_test_dataset(name: str):
     return X, df["label"].astype(str).to_numpy(), df["batch"].astype(str).to_numpy()
 
 
-def load_cyclic_dataset(name: str):
-    """Load every labeled batch for cyclic train/valid/test evaluation.
+def load_cyclic_dataset(name: str, source_file: str | None = None):
+    """Load one selected CSV for cyclic train/valid/test evaluation.
 
-    Public training rows and the local labeled inference rows are combined.
-    For Alzheimer, CU/DEM-AD remain supervised and every other diagnosis is
-    mapped to the pooled unsupervised class, exactly as in the development set.
+    The preferred default is <dataset>_all.csv, created as train+public-test.
+    Rows without labels are ignored. No *_inference.csv file is appended.
+    Pass source_file=<dataset>_train.csv to work on the development split only.
     """
     base = DATASETS_DIR / name
-    train_path = base / f"{name}_train.csv"
-    inference_path = base / f"{name}_inference.csv"
-    if not train_path.exists():
-        raise FileNotFoundError(f"No train CSV for dataset '{name}' at {train_path}")
-    if not inference_path.exists():
-        raise FileNotFoundError(
-            f"No labeled inference CSV for cyclic CV dataset '{name}' at {inference_path}"
-        )
-
-    train = pd.read_csv(train_path)
-    inference = pd.read_csv(inference_path)
-
-    if name == ALZHEIMER_DATASET:
-        train_labels, _ = prepare_alzheimer_development_labels(train["label"])
-        inference_labels, _ = prepare_alzheimer_development_labels(inference["label"])
-        train = train.copy()
-        inference = inference.copy()
-        train["label"] = train_labels
-        inference["label"] = inference_labels
+    if source_file is None:
+        try:
+            source_path = ensure_all_dataset_file(ROOT, name)
+        except Exception:
+            source_path = base / f"{name}_train.csv"
     else:
-        train_labeled = train["label"].notna() & train["label"].astype("string").str.strip().ne("")
-        inf_labeled = (
-            inference["label"].notna()
-            & inference["label"].astype("string").str.strip().ne("")
-        )
-        train = train.loc[train_labeled].copy()
-        inference = inference.loc[inf_labeled].copy()
+        candidate = Path(str(source_file)).name
+        if candidate != str(source_file):
+            raise ValueError("source_file must be a filename inside the dataset directory")
+        source_path = base / candidate
 
-    feature_cols = [column for column in train.columns if column not in _META_COLS]
-    missing = [column for column in feature_cols if column not in inference.columns]
-    if missing:
-        raise ValueError(
-            f"Inference file for {name} is missing {len(missing)} training feature columns"
+    if not source_path.exists():
+        raise FileNotFoundError(
+            f"No cyclic source CSV for dataset '{name}' at {source_path}"
         )
 
-    combined = pd.concat(
-        [
-            train[["name", "batch", "label", *feature_cols]],
-            inference[["name", "batch", "label", *feature_cols]],
-        ],
-        ignore_index=True,
-    )
-    if combined["name"].astype(str).duplicated().any():
-        duplicates = (
-            combined.loc[combined["name"].astype(str).duplicated(), "name"]
-            .astype(str)
-            .head(5)
-            .tolist()
-        )
-        raise ValueError(f"Duplicate sample names in cyclic dataset {name}: {duplicates}")
-
+    frame = prepare_research_source_frame(name, pd.read_csv(source_path))
+    feature_cols = task_feature_columns(frame)
     X = (
-        combined[feature_cols]
+        frame[feature_cols]
         .astype(float)
         .replace([np.inf, -np.inf], np.nan)
         .fillna(0.0)
         .reset_index(drop=True)
     )
-    y = combined["label"].astype(str).to_numpy()
-    batches = combined["batch"].astype(str).to_numpy()
+    y = frame["label"].astype(str).to_numpy()
+    batches = frame["batch"].astype(str).to_numpy()
 
-    # Fail early if the requested symmetric protocol is impossible.
     cyclic_train_valid_test_splits(batches)
+    print(
+        f"[cyclic data] dataset={name} source={source_path.name} "
+        f"labeled_rows={len(frame)} batches={len(set(batches.tolist()))}",
+        flush=True,
+    )
     return X, y, batches
 
 
