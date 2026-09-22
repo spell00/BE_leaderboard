@@ -1354,7 +1354,9 @@ def _normalize_recommender_protocol(protocol: str | None) -> str:
     """Normalize UI/checkpoint protocol names to the two app evaluation modes."""
     if str(protocol or "").strip() in {
         "cyclic_batches",
+        "validation_only",
         "cyclic_train_valid_test_by_batch_v1",
+        "rotating_train_valid_by_batch_v1",
     }:
         return "cyclic_batches"
     return "fixed_external"
@@ -1633,6 +1635,25 @@ Run a reproducible server-side benchmark or propose a matrix-ready dataset.
                 file_types=[".csv"],
             )
 
+        meta_source_file = gr.Dropdown(
+            choices=dataset_source_choices("massbench_benchmark"),
+            value=default_dataset_source("massbench_benchmark"),
+            label="Dataset file for research recommendation",
+            info=(
+                "Used for rotating train/valid/test and validation-only research. "
+                "Fixed-external recommendation continues to use the development split."
+            ),
+        )
+        meta_dataset.change(
+            fn=lambda dataset: gr.update(
+                choices=dataset_source_choices(dataset),
+                value=default_dataset_source(dataset),
+            ),
+            inputs=[meta_dataset],
+            outputs=[meta_source_file],
+            queue=False,
+        )
+
         meta_eval_protocol = gr.Radio(
             choices=[
                 (
@@ -1640,17 +1661,20 @@ Run a reproducible server-side benchmark or propose a matrix-ready dataset.
                     "fixed_external",
                 ),
                 (
-                    "Rotating batch CV — recommend from the complete cyclic batch universe",
+                    "Rotating train/valid/test — use selected source file",
                     "cyclic_batches",
+                ),
+                (
+                    "Train/valid only — use selected source file",
+                    "validation_only",
                 ),
             ],
             value="fixed_external",
             label="Recommendation / evaluation protocol",
             info=(
-                "This controls which samples are used to compute the meta-features. "
-                "For adenocarcinoma: fixed uses 434 samples (batches 1+2); cyclic "
-                "uses all 642 samples (batches 1+2+3). It is synchronized with "
-                "the benchmark protocol below."
+                "Fixed-external uses the development training split. Research "
+                "protocols compute meta-features from the selected single CSV, matching "
+                "the source used for CV."
             ),
         )
 
@@ -2005,7 +2029,12 @@ Datasets are ordered by submission date.
 
             meta_run.click(
                 fn=run_meta_recommendation,
-                inputs=[meta_dataset, meta_upload, meta_eval_protocol],
+                inputs=[
+                    meta_dataset,
+                    meta_upload,
+                    meta_eval_protocol,
+                    meta_source_file,
+                ],
                 outputs=[
                     meta_config,
                     meta_features_table,
@@ -2016,6 +2045,7 @@ Datasets are ordered by submission date.
                     r_model_code,
                     r_dataset_in,
                     r_eval_protocol,
+                    r_source_file,
                 ],
                 api_name="recommend_bernn",
                 queue=False,
