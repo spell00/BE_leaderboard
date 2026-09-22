@@ -77,8 +77,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-features",
         type=int,
-        default=2048,
-        help="Number of highest-variance genes retained by the existing importer.",
+        default=0,
+        help="Maximum number of variance-ranked genes to retain; 0 keeps all genes (default).",
     )
     parser.add_argument(
         "--upload-hf",
