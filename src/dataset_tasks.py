@@ -84,17 +84,21 @@ def _natural_batch_key(value: object):
     )
 
 
-def cyclic_train_valid_test_splits(batches, eligible_mask=None):
-    """Rotate eligible batch roles so each is validation once and test once.
+def cyclic_train_valid_test_splits(batches, eligible_mask=None, n_splits: int = -1):
+    """Rotate grouped batch roles for symmetric train/validation/test CV.
 
-    Batches with no eligible/scorable rows remain training-only in every round.
-    With ordered eligible batches [1, 2, 3], this yields:
+    n_splits=-1 is leave-one-batch-out over every evaluable batch. For a
+    positive n_splits, evaluable batches are deterministically partitioned
+    into that many groups; every batch still appears exactly once in validation
+    and exactly once in test, while the remaining groups train.
+
+    With ordered eligible batches [1, 2, 3] and n_splits=-1:
       round 1: train=[1], valid=[2], test=[3]
       round 2: train=[2], valid=[3], test=[1]
       round 3: train=[3], valid=[1], test=[2]
 
-    With >3 eligible batches, all batches other than the current validation/test
-    batches are used for training. At least three evaluable batches are required.
+    At least three CV groups are required because each round needs separate
+    train, validation, and test groups.
     """
     values = np.asarray(pd.Series(batches).astype(str))
     all_batches = sorted(set(values.tolist()), key=_natural_batch_key)
@@ -108,24 +112,52 @@ def cyclic_train_valid_test_splits(batches, eligible_mask=None):
         eligible_values = values[eligible_mask]
 
     ordered = sorted(set(eligible_values.tolist()), key=_natural_batch_key)
-    if len(ordered) < 3:
+    n_batches = len(ordered)
+    if n_batches < 3:
         raise ValueError(
             "Cyclic train/valid/test batch CV requires at least 3 evaluable batches; "
-            f"found {len(ordered)}: {ordered}"
+            f"found {n_batches}: {ordered}"
         )
 
+    try:
+        requested = int(n_splits)
+    except (TypeError, ValueError):
+        raise ValueError("Number of batch CV folds must be -1 or an integer >= 3")
+
+    if requested == -1:
+        resolved = n_batches
+    elif requested < 3:
+        raise ValueError(
+            "Number of batch CV folds must be -1 (leave-one-batch-out) or at least 3"
+        )
+    elif requested > n_batches:
+        raise ValueError(
+            f"Requested {requested} batch CV folds, but only {n_batches} evaluable "
+            "batches are available"
+        )
+    else:
+        resolved = requested
+
+    # Split the naturally ordered evaluable batches as evenly as possible. This
+    # keeps every batch represented even when, for example, 20 batches are
+    # evaluated with 5 CV folds.
+    grouped = [
+        [str(value) for value in group.tolist()]
+        for group in np.array_split(np.asarray(ordered, dtype=object), resolved)
+    ]
+    if any(not group for group in grouped):
+        raise AssertionError("Batch CV grouping produced an empty group")
+
     splits = []
-    for round_index in range(len(ordered)):
-        valid_batch = ordered[(round_index + 1) % len(ordered)]
-        test_batch = ordered[(round_index + 2) % len(ordered)]
-        train_batches = [
-            batch for batch in all_batches
-            if batch not in {valid_batch, test_batch}
-        ]
+    for round_index in range(resolved):
+        valid_batches = grouped[(round_index + 1) % resolved]
+        test_batches = grouped[(round_index + 2) % resolved]
+        held_out = set(valid_batches) | set(test_batches)
+        train_batches = [batch for batch in all_batches if batch not in held_out]
 
         train_idx = np.flatnonzero(np.isin(values, train_batches))
-        valid_idx = np.flatnonzero(values == valid_batch)
-        test_idx = np.flatnonzero(values == test_batch)
+        valid_idx = np.flatnonzero(np.isin(values, valid_batches))
+        test_idx = np.flatnonzero(np.isin(values, test_batches))
         if not len(train_idx) or not len(valid_idx) or not len(test_idx):
             raise ValueError(
                 "Cyclic batch CV produced an empty split: "
@@ -138,15 +170,26 @@ def cyclic_train_valid_test_splits(batches, eligible_mask=None):
             "valid_idx": valid_idx,
             "test_idx": test_idx,
             "train_batches": train_batches,
-            "valid_batch": valid_batch,
-            "test_batch": test_batch,
+            "valid_batches": valid_batches,
+            "test_batches": test_batches,
+            "valid_batch": valid_batches[0] if len(valid_batches) == 1 else valid_batches,
+            "test_batch": test_batches[0] if len(test_batches) == 1 else test_batches,
+            "n_splits": resolved,
+            "requested_n_splits": requested,
         })
 
-    valid_roles = [row["valid_batch"] for row in splits]
-    test_roles = [row["test_batch"] for row in splits]
-    if sorted(valid_roles, key=_natural_batch_key) != ordered:
+    valid_roles = sorted(
+        [batch for row in splits for batch in row["valid_batches"]],
+        key=_natural_batch_key,
+    )
+    test_roles = sorted(
+        [batch for row in splits for batch in row["test_batches"]],
+        key=_natural_batch_key,
+    )
+    if valid_roles != ordered:
         raise AssertionError("Each evaluable batch must appear exactly once as validation")
-    if sorted(test_roles, key=_natural_batch_key) != ordered:
+    if test_roles != ordered:
         raise AssertionError("Each evaluable batch must appear exactly once as test")
 
     return splits
+
