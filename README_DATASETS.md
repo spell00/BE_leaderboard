@@ -112,8 +112,8 @@ data/datasets/scib_pancreas/provenance.json
 ```
 
 The prepared matrix uses `tech` as the batch column, `celltype` as the label,
-library-size normalization to 10,000 counts, `log1p`, and the top 2,048
-variance genes by default.
+library-size normalization to 10,000 counts, and `log1p`. **All genes are
+retained by default**; no variance filtering is applied unless explicitly requested.
 
 To prepare and upload the generated files to the leaderboard Hugging Face Dataset
 repository in the same command:
@@ -128,7 +128,7 @@ Useful options:
 # Use an already-downloaded H5AD
 python scripts/download_prepare_scib_pancreas.py --source /path/to/pancreas.h5ad
 
-# Change the number of retained genes
+# Optional: cap to the top variance-ranked genes
 python scripts/download_prepare_scib_pancreas.py --max-features 4096
 
 # Explicitly select a Figshare H5AD filename if the article contains several
