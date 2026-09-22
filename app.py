@@ -1980,18 +1980,24 @@ Submit batch correction and model code. Evaluation runs server-side.
             # Update Real Leaderboard table when dataset changes
             r_dataset_in.change(
                 fn=get_real_board,
-                inputs=[r_dataset_in, r_eval_protocol, r_cyclic_cv_folds],
+                inputs=[r_dataset_in, r_eval_protocol, r_cyclic_cv_folds, r_source_file],
                 outputs=[r_board_out],
             )
             r_eval_protocol.change(
                 fn=get_real_board,
-                inputs=[r_dataset_in, r_eval_protocol, r_cyclic_cv_folds],
+                inputs=[r_dataset_in, r_eval_protocol, r_cyclic_cv_folds, r_source_file],
                 outputs=[r_board_out],
                 queue=False,
             )
             r_cyclic_cv_folds.change(
                 fn=get_real_board,
-                inputs=[r_dataset_in, r_eval_protocol, r_cyclic_cv_folds],
+                inputs=[r_dataset_in, r_eval_protocol, r_cyclic_cv_folds, r_source_file],
+                outputs=[r_board_out],
+                queue=False,
+            )
+            r_source_file.change(
+                fn=get_real_board,
+                inputs=[r_dataset_in, r_eval_protocol, r_cyclic_cv_folds, r_source_file],
                 outputs=[r_board_out],
                 queue=False,
             )
@@ -2171,6 +2177,7 @@ Datasets are ordered by submission date.
                     r_dataset_in,
                     r_eval_protocol,
                     r_cyclic_cv_folds,
+                    r_source_file,
                 ],
                 outputs=[
                     r_correction_code,
