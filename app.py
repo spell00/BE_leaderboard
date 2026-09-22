@@ -577,52 +577,73 @@ seed_real_leaderboard_missing_rows()
 sync_real_leaderboard_to_hub()
 
 
-def _normalize_cyclic_cv_folds(value) -> int:
-    """Parse the rotating batch-CV count from Gradio/API input."""
+def _normalize_cyclic_cv_folds(value, min_groups: int = 3) -> int:
+    """Parse rotating batch-CV count for test or validation-only modes."""
     if value is None or str(value).strip() == "":
         return -1
     try:
         numeric = float(value)
     except (TypeError, ValueError):
-        raise ValueError("Number of batch CV folds must be -1 or an integer >= 3")
-    if not math.isfinite(numeric) or not numeric.is_integer():
-        raise ValueError("Number of batch CV folds must be -1 or an integer >= 3")
-    folds = int(numeric)
-    if folds != -1 and folds < 3:
         raise ValueError(
-            "Number of batch CV folds must be -1 (leave-one-batch-out) or at least 3"
+            f"Number of batch CV folds must be -1 or an integer >= {min_groups}"
+        )
+    if not math.isfinite(numeric) or not numeric.is_integer():
+        raise ValueError(
+            f"Number of batch CV folds must be -1 or an integer >= {min_groups}"
+        )
+    folds = int(numeric)
+    if folds != -1 and folds < min_groups:
+        raise ValueError(
+            f"Number of batch CV folds must be -1 (leave-one-batch-out) "
+            f"or at least {min_groups}"
         )
     return folds
 
 
-def cyclic_cv_status(dataset: str, evaluation_protocol: str, cyclic_cv_folds=-1) -> str:
-    if evaluation_protocol != "cyclic_batches":
+def cyclic_cv_status(
+    dataset: str,
+    evaluation_protocol: str,
+    cyclic_cv_folds=-1,
+    dataset_file: str | None = None,
+) -> str:
+    if evaluation_protocol not in {"cyclic_batches", "validation_only"}:
         return ""
+    min_groups = 2 if evaluation_protocol == "validation_only" else 3
     try:
-        folds = _normalize_cyclic_cv_folds(cyclic_cv_folds)
-        n_batches = cyclic_evaluable_batch_count(dataset)
+        folds = _normalize_cyclic_cv_folds(cyclic_cv_folds, min_groups=min_groups)
+        n_batches = cyclic_evaluable_batch_count(dataset, dataset_file)
     except Exception as exc:
         return f"**Batch CV unavailable:** {exc}"
 
+    source_name = dataset_file or default_dataset_source(dataset) or "selected file"
     if folds > n_batches:
         return (
-            f"**Not enough evaluable batches.** Requested {folds} folds but this dataset "
-            f"has {n_batches} evaluable batches. Use -1 for LBO"
-            + ("; the 5-fold leaderboard is unavailable for this dataset." if n_batches < 5 else ".")
+            f"**Not enough evaluable batches.** Requested {folds} folds but "
+            f"{source_name} has {n_batches} evaluable batches. Use -1 for LBO."
         )
+
+    if evaluation_protocol == "validation_only":
+        resolved = n_batches if folds == -1 else folds
+        return (
+            f"**Validation-only research mode.** Source: {source_name}. "
+            f"{resolved} rotating train/valid rounds; no test or inference matrix "
+            "is supplied to the model. This mode is not a leaderboard."
+        )
+
     if folds == -1:
         return (
-            f"**Leaderboard eligible — LBO (-1).** {n_batches} evaluable batches → "
-            f"{n_batches} rotating rounds; each batch is validation once and test once."
+            f"**Leaderboard eligible — LBO (-1).** Source: {source_name}. "
+            f"{n_batches} evaluable batches → {n_batches} rotating rounds; each "
+            "batch is validation once and test once."
         )
     if folds == 5:
         return (
-            f"**Leaderboard eligible — 5-fold batch CV.** {n_batches} evaluable batches "
-            "are partitioned across 5 rotating batch groups."
+            f"**Leaderboard eligible — 5-fold batch CV.** Source: {source_name}. "
+            f"{n_batches} evaluable batches are partitioned across 5 rotating groups."
         )
     return (
-        f"**Research-only configuration.** {folds}-fold batch CV will run, but only "
-        "**-1 (LBO)** and **5** count for a leaderboard."
+        f"**Research-only configuration.** {folds}-fold train/valid/test batch CV "
+        "will run, but only -1 (LBO) and 5 count for a leaderboard."
     )
 
 
