@@ -279,6 +279,7 @@ def _insert_real_result_rows(rows: list[dict], source: str) -> int:
                 valid_mcc_folds=normalized.get("valid_mcc_folds", []),
                 evaluation_protocol=normalized.get("evaluation_protocol") or "fixed_external",
                 cv_folds=_finite_int(normalized.get("cv_folds"), 0),
+                source_file=str(normalized.get("source_file") or ""),
                 train_mcc=_finite_float(normalized.get("train_mcc"), -1.0),
                 log_loss=_finite_float(normalized.get("log_loss")) if normalized.get("log_loss") is not None else None,
                 brier_score=_finite_float(normalized.get("brier_score")) if normalized.get("brier_score") is not None else None,
@@ -675,6 +676,7 @@ def get_real_board(
     dataset: str | None = None,
     evaluation_protocol: str = "fixed_external",
     cyclic_cv_folds=-1,
+    source_file: str | None = None,
 ) -> pd.DataFrame:
     board_slice = _leaderboard_slice(evaluation_protocol, cyclic_cv_folds)
     if board_slice is None:
@@ -682,16 +684,27 @@ def get_real_board(
     else:
         protocol, folds = board_slice
         if protocol == "cyclic_batches" and dataset:
+            selected_source = str(source_file or default_dataset_source(dataset) or "")
             try:
-                n_batches = cyclic_evaluable_batch_count(dataset)
+                n_batches = cyclic_evaluable_batch_count(dataset, selected_source)
                 if folds == 5 and n_batches < 5:
                     leaderboard = []
                 else:
-                    leaderboard = db.get_leaderboard(dataset, protocol, folds)
+                    leaderboard = db.get_leaderboard(
+                        dataset,
+                        protocol,
+                        folds,
+                        source_file=selected_source,
+                    )
             except Exception:
                 leaderboard = []
         else:
-            leaderboard = db.get_leaderboard(dataset, protocol, folds)
+            leaderboard = db.get_leaderboard(
+                dataset,
+                protocol,
+                folds,
+                source_file="" if protocol == "fixed_external" else None,
+            )
 
     if not leaderboard:
         return pd.DataFrame(columns=[
@@ -707,6 +720,7 @@ def get_real_board(
         "test_mcc",
         "valid_mcc",
         "valid_mcc_folds",
+        "source_file",
         "accuracy",
         "macro_f1",
         "n_samples",
