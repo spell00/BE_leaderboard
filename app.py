@@ -1704,6 +1704,17 @@ Submit batch correction and model code. Evaluation runs server-side.
                 value="massbench_benchmark",
                 label="Dataset",
             )
+            r_source_file = gr.Dropdown(
+                choices=dataset_source_choices("massbench_benchmark"),
+                value=default_dataset_source("massbench_benchmark"),
+                label="Dataset file for research CV",
+                info=(
+                    "Defaults to *_all.csv (train + public test). You can instead "
+                    "use *_train.csv. Rows without labels are ignored by CV. "
+                    "Official fixed-external leaderboard mode keeps its existing "
+                    "server-managed train/private-test behavior."
+                ),
+            )
 
             gr.Markdown("#### Test / validation protocol")
             r_eval_protocol = gr.Radio(
@@ -1714,8 +1725,12 @@ Submit batch correction and model code. Evaluation runs server-side.
                         "fixed_external",
                     ),
                     (
-                        "Rotating batch CV — -1 uses leave-one-batch-out",
+                        "Rotating train/valid/test batch CV — -1 uses leave-one-batch-out",
                         "cyclic_batches",
+                    ),
+                    (
+                        "Rotating train/valid only — no test set",
+                        "validation_only",
                     ),
                 ],
                 value="fixed_external",
@@ -1723,8 +1738,10 @@ Submit batch correction and model code. Evaluation runs server-side.
                 info=(
                     "Adenocarcinoma example: never-seen mode uses batches 1/2 for "
                     "train-validation and keeps batch 3 as external test (2 folds). "
-                    "Rotating -1 runs true leave-one-batch-out. A value of 5 groups "
-                    "all evaluable batches into five rotating CV folds."
+                    "Research modes use only the selected dataset file and never "
+                    "auto-load *_inference.csv. Rotating test mode holds out distinct "
+                    "validation and test batch groups; validation-only holds out only "
+                    "validation batches. -1 means batch leave-one-out."
                 ),
             )
             r_cyclic_cv_folds = gr.Number(
