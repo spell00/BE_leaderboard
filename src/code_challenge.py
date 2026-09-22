@@ -2171,6 +2171,232 @@ def _cross_validate_cyclic_submission(
     }
 
 
+def _cross_validate_validation_only_submission(
+    correction_code: str,
+    model_code: str,
+    dataset: str,
+    X: pd.DataFrame,
+    y: pd.Series,
+    batches: pd.Series,
+    names: pd.Series,
+    cyclic_cv_folds: int = -1,
+) -> dict:
+    """Grouped train/validation CV with no test or inference matrix at all."""
+    is_alzheimer = dataset == ALZHEIMER_DATASET
+    eligible = (
+        y.astype(str).isin(ALZHEIMER_SUPERVISED_LABELS).to_numpy()
+        if is_alzheimer
+        else None
+    )
+    try:
+        splits = cyclic_train_valid_splits(
+            batches,
+            eligible_mask=eligible,
+            n_splits=cyclic_cv_folds,
+        )
+    except ValueError as exc:
+        raise CodeValidationError(str(exc)) from exc
+
+    is_bernn_model = any(
+        token in model_code
+        for token in (
+            "TrainAEClassifierHoldout",
+            "TrainAEThenClassifierHoldout",
+            "AEHeadPredictor",
+        )
+    )
+    supervised_labels = (
+        set(ALZHEIMER_SUPERVISED_LABELS)
+        if is_alzheimer
+        else set(y.astype(str).unique())
+    )
+    model_y_all = (
+        model_labels_for_alzheimer(y).astype(str).reset_index(drop=True)
+        if is_alzheimer
+        else y.astype(str).reset_index(drop=True)
+    )
+
+    valid_scores: list[float] = []
+    fold_details: list[dict[str, object]] = []
+    oof_predictions = pd.Series(index=np.arange(len(X)), dtype=object)
+
+    from src.baselines import set_bernn_seed
+
+    print(
+        f"[submission-valid-only] Protocol: rotating train/validation by batch "
+        f"(requested_folds={cyclic_cv_folds}, resolved_rounds={len(splits)})",
+        flush=True,
+    )
+
+    for fold, split in enumerate(splits, start=1):
+        set_bernn_seed(CV_RANDOM_STATE + fold)
+        train_idx = split["train_idx"]
+        valid_idx = split["valid_idx"]
+
+        fold_X_train = X.iloc[train_idx].reset_index(drop=True)
+        fold_X_valid = X.iloc[valid_idx].reset_index(drop=True)
+        fold_y_train = model_y_all.iloc[train_idx].reset_index(drop=True)
+        fold_y_valid = model_y_all.iloc[valid_idx].reset_index(drop=True)
+        fold_batches_train = batches.iloc[train_idx].reset_index(drop=True)
+        fold_batches_valid = batches.iloc[valid_idx].reset_index(drop=True)
+
+        corrected_train, corrected_valid = _apply_user_batch_correction(
+            correction_code,
+            fold_X_train,
+            fold_batches_train,
+            fold_X_valid,
+            fold_batches_valid,
+            plot_capture=None,
+        )
+
+        model_X_train = corrected_train
+        model_y_train = fold_y_train
+        model_batches_train = fold_batches_train
+        model_X_valid = corrected_valid
+        model_y_valid = fold_y_valid
+        model_batches_valid = fold_batches_valid
+        scored_global_idx = np.asarray(valid_idx)
+
+        if is_alzheimer and not is_bernn_model:
+            train_supervised = model_y_train.ne(UNSUPERVISED_LABEL).to_numpy()
+            valid_supervised = model_y_valid.ne(UNSUPERVISED_LABEL).to_numpy()
+            model_X_train = model_X_train.loc[train_supervised].reset_index(drop=True)
+            model_y_train = model_y_train.loc[train_supervised].reset_index(drop=True)
+            model_batches_train = model_batches_train.loc[train_supervised].reset_index(drop=True)
+            model_X_valid = model_X_valid.loc[valid_supervised].reset_index(drop=True)
+            model_y_valid = model_y_valid.loc[valid_supervised].reset_index(drop=True)
+            model_batches_valid = model_batches_valid.loc[valid_supervised].reset_index(drop=True)
+            scored_global_idx = scored_global_idx[valid_supervised]
+
+        empty_test = pd.DataFrame(columns=model_X_train.columns)
+        empty_batches = pd.Series(dtype=str)
+        _, extra, _ = _run_user_model(
+            model_code,
+            model_X_train,
+            model_y_train,
+            empty_test,
+            dataset,
+            model_batches_train,
+            empty_batches,
+            X_valid=model_X_valid,
+            y_valid=model_y_valid,
+            batches_valid=model_batches_valid,
+            y_test=None,
+            plot_capture=None,
+            require_test_predictions=False,
+        )
+
+        valid_preds = extra.pop("_valid_predictions", None) if isinstance(extra, dict) else None
+        if valid_preds is None:
+            raise CodeValidationError(
+                "Validation-only CV requires fit() to return a trained model with "
+                "predict() so the validation fold can be scored."
+            )
+        valid_preds = pd.Series(valid_preds).astype(str).reset_index(drop=True)
+        if len(valid_preds) != len(model_y_valid):
+            raise CodeValidationError(
+                f"Validation-only round {fold} returned {len(valid_preds)} predictions "
+                f"for {len(model_y_valid)} validation rows."
+            )
+
+        score_y_valid = model_y_valid
+        score_valid_preds = valid_preds
+        if is_alzheimer and is_bernn_model:
+            keep_valid = score_y_valid.ne(UNSUPERVISED_LABEL).to_numpy()
+            score_y_valid = score_y_valid.loc[keep_valid].reset_index(drop=True)
+            score_valid_preds = score_valid_preds.loc[keep_valid].reset_index(drop=True)
+            scored_global_idx = scored_global_idx[keep_valid]
+
+        if len(score_y_valid) == 0:
+            raise CodeValidationError(
+                f"Validation batch group {split['valid_batches']} has no supervised rows."
+            )
+
+        valid_mcc = float(matthews_corrcoef(score_y_valid, score_valid_preds))
+        valid_scores.append(valid_mcc)
+        oof_predictions.loc[scored_global_idx] = score_valid_preds.to_numpy()
+
+        fold_details.append({
+            "fold": fold,
+            "valid_mcc": valid_mcc,
+            "n_train": int(len(train_idx)),
+            "n_valid": int(len(scored_global_idx)),
+            "n_test": 0,
+            "train_batches": list(split["train_batches"]),
+            "valid_batches": list(split["valid_batches"]),
+            "test_batches": [],
+        })
+        print(
+            f"[submission-valid-only][round {fold}/{len(splits)}] "
+            f"valid MCC={valid_mcc:.4f}",
+            flush=True,
+        )
+
+    supervised_all = y.astype(str).isin(supervised_labels).to_numpy()
+    supervised_idx = np.flatnonzero(supervised_all)
+    if oof_predictions.loc[supervised_idx].isna().any():
+        raise AssertionError(
+            "Every supervised sample must receive exactly one validation-only OOF prediction"
+        )
+
+    pred_df = pd.DataFrame({
+        "name": names.iloc[supervised_idx].astype(str).to_numpy(),
+        "prediction": oof_predictions.loc[supervised_idx].astype(str).to_numpy(),
+    })
+    reference = pd.DataFrame({
+        "name": names.iloc[supervised_idx].astype(str).to_numpy(),
+        "prediction": y.iloc[supervised_idx].astype(str).to_numpy(),
+    })
+    groups = pd.DataFrame({
+        "name": names.iloc[supervised_idx].astype(str).to_numpy(),
+        "group": batches.iloc[supervised_idx].astype(str).to_numpy(),
+    })
+    metrics = evaluate_predictions(pred_df, reference, groups=groups)
+    oof_mcc = float(metrics.get("test_mcc", metrics.get("mcc", 0.0)))
+    metrics.update({
+        "oof_valid_mcc": oof_mcc,
+        "valid_mcc": float(np.mean(valid_scores)),
+        "valid_mcc_std": float(np.std(valid_scores)),
+        "valid_mcc_folds": [float(v) for v in valid_scores],
+        "test_mcc": -1.0,
+        "test_samples": 0,
+        "cv_protocol": "rotating_train_valid_by_batch_v1",
+        "valid_fold_details": fold_details,
+        "evaluation_protocol": "validation_only",
+        "cyclic_cv_folds_requested": int(cyclic_cv_folds),
+        "cyclic_cv_folds_resolved": int(len(splits)),
+    })
+    return {"pred_df": pred_df, "metrics": metrics}
+
+
+def run_validation_research_submission(
+    team: str,
+    model_name: str,
+    dataset: str,
+    correction_code: str,
+    model_code: str,
+    dataset_file: str | None = None,
+    cyclic_cv_folds: int = -1,
+) -> tuple[pd.DataFrame, dict[str, float | int], str, str]:
+    """Run selected-file grouped CV with train/validation only and no test set."""
+    X, y, batches, names = _load_research_source_dataset(dataset, dataset_file)
+    result = _cross_validate_validation_only_submission(
+        correction_code,
+        model_code,
+        dataset,
+        X,
+        y,
+        batches,
+        names,
+        cyclic_cv_folds=cyclic_cv_folds,
+    )
+    metrics = result["metrics"]
+    metrics["train_batches"] = int(batches.nunique())
+    metrics["train_samples"] = int(len(X))
+    metrics["source_file"] = str(dataset_file or _default_research_source_filename(dataset))
+    return result["pred_df"], metrics, "", ""
+
+
 def run_cyclic_research_submission(
     team: str,
     model_name: str,
