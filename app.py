@@ -1413,10 +1413,12 @@ def run_meta_recommendation(
     dataset_file: str | None = None,
 ):
     """Run zero-shot BERNN recommendation on the selected evaluation universe."""
-    selected_protocol = _normalize_recommender_protocol(evaluation_protocol)
+    requested_protocol = str(evaluation_protocol or "fixed_external")
+    selected_protocol = _normalize_recommender_protocol(requested_protocol)
     print(
         f"[meta-recommender] click received dataset={dataset!r} "
-        f"uploaded={bool(uploaded_file)} protocol={selected_protocol!r}",
+        f"uploaded={bool(uploaded_file)} protocol={requested_protocol!r} "
+        f"recommender_universe={selected_protocol!r}",
         flush=True,
     )
     try:
@@ -1484,7 +1486,8 @@ def run_meta_recommendation(
 
         details = [
             f"Recommendation generated for {source_name}.",
-            f"Selected recommendation/evaluation protocol: {selected_protocol}",
+            f"Selected evaluation protocol: {requested_protocol}",
+            f"Recommender data universe: {selected_protocol}",
             f"Checkpoint: {checkpoint_name}",
             f"Checkpoint training protocol: {checkpoint_protocol_raw}",
             f"Input: {len(frame)} samples, {max(len(frame.columns) - 3, 0)} features",
@@ -1560,7 +1563,7 @@ def run_meta_recommendation(
             gr.update(value=model_choice),
             generated_code,
             gr.update(value=dataset) if not uploaded_file else gr.update(),
-            gr.update(value=selected_protocol),
+            gr.update(value=requested_protocol),
             gr.update(
                 value=(
                     dataset_file or default_dataset_source(dataset)
