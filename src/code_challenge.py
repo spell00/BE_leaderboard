@@ -27,6 +27,7 @@ from sklearn.svm import LinearSVC, SVC
 
 from src.hf_utils import load_private_inference, load_private_labels
 from src.leaderboard import evaluate_predictions, sorted_board
+from src.dataset_files import resolve_dataset_matrix_file
 from src.dataset_tasks import (
     ALZHEIMER_DATASET,
     ALZHEIMER_SUPERVISED_LABELS,
@@ -36,7 +37,9 @@ from src.dataset_tasks import (
     alzheimer_supervised_mask,
     model_labels_for_alzheimer,
     prepare_builtin_training_frame,
+    prepare_research_source_frame,
     task_feature_columns,
+    cyclic_train_valid_splits,
     cyclic_train_valid_test_splits,
 )
 
