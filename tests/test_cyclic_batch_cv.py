@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from src.dataset_tasks import cyclic_train_valid_test_splits
+from src.dataset_tasks import cyclic_train_valid_splits, cyclic_train_valid_test_splits
 
 
 def _role_batches(splits, key):
@@ -40,3 +40,26 @@ def test_at_least_three_groups_are_required():
     batches = np.repeat(["1", "2", "3", "4", "5"], 2)
     with pytest.raises(ValueError, match="at least 3"):
         cyclic_train_valid_test_splits(batches, n_splits=2)
+
+
+def test_train_valid_lbo_uses_each_batch_once_as_validation():
+    batches = np.repeat(["1", "2", "3", "4"], 2)
+    splits = cyclic_train_valid_splits(batches, n_splits=-1)
+
+    assert len(splits) == 4
+    assert _role_batches(splits, "valid_batches") == ["1", "2", "3", "4"]
+    assert all(len(split["test_batches"]) == 0 for split in [
+        {**split, "test_batches": []} for split in splits
+    ])
+    assert all(
+        set(split["train_batches"]).isdisjoint(set(split["valid_batches"]))
+        for split in splits
+    )
+
+
+def test_train_valid_allows_two_batch_lbo():
+    batches = np.repeat(["1", "2"], 3)
+    splits = cyclic_train_valid_splits(batches, n_splits=-1)
+    assert len(splits) == 2
+    assert all(len(split["train_idx"]) == 3 for split in splits)
+    assert all(len(split["valid_idx"]) == 3 for split in splits)
