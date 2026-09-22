@@ -2052,13 +2052,24 @@ def _cross_validate_cyclic_submission(
         predicted_proba=predicted_proba,
         groups=groups,
     )
+
+    # Match scripts/hp_search.py cyclic semantics exactly:
+    # - primary test_mcc = mean MCC across rotating test batches
+    # - global concatenated OOF MCC is retained as a separate diagnostic.
+    global_oof_test_mcc = float(metrics.get("test_mcc", metrics.get("mcc", 0.0)))
+    mean_test_mcc = float(np.mean(test_scores))
+    std_test_mcc = float(np.std(test_scores))
     metrics.update({
         "valid_mcc": float(np.mean(valid_scores)),
         "valid_mcc_std": float(np.std(valid_scores)),
         "valid_mcc_folds": [float(v) for v in valid_scores],
+        "test_mcc": mean_test_mcc,
+        "test_mcc_std": std_test_mcc,
         "test_mcc_folds": [float(v) for v in test_scores],
-        "test_mcc_fold_mean": float(np.mean(test_scores)),
-        "test_mcc_fold_std": float(np.std(test_scores)),
+        # Backward-compatible aliases used by the current UI.
+        "test_mcc_fold_mean": mean_test_mcc,
+        "test_mcc_fold_std": std_test_mcc,
+        "test_mcc_global_oof": global_oof_test_mcc,
         "cv_protocol": "cyclic_train_valid_test_by_batch_v1",
         "valid_fold_details": fold_details,
         "evaluation_protocol": "cyclic_batches",
@@ -2066,8 +2077,8 @@ def _cross_validate_cyclic_submission(
 
     print(
         f"[submission-cyclic] Mean valid MCC={metrics['valid_mcc']:.4f}; "
-        f"mean per-batch test MCC={metrics['test_mcc_fold_mean']:.4f}; "
-        f"global OOF test MCC={float(metrics.get('test_mcc', metrics.get('mcc', 0.0))):.4f}",
+        f"mean per-batch test MCC={metrics['test_mcc']:.4f}; "
+        f"global OOF test MCC={metrics['test_mcc_global_oof']:.4f}",
         flush=True,
     )
     return {
