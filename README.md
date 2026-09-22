@@ -1,3 +1,15 @@
+---
+title: Batch Effects Leaderboard
+emoji: 🧬
+colorFrom: blue
+colorTo: indigo
+sdk: gradio
+sdk_version: "5.50.0"
+python_version: "3.11"
+app_file: app.py
+pinned: false
+---
+
 # BE Leaderboard Meta-HPO Reproduction
 
 This repository reconstructs the two GEO batch-effect datasets, audits their
