@@ -968,6 +968,7 @@ def submit_real(
                 model_code=model_code,
                 evaluation_protocol=evaluation_protocol,
                 cyclic_cv_folds=cyclic_cv_folds,
+                dataset_file=dataset_file,
             )
         except CodeValidationError as exc:
             return _finish(
@@ -981,6 +982,29 @@ def submit_real(
             )
 
         print(f"[submission] Code submission completed for {team.strip()} / {model_name.strip()} on {dataset}", flush=True)
+
+        if evaluation_protocol == "validation_only":
+            valid_mcc = float(metrics.get("valid_mcc", -1.0))
+            valid_std = float(metrics.get("valid_mcc_std", 0.0))
+            fold_valid = metrics.get("valid_mcc_folds", [])
+            details = metrics.get("valid_fold_details", [])
+            msg = (
+                f"Validation-only result on {DATASET_LABELS.get(dataset, dataset)} "
+                f"using {metrics.get('source_file', dataset_file)}. "
+                f"Mean Valid MCC={valid_mcc:.4f} ± {valid_std:.4f}. "
+                "No test set or inference file was supplied; this result is not "
+                "written to a leaderboard."
+            )
+            if fold_valid:
+                msg += "\n\nTrain/validation rounds:"
+                for idx, valid_score in enumerate(fold_valid):
+                    detail = details[idx] if idx < len(details) else {}
+                    msg += (
+                        f"\n- R{idx + 1}: train={detail.get('train_batches', [])}, "
+                        f"valid={detail.get('valid_batches', [])} "
+                        f"MCC={float(valid_score):.4f}"
+                    )
+            return _finish(get_real_board(dataset, "fixed_external", -1), msg)
 
         if evaluation_protocol == "cyclic_batches":
             valid_mcc = float(metrics.get("valid_mcc", -1.0))
