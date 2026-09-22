@@ -2255,6 +2255,137 @@ Datasets are ordered by submission date.
                 outputs=[dataset_selector_modal, r_dataset_in, r_board_out, r_dataset_info, r_train_download, r_test_download]
             )
 
+        with gr.TabItem("Inference"):
+            gr.Markdown("""
+## Inference on a selected file
+
+Choose one labeled source CSV for train/validation CV and a separate target CSV
+for prediction. The target file may be completely unlabeled; if it contains a
+`label` column, that column is ignored and is never scored.
+
+This workflow does **not** use the leaderboard's hidden/private test labels and
+does **not** auto-load any `*_inference.csv` file.
+""")
+            with gr.Row():
+                i_dataset = gr.Dropdown(
+                    choices=[(label, key) for key, label in DATASET_LABELS.items()],
+                    value="massbench_benchmark",
+                    label="Dataset",
+                )
+                i_source_file = gr.Dropdown(
+                    choices=dataset_source_choices("massbench_benchmark"),
+                    value=default_dataset_source("massbench_benchmark"),
+                    label="Labeled source file",
+                )
+                i_target_file = gr.Dropdown(
+                    choices=inference_file_choices("massbench_benchmark"),
+                    value=default_inference_file("massbench_benchmark"),
+                    label="Inference target file",
+                )
+
+            i_cv_folds = gr.Number(
+                value=-1,
+                precision=0,
+                label="Train/validation batch CV folds",
+                info="-1 = leave-one-batch-out; positive values group batches into that many validation folds.",
+            )
+
+            def inference_file_state(dataset: str):
+                return (
+                    gr.update(
+                        choices=dataset_source_choices(dataset),
+                        value=default_dataset_source(dataset),
+                    ),
+                    gr.update(
+                        choices=inference_file_choices(dataset),
+                        value=default_inference_file(dataset),
+                    ),
+                )
+
+            i_dataset.change(
+                fn=inference_file_state,
+                inputs=[i_dataset],
+                outputs=[i_source_file, i_target_file],
+                queue=False,
+            )
+
+            gr.Markdown("#### Batch Correction")
+            with gr.Row():
+                i_corr_baseline = gr.Dropdown(
+                    choices=[(v["name"], k) for k, v in BATCH_CORRECTION_EXAMPLES.items()],
+                    value="none",
+                    label="Baseline",
+                )
+                i_corr_load = gr.Button("Load")
+            i_correction_code = gr.Code(
+                label="Batch Correction Code",
+                language="python",
+                value=DEFAULT_CORRECTION_CODE,
+                lines=10,
+            )
+            i_corr_load.click(
+                fn=lambda x: load_baseline(x, True),
+                inputs=[i_corr_baseline],
+                outputs=[i_correction_code],
+            )
+            i_corr_baseline.change(
+                fn=lambda x: load_baseline(x, True),
+                inputs=[i_corr_baseline],
+                outputs=[i_correction_code],
+            )
+
+            gr.Markdown("#### Model")
+            with gr.Row():
+                i_model_baseline = gr.Dropdown(
+                    choices=[(v["name"], k) for k, v in MODEL_EXAMPLES.items()],
+                    value="gaussian_nb",
+                    label="Baseline",
+                )
+                i_model_load = gr.Button("Load")
+            i_model_code = gr.Code(
+                label="Model Code",
+                language="python",
+                value=DEFAULT_MODEL_CODE,
+                lines=12,
+            )
+            i_model_load.click(
+                fn=lambda x: load_baseline(x, False),
+                inputs=[i_model_baseline],
+                outputs=[i_model_code],
+            )
+            i_model_baseline.change(
+                fn=lambda x: load_baseline(x, False),
+                inputs=[i_model_baseline],
+                outputs=[i_model_code],
+            )
+
+            i_run = gr.Button("Run Inference", variant="primary")
+            i_status = gr.Textbox(label="Inference status", interactive=False, lines=4)
+            i_predictions = gr.Dataframe(
+                label="Predictions",
+                headers=["name", "prediction"],
+                interactive=False,
+                wrap=True,
+            )
+            i_download = gr.File(
+                label="Download predictions CSV",
+                interactive=False,
+            )
+
+            i_run.click(
+                fn=run_inference_ui,
+                inputs=[
+                    i_dataset,
+                    i_source_file,
+                    i_target_file,
+                    i_correction_code,
+                    i_model_code,
+                    i_cv_folds,
+                ],
+                outputs=[i_predictions, i_status, i_download],
+                api_name="run_inference",
+            )
+
         with gr.TabItem("Add a Dataset"):
             gr.Markdown("""
 ## Add a benchmark dataset
