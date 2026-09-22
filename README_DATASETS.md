@@ -91,3 +91,47 @@ PY
 
 Before training, confirm the audit index exists and inspect the PCA/UMAP plots
 for both batch separation and biological-label structure.
+
+## scIB pancreas: one-command download and preparation
+
+A reproducible importer is available for the public scIB pancreas benchmark dataset.
+
+Prepare it locally:
+
+```bash
+python scripts/download_prepare_scib_pancreas.py
+```
+
+This command queries Figshare article `25953868`, downloads the H5AD source,
+runs `scripts/import_scib_pancreas.py`, and creates:
+
+```text
+data/datasets/scib_pancreas/scib_pancreas_train.csv
+data/datasets/scib_pancreas/scib_pancreas_all.csv
+data/datasets/scib_pancreas/provenance.json
+```
+
+The prepared matrix uses `tech` as the batch column, `celltype` as the label,
+library-size normalization to 10,000 counts, `log1p`, and the top 2,048
+variance genes by default.
+
+To prepare and upload the generated files to the leaderboard Hugging Face Dataset
+repository in the same command:
+
+```bash
+python scripts/download_prepare_scib_pancreas.py --upload-hf
+```
+
+Useful options:
+
+```bash
+# Use an already-downloaded H5AD
+python scripts/download_prepare_scib_pancreas.py --source /path/to/pancreas.h5ad
+
+# Change the number of retained genes
+python scripts/download_prepare_scib_pancreas.py --max-features 4096
+
+# Explicitly select a Figshare H5AD filename if the article contains several
+python scripts/download_prepare_scib_pancreas.py --figshare-file FILE.h5ad
+```
+
