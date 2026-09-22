@@ -40,7 +40,10 @@ def ensure_hf_datasets(root: Path) -> None:
     snapshot_download(
         repo_id=repo_id,
         repo_type="dataset",
-        allow_patterns=["data/datasets/**"],
+        allow_patterns=[
+            "data/datasets/**",
+            "models/meta_bernn/**",
+        ],
         local_dir=str(root),
         token=os.getenv("HF_TOKEN") or None,
     )
