@@ -1068,13 +1068,27 @@ Available preloaded libraries:
 
 
 
-def _load_recommender_input(dataset: str, uploaded_file) -> tuple[pd.DataFrame, str]:
-    """Load recommendation input using the same built-in preprocessing as HPO."""
+def _normalize_recommender_protocol(protocol: str | None) -> str:
+    """Normalize UI/checkpoint protocol names to the two app evaluation modes."""
+    if str(protocol or "").strip() in {
+        "cyclic_batches",
+        "cyclic_train_valid_test_by_batch_v1",
+    }:
+        return "cyclic_batches"
+    return "fixed_external"
+
+
+def _load_recommender_input(
+    dataset: str,
+    uploaded_file,
+    evaluation_protocol: str,
+) -> tuple[pd.DataFrame, str]:
+    """Load the exact dataset universe selected for the upcoming evaluation."""
+    protocol = _normalize_recommender_protocol(evaluation_protocol)
     if uploaded_file:
         path = getattr(uploaded_file, "name", uploaded_file)
         return pd.read_csv(path), f"uploaded file: {Path(path).name}"
 
-    protocol = recommender_evaluation_protocol()
     if protocol == "cyclic_batches":
         from scripts.hp_search import load_cyclic_dataset
 
@@ -1105,18 +1119,30 @@ def _load_recommender_input(dataset: str, uploaded_file) -> tuple[pd.DataFrame, 
     for column in feature_columns:
         normalized[column] = cleaned[column]
 
-    return normalized, DATASET_LABELS.get(dataset, dataset)
+    return (
+        normalized,
+        f"{DATASET_LABELS.get(dataset, dataset)} (fixed-external development universe)",
+    )
 
 
-def run_meta_recommendation(dataset: str, uploaded_file):
-    """Run zero-shot BERNN hyperparameter recommendation for the UI."""
+def run_meta_recommendation(
+    dataset: str,
+    uploaded_file,
+    evaluation_protocol: str = "fixed_external",
+):
+    """Run zero-shot BERNN recommendation on the selected evaluation universe."""
+    selected_protocol = _normalize_recommender_protocol(evaluation_protocol)
     print(
         f"[meta-recommender] click received dataset={dataset!r} "
-        f"uploaded={bool(uploaded_file)}",
+        f"uploaded={bool(uploaded_file)} protocol={selected_protocol!r}",
         flush=True,
     )
     try:
-        frame, source_name = _load_recommender_input(dataset, uploaded_file)
+        frame, source_name = _load_recommender_input(
+            dataset,
+            uploaded_file,
+            selected_protocol,
+        )
         result = recommend_bernn_config(frame)
         config_table, meta_table = recommendation_tables(result)
 
@@ -1131,7 +1157,17 @@ def run_meta_recommendation(dataset: str, uploaded_file):
         )
 
         metadata = result.get("checkpoint_metadata", {})
-        if not uploaded_file:
+        checkpoint_protocol_raw = metadata.get(
+            "evaluation_protocol",
+            "fixed_external_test_v1",
+        )
+        checkpoint_protocol = _normalize_recommender_protocol(
+            checkpoint_protocol_raw
+        )
+        protocol_matches_checkpoint = selected_protocol == checkpoint_protocol
+        parity_verified = False
+
+        if not uploaded_file and protocol_matches_checkpoint:
             reference_meta = metadata.get("raw_meta_features", {}).get(dataset)
             if reference_meta is not None:
                 current_meta = np.asarray(
@@ -1153,24 +1189,32 @@ def run_meta_recommendation(dataset: str, uploaded_file):
                     )
                     raise RuntimeError(
                         f"Built-in dataset '{dataset}' does not reproduce the "
-                        "meta-features stored in this checkpoint "
+                        "meta-features stored in this checkpoint for protocol "
+                        f"'{selected_protocol}' "
                         f"(max absolute difference={max_abs:.6g})."
                     )
+                parity_verified = True
 
         checkpoint_name = Path(result["checkpoint_path"]).name
-        checkpoint_protocol = metadata.get("evaluation_protocol", "fixed_external_test_v1")
         round_number = metadata.get("round")
         benchmark_error = metadata.get("benchmark_prediction_error")
 
         details = [
             f"Recommendation generated for {source_name}.",
+            f"Selected recommendation/evaluation protocol: {selected_protocol}",
             f"Checkpoint: {checkpoint_name}",
-            f"Checkpoint evaluation protocol: {checkpoint_protocol}",
+            f"Checkpoint training protocol: {checkpoint_protocol_raw}",
             f"Input: {len(frame)} samples, {max(len(frame.columns) - 3, 0)} features",
             f"Meta-features: {len(result.get('meta_features', {}))}",
         ]
-        if not uploaded_file and metadata.get("raw_meta_features", {}).get(dataset) is not None:
+        if parity_verified:
             details.append("Training-data meta-feature parity: verified")
+        elif not uploaded_file and not protocol_matches_checkpoint:
+            details.append(
+                "Checkpoint/input protocol differs: stored checkpoint meta-features "
+                "are not expected to match and parity was not enforced. The new "
+                "recommendation uses the selected evaluation universe."
+            )
         if round_number is not None:
             details.append(f"Checkpoint round: {round_number}")
         if benchmark_error is not None:
@@ -1233,6 +1277,7 @@ def run_meta_recommendation(dataset: str, uploaded_file):
             gr.update(value=model_choice),
             generated_code,
             gr.update(value=dataset) if not uploaded_file else gr.update(),
+            gr.update(value=selected_protocol),
         )
     except Exception as exc:
         print(
@@ -1245,6 +1290,7 @@ def run_meta_recommendation(dataset: str, uploaded_file):
             _format_exec_error(exc),
             "",
             gr.update(interactive=False),
+            gr.update(),
             gr.update(),
             gr.update(),
             gr.update(),
@@ -1297,6 +1343,27 @@ Run a reproducible server-side benchmark or propose a matrix-ready dataset.
                 label="Or upload CSV",
                 file_types=[".csv"],
             )
+
+        meta_eval_protocol = gr.Radio(
+            choices=[
+                (
+                    "Never-seen external test — recommend from development data only",
+                    "fixed_external",
+                ),
+                (
+                    "Rotating batch LBO — recommend from the complete cyclic batch universe",
+                    "cyclic_batches",
+                ),
+            ],
+            value="fixed_external",
+            label="Recommendation / evaluation protocol",
+            info=(
+                "This controls which samples are used to compute the meta-features. "
+                "For adenocarcinoma: fixed uses 434 samples (batches 1+2); cyclic "
+                "uses all 642 samples (batches 1+2+3). It is synchronized with "
+                "the benchmark protocol below."
+            ),
+        )
 
         meta_run = gr.Button(
             "Recommend BERNN configuration",
@@ -1413,6 +1480,22 @@ Submit batch correction and model code. Evaluation runs server-side.
                     "**Selected: Never-seen external test.** The designated external test "
                     "batch(es) are never used for training or validation."
                 )
+
+            # Keep the recommender and evaluator protocol selectors synchronized.
+            # Programmatic updates do not retrain the recommender; when changing
+            # protocol, click Recommend again to regenerate protocol-matched code.
+            r_eval_protocol.input(
+                fn=lambda protocol: protocol,
+                inputs=[r_eval_protocol],
+                outputs=[meta_eval_protocol],
+                queue=False,
+            )
+            meta_eval_protocol.input(
+                fn=lambda protocol: protocol,
+                inputs=[meta_eval_protocol],
+                outputs=[r_eval_protocol],
+                queue=False,
+            )
 
             r_eval_protocol.change(
                 fn=protocol_summary,
@@ -1554,7 +1637,7 @@ Datasets are ordered by submission date.
 
             meta_run.click(
                 fn=run_meta_recommendation,
-                inputs=[meta_dataset, meta_upload],
+                inputs=[meta_dataset, meta_upload, meta_eval_protocol],
                 outputs=[
                     meta_config,
                     meta_features_table,
@@ -1564,6 +1647,7 @@ Datasets are ordered by submission date.
                     r_model_baseline,
                     r_model_code,
                     r_dataset_in,
+                    r_eval_protocol,
                 ],
                 api_name="recommend_bernn",
                 queue=False,
