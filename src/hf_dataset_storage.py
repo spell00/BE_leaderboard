@@ -1,4 +1,4 @@
-"""Restore leaderboard datasets from the dedicated Hugging Face storage Space."""
+"""Restore leaderboard datasets from the dedicated Hugging Face Dataset repository."""
 
 from __future__ import annotations
 
@@ -8,11 +8,11 @@ from pathlib import Path
 from huggingface_hub import snapshot_download
 
 
-DEFAULT_STORAGE_REPO = "spell0/Batch-effects-leaderboard-storage"
+DEFAULT_STORAGE_REPO = "spell0/Batch-effects-leaderboard-data"
 
 
 def ensure_hf_datasets(root: Path) -> None:
-    """Download data/datasets from the storage Space when running on HF Spaces."""
+    """Download data/datasets from the Dataset repository when running on HF Spaces."""
 
     # Local development already has the datasets checked out.
     if not os.getenv("SPACE_ID"):
@@ -28,7 +28,7 @@ def ensure_hf_datasets(root: Path) -> None:
         return
 
     repo_id = os.getenv(
-        "BE_DATA_STORAGE_REPO",
+        "BE_DATA_REPO",
         DEFAULT_STORAGE_REPO,
     ).strip()
 
@@ -39,7 +39,7 @@ def ensure_hf_datasets(root: Path) -> None:
 
     snapshot_download(
         repo_id=repo_id,
-        repo_type="space",
+        repo_type="dataset",
         allow_patterns=["data/datasets/**"],
         local_dir=str(root),
         token=os.getenv("HF_TOKEN") or None,
