@@ -1364,29 +1364,26 @@ def _load_recommender_input(
     dataset: str,
     uploaded_file,
     evaluation_protocol: str,
+    dataset_file: str | None = None,
 ) -> tuple[pd.DataFrame, str]:
-    """Load the exact dataset universe selected for the upcoming evaluation."""
+    """Load the exact selected-file universe for BERNN meta-features."""
     protocol = _normalize_recommender_protocol(evaluation_protocol)
     if uploaded_file:
         path = getattr(uploaded_file, "name", uploaded_file)
         return pd.read_csv(path), f"uploaded file: {Path(path).name}"
 
     if protocol == "cyclic_batches":
-        from scripts.hp_search import load_cyclic_dataset
-
-        X, y, batches = load_cyclic_dataset(dataset)
-        normalized = pd.DataFrame({
-            "name": [f"{dataset}_{index}" for index in range(len(X))],
-            "batch": pd.Series(batches).astype(str),
-            "label": pd.Series(y).astype(str),
-        })
-        normalized = pd.concat(
-            [normalized.reset_index(drop=True), X.reset_index(drop=True)],
-            axis=1,
-        )
+        filename = str(dataset_file or default_dataset_source(dataset) or "")
+        path = resolve_dataset_matrix_file(ROOT, dataset, filename)
+        frame = prepare_research_source_frame(dataset, pd.read_csv(path))
+        feature_columns = task_feature_columns(frame)
+        cleaned = clean_task_features(frame, feature_columns)
+        normalized = frame[["name", "batch", "label"]].reset_index(drop=True).copy()
+        for column in feature_columns:
+            normalized[column] = cleaned[column]
         return (
             normalized,
-            f"{DATASET_LABELS.get(dataset, dataset)} (cyclic batch universe)",
+            f"{DATASET_LABELS.get(dataset, dataset)} ({filename})",
         )
 
     path = ROOT / "data" / "datasets" / dataset / f"{dataset}_train.csv"
@@ -1411,6 +1408,7 @@ def run_meta_recommendation(
     dataset: str,
     uploaded_file,
     evaluation_protocol: str = "fixed_external",
+    dataset_file: str | None = None,
 ):
     """Run zero-shot BERNN recommendation on the selected evaluation universe."""
     selected_protocol = _normalize_recommender_protocol(evaluation_protocol)
@@ -1424,6 +1422,7 @@ def run_meta_recommendation(
             dataset,
             uploaded_file,
             selected_protocol,
+            dataset_file,
         )
         result = recommend_bernn_config(frame)
         config_table, meta_table = recommendation_tables(result)
@@ -1560,6 +1559,13 @@ def run_meta_recommendation(
             generated_code,
             gr.update(value=dataset) if not uploaded_file else gr.update(),
             gr.update(value=selected_protocol),
+            gr.update(
+                value=(
+                    dataset_file or default_dataset_source(dataset)
+                    if not uploaded_file
+                    else None
+                )
+            ),
         )
     except Exception as exc:
         print(
@@ -1572,6 +1578,7 @@ def run_meta_recommendation(
             _format_exec_error(exc),
             "",
             gr.update(interactive=False),
+            gr.update(),
             gr.update(),
             gr.update(),
             gr.update(),
