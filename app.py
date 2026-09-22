@@ -874,7 +874,7 @@ def submit_real(
 
     if evaluation_protocol == "cyclic_batches" and not RESEARCH_CYCLIC_ENABLED:
         return _finish(
-            get_real_board(dataset),
+            get_real_board(dataset, evaluation_protocol, cyclic_cv_folds),
             "Cyclic batch rotation is disabled on this deployment. "
             "Enable it for local research with ENABLE_RESEARCH_CYCLIC=1.",
         )
@@ -901,9 +901,15 @@ def submit_real(
                 cyclic_cv_folds=cyclic_cv_folds,
             )
         except CodeValidationError as exc:
-            return _finish(get_real_board(dataset), f"Submission rejected: {exc}")
+            return _finish(
+                get_real_board(dataset, evaluation_protocol, cyclic_cv_folds),
+                f"Submission rejected: {exc}",
+            )
         except SubmissionCancelled as exc:
-            return _finish(get_real_board(dataset), str(exc))
+            return _finish(
+                get_real_board(dataset, evaluation_protocol, cyclic_cv_folds),
+                str(exc),
+            )
 
         print(f"[submission] Code submission completed for {team.strip()} / {model_name.strip()} on {dataset}", flush=True)
 
@@ -1036,7 +1042,10 @@ def submit_real(
             print(f"[bernn-default] update skipped: {type(exc).__name__}: {exc}")
     except Exception as exc:
         print(f"[submission] ERROR during submission for {team.strip()} / {model_name.strip()} on {dataset}: {type(exc).__name__}: {exc}", flush=True)
-        return _finish(get_real_board(dataset), _format_exec_error(exc))
+        return _finish(
+            get_real_board(dataset, evaluation_protocol, cyclic_cv_folds),
+            _format_exec_error(exc),
+        )
         # return _finish(get_real_board(dataset), _format_exec_error(exc), _captured_logs(logs_buffer))
 
     print(f"[submission] Submission completed for {team.strip()} / {model_name.strip()} on {dataset} 1", flush=True)
@@ -1529,7 +1538,7 @@ Run a reproducible server-side benchmark or propose a matrix-ready dataset.
                     "fixed_external",
                 ),
                 (
-                    "Rotating batch LBO — recommend from the complete cyclic batch universe",
+                    "Rotating batch CV — recommend from the complete cyclic batch universe",
                     "cyclic_batches",
                 ),
             ],
@@ -1592,7 +1601,7 @@ Run a reproducible server-side benchmark or propose a matrix-ready dataset.
 Submit batch correction and model code. Evaluation runs server-side.
 - Click a leaderboard row to auto-fill code if you own it or it is public
 - Supported batch correction: ComBat-like, Harmony (harmonypy), scanpy, bernn (TrainAEClassifierHoldout/TrainAEThenClassifierHoldout) methods
-- Official score is the lower of validation MCC and hidden test MCC. For example, Valid MCC=0.60 and Test MCC=0.80 scores 0.60; Valid MCC=0.80 and Test MCC=0.60 also scores 0.60. This discourages lucky or overfit test runs.
+- Leaderboards are separated by evaluation protocol. Fixed-external uses the hidden test split; rotating -1 and rotating 5 use mean held-out batch Test MCC. The score is the lower of Valid MCC and Test MCC.
 """)
 
             r_model_in = gr.Textbox(label="Submission Name", value="my_submission")
