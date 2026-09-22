@@ -65,16 +65,25 @@ def prepare_research_source_frame(dataset: str, frame: pd.DataFrame) -> pd.DataF
         raise ValueError("Selected research source file must contain a label column")
 
     labels = normalized_labels(frame["label"])
-    labelled = labels.notna() & labels.ne("")
-    out = frame.loc[labelled].copy()
-    if out.empty:
-        raise ValueError("Selected research source file contains no labeled rows")
+    out = frame.copy()
 
     if dataset == ALZHEIMER_DATASET:
-        mapped, _ = prepare_alzheimer_development_labels(out["label"])
+        # CU / DEM-AD stay supervised.
+        # Other known Alzheimer diagnoses remain pooled/unsupervised.
+        # Missing labels are also retained as unsupervised samples.
+        mapped, _ = prepare_alzheimer_development_labels(labels)
+        mapped = mapped.fillna(POOL_LABEL)
+        mapped = mapped.where(mapped.ne(""), POOL_LABEL)
         out["label"] = mapped
     else:
-        out["label"] = labels.loc[labelled]
+        # Keep unlabeled rows for unsupervised/batch-learning use.
+        # They must not contribute to supervised classification loss.
+        out["label"] = labels.fillna(UNSUPERVISED_LABEL)
+        out["label"] = out["label"].where(
+            out["label"].ne(""),
+            UNSUPERVISED_LABEL,
+        )
+
     return out.reset_index(drop=True)
 
 
