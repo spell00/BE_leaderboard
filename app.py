@@ -466,6 +466,7 @@ def _run_code_submission_cancellable(
     model_code: str,
     evaluation_protocol: str = "fixed_external",
     cyclic_cv_folds: int = -1,
+    dataset_file: str | None = None,
 ) -> dict:
     with _ACTIVE_REAL_RUNS_LOCK:
         existing = _ACTIVE_REAL_RUNS.get(run_key)
@@ -496,6 +497,7 @@ def _run_code_submission_cancellable(
                         "model_code": model_code,
                         "evaluation_protocol": evaluation_protocol,
                         "cyclic_cv_folds": int(cyclic_cv_folds),
+                        "dataset_file": dataset_file,
                     },
                     fh,
                     protocol=pickle.HIGHEST_PROTOCOL,
