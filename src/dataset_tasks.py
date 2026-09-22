@@ -52,6 +52,32 @@ def prepare_builtin_training_frame(dataset: str, frame: pd.DataFrame) -> pd.Data
     return out.reset_index(drop=True)
 
 
+def prepare_research_source_frame(dataset: str, frame: pd.DataFrame) -> pd.DataFrame:
+    """Prepare one user-selected source CSV for supervised research CV.
+
+    Unlike the legacy fixed-test path, rows with missing/blank labels are always
+    ignored. This is important for *_all.csv files built by concatenating a
+    labeled train split with an unlabeled public test/inference split. For
+    Alzheimer, labeled non-CU/DEM-AD diagnoses are still retained as pooled
+    unsupervised rows after unlabeled rows have been removed.
+    """
+    if "label" not in frame.columns:
+        raise ValueError("Selected research source file must contain a label column")
+
+    labels = normalized_labels(frame["label"])
+    labelled = labels.notna() & labels.ne("")
+    out = frame.loc[labelled].copy()
+    if out.empty:
+        raise ValueError("Selected research source file contains no labeled rows")
+
+    if dataset == ALZHEIMER_DATASET:
+        mapped, _ = prepare_alzheimer_development_labels(out["label"])
+        out["label"] = mapped
+    else:
+        out["label"] = labels.loc[labelled]
+    return out.reset_index(drop=True)
+
+
 def model_labels_for_alzheimer(labels) -> pd.Series:
     """Convert pooled rows to BERNN's -1 unsupervised sentinel."""
     normalized = normalized_labels(labels)
@@ -82,6 +108,93 @@ def _natural_batch_key(value: object):
         for part in re.split(r"(\d+)", text)
         if part != ""
     )
+
+
+def cyclic_train_valid_splits(batches, eligible_mask=None, n_splits: int = -1):
+    """Rotate grouped batch roles for train/validation-only research CV.
+
+    With n_splits=-1, each evaluable batch is validation exactly once and every
+    other batch trains. A positive n_splits groups batches deterministically.
+    No test or inference matrix participates in this protocol.
+    """
+    values = np.asarray(pd.Series(batches).astype(str))
+    all_batches = sorted(set(values.tolist()), key=_natural_batch_key)
+
+    if eligible_mask is None:
+        eligible_values = values
+    else:
+        eligible_mask = np.asarray(eligible_mask, dtype=bool)
+        if eligible_mask.shape != values.shape:
+            raise ValueError("eligible_mask must have one boolean per sample")
+        eligible_values = values[eligible_mask]
+
+    ordered = sorted(set(eligible_values.tolist()), key=_natural_batch_key)
+    n_batches = len(ordered)
+    if n_batches < 2:
+        raise ValueError(
+            "Train/validation batch CV requires at least 2 evaluable batches; "
+            f"found {n_batches}: {ordered}"
+        )
+
+    try:
+        requested = int(n_splits)
+    except (TypeError, ValueError):
+        raise ValueError("Number of batch CV folds must be -1 or an integer >= 2")
+
+    if requested == -1:
+        resolved = n_batches
+    elif requested < 2:
+        raise ValueError(
+            "Number of batch CV folds must be -1 (leave-one-batch-out) or at least 2"
+        )
+    elif requested > n_batches:
+        raise ValueError(
+            f"Requested {requested} batch CV folds, but only {n_batches} evaluable "
+            "batches are available"
+        )
+    else:
+        resolved = requested
+
+    grouped = [
+        [str(value) for value in group.tolist()]
+        for group in np.array_split(np.asarray(ordered, dtype=object), resolved)
+    ]
+    if any(not group for group in grouped):
+        raise AssertionError("Batch CV grouping produced an empty group")
+
+    splits = []
+    for round_index in range(resolved):
+        valid_batches = grouped[round_index]
+        valid_set = set(valid_batches)
+        train_batches = [batch for batch in all_batches if batch not in valid_set]
+
+        train_idx = np.flatnonzero(np.isin(values, train_batches))
+        valid_idx = np.flatnonzero(np.isin(values, valid_batches))
+        if not len(train_idx) or not len(valid_idx):
+            raise ValueError(
+                "Train/validation batch CV produced an empty split: "
+                f"train={len(train_idx)} valid={len(valid_idx)}"
+            )
+
+        splits.append({
+            "round": round_index + 1,
+            "train_idx": train_idx,
+            "valid_idx": valid_idx,
+            "train_batches": train_batches,
+            "valid_batches": valid_batches,
+            "valid_batch": valid_batches[0] if len(valid_batches) == 1 else valid_batches,
+            "n_splits": resolved,
+            "requested_n_splits": requested,
+        })
+
+    valid_roles = sorted(
+        [batch for row in splits for batch in row["valid_batches"]],
+        key=_natural_batch_key,
+    )
+    if valid_roles != ordered:
+        raise AssertionError("Each evaluable batch must appear exactly once as validation")
+
+    return splits
 
 
 def cyclic_train_valid_test_splits(batches, eligible_mask=None, n_splits: int = -1):
