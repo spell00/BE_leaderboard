@@ -433,6 +433,7 @@ BERNN_DEFAULTS = {
     "class_triplet_w": 1.0,
     "triplet_dloss": True,
     "rec_loss": "l1",
+    "log1p": True,
     "scaler": "standard",
     "use_l1": True,
     "prune_network": True,
@@ -471,6 +472,7 @@ BERNN_KNOBS = [
     {"key": "class_triplet_w", "label": "Class triplet weight", "kind": "float", "min": 0.0, "max": 10.0, "help": "Weight for the class triplet objective"},
     {"key": "triplet_dloss","label": "Batch triplet loss",  "kind": "bool",   "help": "Use the batch/domain triplet component when dloss is triplet-based"},
     {"key": "rec_loss",     "label": "Reconstruction loss", "kind": "choice", "choices": ["l1", "mse"], "help": "Autoencoder reconstruction loss"},
+    {"key": "log1p",        "label": "Log1p transform",      "kind": "bool",   "help": "Apply log1p to non-negative input intensities before scaling"},
     {"key": "scaler",       "label": "Scaler",              "kind": "choice", "choices": ["standard", "robust", "minmax", "standard_per_batch", "robust_per_batch"], "help": "Input scaling"},
     {"key": "use_l1",       "label": "L1 regularization",   "kind": "bool",   "help": "Apply L1 penalty"},
     {"key": "prune_network","label": "Prune network",       "kind": "bool",   "help": "Enable network pruning"},
@@ -527,7 +529,7 @@ _BERNN_CONFIG_ORDER = [k["key"] for k in BERNN_KNOBS]
 _BERNN_TUNED_PATH = Path(__file__).with_name("bernn_tuned_defaults.json")
 # Only these keys are honored from the tuned file (ignore bookkeeping like _valid_mcc).
 _BERNN_TUNABLE_KEYS = (
-    "kan", "n_layers", "layer1", "scaler", "warmup",
+    "kan", "n_layers", "layer1", "log1p", "scaler", "warmup",
     "class_triplet", "class_triplet_w", "triplet_dloss",
     "lr", "wd", "nu", "margin", "smoothing", "dropout", "thres", "gamma", "beta",
 )
@@ -752,6 +754,7 @@ def build_bernn_code(cfg=None, preset=None, *, meta_predicted=False):
         bs          = cfg.get("bs",          32)
         device      = cfg.get("device",      "cpu")
         scaler      = cfg.get("scaler",      "standard")
+        log1p       = cfg.get("log1p",        True)
         layer1      = cfg.get("layer1",      256)
         n_layers    = cfg.get("n_layers",    1)
         variational = cfg.get("variational", False)
@@ -799,6 +802,7 @@ def build_bernn_code(cfg=None, preset=None, *, meta_predicted=False):
             f"        \'bs\':          {bs},\n"
             f"        \'device\':      {device!r},\n"
             f"        \'scaler\':      {scaler!r},\n"
+            f"        \'log1p\':       {log1p!r},\n"
             f"        \'layer1\':      {layer1},\n"
             f"        \'n_layers\':    {n_layers},\n"
             f"        \'variational\': {variational},\n"
@@ -834,6 +838,7 @@ def build_bernn_code(cfg=None, preset=None, *, meta_predicted=False):
             "        layer1=CONFIG[\'layer1\'],\n"
             "        rec_loss=CONFIG[\'rec_loss\'],\n"
             "        scaler=CONFIG[\'scaler\'],\n"
+            "        log1p=CONFIG[\'log1p\'],\n"
             "        use_l1=CONFIG[\'use_l1\'],\n"
             "        prune_network=CONFIG[\'prune_network\'],\n"
             "        optimize_hyperparams=False,\n"
@@ -909,6 +914,7 @@ def build_bernn_code(cfg=None, preset=None, *, meta_predicted=False):
             use_mapping=CONFIG["use_mapping"],
             rec_loss=CONFIG["rec_loss"],
             scaler=CONFIG["scaler"],
+            log1p=CONFIG["log1p"],
             use_l1=CONFIG["use_l1"],
             prune_network=CONFIG["prune_network"],
             update_grid=CONFIG["kan"],       # grid updates are KAN-only; enabling with MLP crashes the two-stage trainer
