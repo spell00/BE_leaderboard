@@ -2369,6 +2369,282 @@ def _cross_validate_validation_only_submission(
     return {"pred_df": pred_df, "metrics": metrics}
 
 
+def _load_inference_target(
+    dataset: str,
+    inference_file: str,
+    feature_cols: list[str],
+) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
+    """Load a selected matrix for inference; labels are intentionally ignored."""
+    path = resolve_dataset_matrix_file(ROOT, dataset, inference_file)
+    frame = pd.read_csv(path)
+    if "name" not in frame.columns:
+        raise ValueError(
+            f"Inference file '{inference_file}' must contain a name column"
+        )
+
+    missing = [column for column in feature_cols if column not in frame.columns]
+    if missing:
+        raise ValueError(
+            f"Inference file '{inference_file}' is missing {len(missing)} "
+            f"source feature columns"
+        )
+
+    names = frame["name"].astype(str).reset_index(drop=True)
+    if names.duplicated().any():
+        duplicates = names[names.duplicated()].head(5).tolist()
+        raise ValueError(
+            f"Inference file '{inference_file}' has duplicate sample names: {duplicates}"
+        )
+    X = _clean_features(frame, feature_cols)
+    if "batch" in frame.columns:
+        batches = frame["batch"].astype(str).reset_index(drop=True)
+    else:
+        batches = pd.Series(["inference"] * len(frame), dtype=str)
+    return X, batches, names
+
+
+def _cross_validate_inference_submission(
+    correction_code: str,
+    model_code: str,
+    dataset: str,
+    X: pd.DataFrame,
+    y: pd.Series,
+    batches: pd.Series,
+    X_inference: pd.DataFrame,
+    batches_inference: pd.Series,
+    names_inference: pd.Series,
+    cyclic_cv_folds: int = -1,
+) -> dict:
+    """Train/valid CV on one source file and ensemble predictions on another file."""
+    if len(X_inference) == 0:
+        raise CodeValidationError("Selected inference file contains no rows")
+
+    is_alzheimer = dataset == ALZHEIMER_DATASET
+    eligible = (
+        y.astype(str).isin(ALZHEIMER_SUPERVISED_LABELS).to_numpy()
+        if is_alzheimer
+        else None
+    )
+    try:
+        splits = cyclic_train_valid_splits(
+            batches,
+            eligible_mask=eligible,
+            n_splits=cyclic_cv_folds,
+        )
+    except ValueError as exc:
+        raise CodeValidationError(str(exc)) from exc
+
+    is_bernn_model = any(
+        token in model_code
+        for token in (
+            "TrainAEClassifierHoldout",
+            "TrainAEThenClassifierHoldout",
+            "AEHeadPredictor",
+        )
+    )
+    supervised_labels = (
+        set(ALZHEIMER_SUPERVISED_LABELS)
+        if is_alzheimer
+        else set(y.astype(str).unique())
+    )
+    all_labels = sorted(supervised_labels)
+    model_y_all = (
+        model_labels_for_alzheimer(y).astype(str).reset_index(drop=True)
+        if is_alzheimer
+        else y.astype(str).reset_index(drop=True)
+    )
+
+    valid_scores: list[float] = []
+    fold_details: list[dict[str, object]] = []
+    inference_prediction_folds: list[pd.Series] = []
+    inference_proba_folds: list[pd.DataFrame] = []
+
+    from src.baselines import set_bernn_seed
+
+    print(
+        f"[inference] Train/valid CV with separate inference target "
+        f"(requested_folds={cyclic_cv_folds}, resolved_rounds={len(splits)}, "
+        f"inference_rows={len(X_inference)})",
+        flush=True,
+    )
+
+    for fold, split in enumerate(splits, start=1):
+        set_bernn_seed(CV_RANDOM_STATE + fold)
+        train_idx = split["train_idx"]
+        valid_idx = split["valid_idx"]
+
+        fold_X_train = X.iloc[train_idx].reset_index(drop=True)
+        fold_X_valid = X.iloc[valid_idx].reset_index(drop=True)
+        fold_y_train = model_y_all.iloc[train_idx].reset_index(drop=True)
+        fold_y_valid = model_y_all.iloc[valid_idx].reset_index(drop=True)
+        fold_batches_train = batches.iloc[train_idx].reset_index(drop=True)
+        fold_batches_valid = batches.iloc[valid_idx].reset_index(drop=True)
+
+        fold_X_eval = pd.concat(
+            [fold_X_valid, X_inference.reset_index(drop=True)],
+            ignore_index=True,
+        )
+        fold_batches_eval = pd.concat(
+            [fold_batches_valid, batches_inference.reset_index(drop=True)],
+            ignore_index=True,
+        )
+        corrected_train, corrected_eval = _apply_user_batch_correction(
+            correction_code,
+            fold_X_train,
+            fold_batches_train,
+            fold_X_eval,
+            fold_batches_eval,
+            plot_capture=None,
+        )
+        n_valid = len(fold_X_valid)
+        corrected_valid = corrected_eval.iloc[:n_valid].reset_index(drop=True)
+        corrected_inference = corrected_eval.iloc[n_valid:].reset_index(drop=True)
+
+        model_X_train = corrected_train
+        model_y_train = fold_y_train
+        model_batches_train = fold_batches_train
+        model_X_valid = corrected_valid
+        model_y_valid = fold_y_valid
+        model_batches_valid = fold_batches_valid
+
+        if is_alzheimer and not is_bernn_model:
+            train_supervised = model_y_train.ne(UNSUPERVISED_LABEL).to_numpy()
+            valid_supervised = model_y_valid.ne(UNSUPERVISED_LABEL).to_numpy()
+            model_X_train = model_X_train.loc[train_supervised].reset_index(drop=True)
+            model_y_train = model_y_train.loc[train_supervised].reset_index(drop=True)
+            model_batches_train = model_batches_train.loc[train_supervised].reset_index(drop=True)
+            model_X_valid = model_X_valid.loc[valid_supervised].reset_index(drop=True)
+            model_y_valid = model_y_valid.loc[valid_supervised].reset_index(drop=True)
+            model_batches_valid = model_batches_valid.loc[valid_supervised].reset_index(drop=True)
+
+        inference_preds, extra, inference_proba = _run_user_model(
+            model_code,
+            model_X_train,
+            model_y_train,
+            corrected_inference,
+            dataset,
+            model_batches_train,
+            batches_inference,
+            X_valid=model_X_valid,
+            y_valid=model_y_valid,
+            batches_valid=model_batches_valid,
+            y_test=None,
+            plot_capture=None,
+        )
+
+        valid_preds = extra.pop("_valid_predictions", None) if isinstance(extra, dict) else None
+        if valid_preds is None:
+            raise CodeValidationError(
+                "Inference CV requires fit() to return a trained model with "
+                "predict() so validation folds can be scored."
+            )
+        valid_preds = pd.Series(valid_preds).astype(str).reset_index(drop=True)
+        inference_preds = pd.Series(inference_preds).astype(str).reset_index(drop=True)
+        if len(inference_preds) != len(X_inference):
+            raise CodeValidationError(
+                f"Inference fold {fold} returned {len(inference_preds)} predictions "
+                f"for {len(X_inference)} target rows."
+            )
+
+        score_y_valid = model_y_valid
+        score_valid_preds = valid_preds
+        if is_alzheimer and is_bernn_model:
+            keep_valid = score_y_valid.ne(UNSUPERVISED_LABEL).to_numpy()
+            score_y_valid = score_y_valid.loc[keep_valid].reset_index(drop=True)
+            score_valid_preds = score_valid_preds.loc[keep_valid].reset_index(drop=True)
+        if len(score_y_valid) == 0:
+            raise CodeValidationError(
+                f"Validation batch group {split['valid_batches']} has no supervised rows."
+            )
+
+        valid_mcc = float(matthews_corrcoef(score_y_valid, score_valid_preds))
+        valid_scores.append(valid_mcc)
+        inference_prediction_folds.append(inference_preds)
+
+        classes = extra.get("_model_classes") if isinstance(extra, dict) else None
+        aligned = _aligned_proba_frame(
+            inference_proba,
+            classes,
+            all_labels,
+            len(X_inference),
+        )
+        if aligned is not None:
+            inference_proba_folds.append(aligned)
+
+        fold_details.append({
+            "fold": fold,
+            "valid_mcc": valid_mcc,
+            "n_train": int(len(train_idx)),
+            "n_valid": int(len(valid_idx)),
+            "n_inference": int(len(X_inference)),
+            "train_batches": list(split["train_batches"]),
+            "valid_batches": list(split["valid_batches"]),
+        })
+
+    if (
+        len(inference_proba_folds) == len(inference_prediction_folds)
+        and inference_proba_folds
+    ):
+        summed_proba = sum(inference_proba_folds)
+        row_sums = summed_proba.sum(axis=1).replace(0.0, 1.0)
+        consensus_proba = summed_proba.div(row_sums, axis=0)
+        consensus = consensus_proba.idxmax(axis=1).astype(str).reset_index(drop=True)
+    else:
+        votes = pd.concat(inference_prediction_folds, axis=1)
+        consensus = votes.mode(axis=1).iloc[:, 0].astype(str).reset_index(drop=True)
+
+    pred_df = pd.DataFrame({
+        "name": names_inference.astype(str).to_numpy(),
+        "prediction": consensus.to_numpy(),
+    })
+    return {
+        "pred_df": pred_df,
+        "metrics": {
+            "valid_mcc": float(np.mean(valid_scores)),
+            "valid_mcc_std": float(np.std(valid_scores)),
+            "valid_mcc_folds": [float(v) for v in valid_scores],
+            "valid_fold_details": fold_details,
+            "cv_protocol": "rotating_train_valid_plus_inference_v1",
+            "n_predictions": int(len(pred_df)),
+            "evaluation_protocol": "inference",
+            "cyclic_cv_folds_requested": int(cyclic_cv_folds),
+            "cyclic_cv_folds_resolved": int(len(splits)),
+        },
+    }
+
+
+def run_file_inference(
+    dataset: str,
+    source_file: str,
+    inference_file: str,
+    correction_code: str,
+    model_code: str,
+    cyclic_cv_folds: int = -1,
+) -> tuple[pd.DataFrame, dict]:
+    """Run real inference from one selected source CSV onto another selected CSV."""
+    X, y, batches, _ = _load_research_source_dataset(dataset, source_file)
+    X_inference, batches_inference, names_inference = _load_inference_target(
+        dataset,
+        inference_file,
+        list(X.columns),
+    )
+    result = _cross_validate_inference_submission(
+        correction_code,
+        model_code,
+        dataset,
+        X,
+        y,
+        batches,
+        X_inference,
+        batches_inference,
+        names_inference,
+        cyclic_cv_folds=cyclic_cv_folds,
+    )
+    result["metrics"]["source_file"] = source_file
+    result["metrics"]["inference_file"] = inference_file
+    return result["pred_df"], result["metrics"]
+
+
 def run_validation_research_submission(
     team: str,
     model_name: str,
