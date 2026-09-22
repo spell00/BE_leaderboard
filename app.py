@@ -1764,35 +1764,55 @@ Submit batch correction and model code. Evaluation runs server-side.
                 value=get_dataset_info("massbench_benchmark"),
                 label="Dataset Information"
             )
-            def protocol_summary(protocol: str, dataset: str) -> str:
-                if protocol == "cyclic_batches":
-                    if dataset == "massbench_adenocarcinoma":
-                        return (
-                            "**Selected: Rotating batch CV.** With the default -1 setting, "
-                            "adenocarcinoma has 3 LBO rounds: R1 train=1, valid=2, test=3; "
-                            "R2 train=2, valid=3, test=1; R3 train=3, valid=1, test=2."
-                        )
+            def protocol_summary(
+                protocol: str,
+                dataset: str,
+                source_file: str | None,
+            ) -> str:
+                source = source_file or default_dataset_source(dataset) or "selected file"
+                if protocol == "validation_only":
                     return (
-                        "**Selected: Rotating batch CV.** -1 performs true batch LBO. "
-                        "A positive fold count partitions all evaluable batches into that many "
-                        "groups so every batch is still validation once and test once."
+                        f"**Selected: train/validation only.** Source: {source}. "
+                        "The selected file is split by batch into rotating train/valid "
+                        "folds. No test set and no inference file are supplied."
                     )
-                if dataset == "massbench_adenocarcinoma":
+                if protocol == "cyclic_batches":
                     return (
-                        "**Selected: Never-seen external test.** Adenocarcinoma uses 2 "
-                        "train/validation folds across batches 1 and 2; batch 3 remains entirely "
-                        "outside train/validation and is used only as the external test."
+                        f"**Selected: rotating train/valid/test batch CV.** "
+                        f"Source: {source}. -1 performs leave-one-batch-out; distinct "
+                        "batch groups are used for train, validation, and test. "
+                        "No *_inference.csv file is auto-loaded."
                     )
                 return (
-                    "**Selected: Never-seen external test.** The designated external test "
-                    "batch(es) are never used for training or validation."
+                    "**Selected: official fixed external test.** The existing "
+                    "server-managed training split and hidden/private external test "
+                    "are used. The research source-file selector is ignored."
                 )
 
-            # Keep the recommender and evaluator protocol selectors synchronized.
-            # Programmatic updates do not retrain the recommender; when changing
-            # protocol, click Recommend again to regenerate protocol-matched code.
+            def source_file_state(dataset: str):
+                choices = dataset_source_choices(dataset)
+                return gr.update(
+                    choices=choices,
+                    value=default_dataset_source(dataset),
+                )
+
+            r_dataset_in.change(
+                fn=source_file_state,
+                inputs=[r_dataset_in],
+                outputs=[r_source_file],
+                queue=False,
+            )
+
+            # The recommender selector remains synchronized at the protocol level.
+            # validation_only and cyclic_batches both use a selected single-file
+            # research universe, so validation_only maps to cyclic for the legacy
+            # two-choice recommender control until its own source selector is applied.
             r_eval_protocol.input(
-                fn=lambda protocol: protocol,
+                fn=lambda protocol: (
+                    "cyclic_batches"
+                    if protocol in {"cyclic_batches", "validation_only"}
+                    else "fixed_external"
+                ),
                 inputs=[r_eval_protocol],
                 outputs=[meta_eval_protocol],
                 queue=False,
@@ -1804,43 +1824,38 @@ Submit batch correction and model code. Evaluation runs server-side.
                 queue=False,
             )
 
-            r_eval_protocol.change(
-                fn=protocol_summary,
-                inputs=[r_eval_protocol, r_dataset_in],
-                outputs=[r_protocol_summary],
-                queue=False,
-            )
-            r_dataset_in.change(
-                fn=protocol_summary,
-                inputs=[r_eval_protocol, r_dataset_in],
-                outputs=[r_protocol_summary],
-                queue=False,
-            )
-
-            def cv_control_state(protocol: str, dataset: str, folds):
-                return (
-                    gr.update(visible=(protocol == "cyclic_batches")),
-                    cyclic_cv_status(dataset, protocol, folds),
+            for _component in (r_eval_protocol, r_dataset_in, r_source_file):
+                _component.change(
+                    fn=protocol_summary,
+                    inputs=[r_eval_protocol, r_dataset_in, r_source_file],
+                    outputs=[r_protocol_summary],
+                    queue=False,
                 )
 
-            r_eval_protocol.change(
-                fn=cv_control_state,
-                inputs=[r_eval_protocol, r_dataset_in, r_cyclic_cv_folds],
-                outputs=[r_cyclic_cv_folds, r_cv_status],
-                queue=False,
-            )
-            r_dataset_in.change(
-                fn=cv_control_state,
-                inputs=[r_eval_protocol, r_dataset_in, r_cyclic_cv_folds],
-                outputs=[r_cyclic_cv_folds, r_cv_status],
-                queue=False,
-            )
-            r_cyclic_cv_folds.change(
-                fn=lambda dataset, protocol, folds: cyclic_cv_status(dataset, protocol, folds),
-                inputs=[r_dataset_in, r_eval_protocol, r_cyclic_cv_folds],
-                outputs=[r_cv_status],
-                queue=False,
-            )
+            def cv_control_state(protocol: str, dataset: str, folds, source_file):
+                research = protocol in {"cyclic_batches", "validation_only"}
+                return (
+                    gr.update(visible=research),
+                    cyclic_cv_status(dataset, protocol, folds, source_file),
+                )
+
+            for _component in (
+                r_eval_protocol,
+                r_dataset_in,
+                r_cyclic_cv_folds,
+                r_source_file,
+            ):
+                _component.change(
+                    fn=cv_control_state,
+                    inputs=[
+                        r_eval_protocol,
+                        r_dataset_in,
+                        r_cyclic_cv_folds,
+                        r_source_file,
+                    ],
+                    outputs=[r_cyclic_cv_folds, r_cv_status],
+                    queue=False,
+                )
 
             r_board_out = gr.Dataframe(
                 label=f"Real Leaderboard (top {LEADERBOARD_UI_LIMIT} rows)",
