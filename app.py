@@ -788,15 +788,11 @@ def submit_real(
         if evaluation_protocol == "cyclic_batches":
             valid_mcc = float(metrics.get("valid_mcc", -1.0))
             test_mcc = float(metrics.get("test_mcc", metrics.get("mcc", -1.0)))
-            global_oof_test_mcc = float(
-                metrics.get("test_mcc_global_oof", metrics.get("mcc", test_mcc))
-            )
             fold_valid = metrics.get("valid_mcc_folds", [])
             fold_test = metrics.get("test_mcc_folds", [])
             msg = (
                 f"Research cyclic batch result on {DATASET_LABELS.get(dataset, dataset)}. "
                 f"Mean Valid MCC={valid_mcc:.4f}, Mean Test MCC={test_mcc:.4f}, "
-                f"global OOF Test MCC={global_oof_test_mcc:.4f}, "
                 f"N={metrics.get('n_samples', 0)}. "
                 "This run is not written to the official leaderboard."
             )
