@@ -2488,7 +2488,10 @@ sample_004,batch_2,control,9.8,0.73
 if __name__ == "__main__":
     launch_kwargs = {
         "server_name": "0.0.0.0",
-        "allowed_paths": [str(ROOT / "data" / "datasets")],
+        "allowed_paths": [
+            str(ROOT / "data" / "datasets"),
+            str(ROOT / "logs" / "inference"),
+        ],
         "show_error": True,
         "ssr_mode": False,
     }
