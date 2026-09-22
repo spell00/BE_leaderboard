@@ -838,6 +838,7 @@ def submit_real(
     custom_pip: str = "",
     evaluation_protocol: str = "fixed_external",
     cyclic_cv_folds=-1,
+    dataset_file: str | None = None,
     profile: gr.OAuthProfile | None = None,
     request: gr.Request | None = None,
 ) -> tuple[pd.DataFrame, str, str]:
@@ -849,15 +850,20 @@ def submit_real(
     model_code = str(model_code or "")
     custom_pip = str(custom_pip or "")
     evaluation_protocol = str(evaluation_protocol or "fixed_external")
+    dataset_file = str(dataset_file or default_dataset_source(dataset) or "")
     try:
-        cyclic_cv_folds = _normalize_cyclic_cv_folds(cyclic_cv_folds)
+        cyclic_cv_folds = _normalize_cyclic_cv_folds(
+            cyclic_cv_folds,
+            min_groups=2 if evaluation_protocol == "validation_only" else 3,
+        )
     except ValueError as exc:
         return get_real_board(dataset, evaluation_protocol, -1), str(exc), ""
 
     print(
         f"[submission] Received submission from {team.strip() or 'anonymous'} / "
         f"{model_name.strip() or 'unnamed'} on {dataset}; "
-        f"evaluation_protocol={evaluation_protocol}; cyclic_cv_folds={cyclic_cv_folds}",
+        f"evaluation_protocol={evaluation_protocol}; cyclic_cv_folds={cyclic_cv_folds}; "
+        f"dataset_file={dataset_file!r}",
         flush=True,
     )
     if not dataset.strip():
@@ -869,9 +875,9 @@ def submit_real(
 
     cyclic_n_batches = None
     cyclic_leaderboard_eligible = False
-    if evaluation_protocol == "cyclic_batches":
+    if evaluation_protocol in {"cyclic_batches", "validation_only"}:
         try:
-            cyclic_n_batches = cyclic_evaluable_batch_count(dataset)
+            cyclic_n_batches = cyclic_evaluable_batch_count(dataset, dataset_file)
         except Exception as exc:
             return (
                 get_real_board(dataset, evaluation_protocol, cyclic_cv_folds),
@@ -886,7 +892,10 @@ def submit_real(
             if cyclic_n_batches < 5:
                 message += " The 5-fold leaderboard is unavailable for this dataset."
             return get_real_board(dataset, evaluation_protocol, cyclic_cv_folds), message, ""
-        cyclic_leaderboard_eligible = cyclic_cv_folds in {-1, 5}
+        cyclic_leaderboard_eligible = (
+            evaluation_protocol == "cyclic_batches"
+            and cyclic_cv_folds in {-1, 5}
+        )
 
     logs_buffer = _RunLogCapture(_new_run_log_path(team, model_name, dataset))
     print(f"[submission] Logs will be captured to {logs_buffer.path}", flush=True)
@@ -932,7 +941,7 @@ def submit_real(
 
     print(f"[submission] boarded dataset: {dataset}", flush=True)
 
-    if evaluation_protocol == "cyclic_batches" and not RESEARCH_CYCLIC_ENABLED:
+    if evaluation_protocol in {"cyclic_batches", "validation_only"} and not RESEARCH_CYCLIC_ENABLED:
         return _finish(
             get_real_board(dataset, evaluation_protocol, cyclic_cv_folds),
             "Cyclic batch rotation is disabled on this deployment. "
