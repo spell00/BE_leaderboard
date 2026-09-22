@@ -167,6 +167,48 @@ def default_dataset_source(dataset: str) -> str | None:
     return names[0] if names else None
 
 
+UPLOADED_RESEARCH_SOURCE = "__uploaded_research_source__"
+
+
+def _uploaded_file_path(uploaded_file) -> Path | None:
+    if not uploaded_file:
+        return None
+    return Path(getattr(uploaded_file, "name", uploaded_file))
+
+
+def meta_source_choices(dataset: str, uploaded_file=None):
+    """Built-in dataset files plus the currently uploaded research CSV."""
+    choices = list(dataset_source_choices(dataset))
+    path = _uploaded_file_path(uploaded_file)
+    if path is not None:
+        choices.append((f"Uploaded CSV — {path.name}", UPLOADED_RESEARCH_SOURCE))
+    return choices
+
+
+def update_meta_source_for_dataset(dataset: str, uploaded_file=None):
+    """Refresh source choices without hiding an existing uploaded CSV."""
+    choices = meta_source_choices(dataset, uploaded_file)
+    path = _uploaded_file_path(uploaded_file)
+    value = (
+        UPLOADED_RESEARCH_SOURCE
+        if path is not None
+        else default_dataset_source(dataset)
+    )
+    return gr.update(choices=choices, value=value)
+
+
+def update_meta_source_for_upload(uploaded_file, dataset: str):
+    """Select an uploaded CSV as soon as Gradio finishes receiving it."""
+    choices = meta_source_choices(dataset, uploaded_file)
+    path = _uploaded_file_path(uploaded_file)
+    value = (
+        UPLOADED_RESEARCH_SOURCE
+        if path is not None
+        else default_dataset_source(dataset)
+    )
+    return gr.update(choices=choices, value=value)
+
+
 def inference_file_choices(dataset: str):
     return [(name, name) for name in inference_filenames(ROOT, dataset)]
 
@@ -1405,9 +1447,15 @@ def _load_recommender_input(
 ) -> tuple[pd.DataFrame, str]:
     """Load the exact selected-file universe for BERNN meta-features."""
     protocol = _normalize_recommender_protocol(evaluation_protocol)
-    if uploaded_file:
-        path = getattr(uploaded_file, "name", uploaded_file)
-        return pd.read_csv(path), f"uploaded file: {Path(path).name}"
+    using_uploaded = dataset_file == UPLOADED_RESEARCH_SOURCE
+    if using_uploaded:
+        path = _uploaded_file_path(uploaded_file)
+        if path is None:
+            raise ValueError(
+                "Uploaded CSV is selected, but no uploaded file is available. "
+                "Upload the CSV again or choose a built-in dataset file."
+            )
+        return pd.read_csv(path), f"uploaded file: {path.name}"
 
     if protocol == "cyclic_batches":
         filename = str(dataset_file or default_dataset_source(dataset) or "")
@@ -1450,9 +1498,11 @@ def run_meta_recommendation(
     """Run zero-shot BERNN recommendation on the selected evaluation universe."""
     requested_protocol = str(evaluation_protocol or "fixed_external")
     selected_protocol = _normalize_recommender_protocol(requested_protocol)
+    using_uploaded = dataset_file == UPLOADED_RESEARCH_SOURCE
     print(
         f"[meta-recommender] click received dataset={dataset!r} "
-        f"uploaded={bool(uploaded_file)} protocol={requested_protocol!r} "
+        f"uploaded={bool(uploaded_file)} selected_upload={using_uploaded} "
+        f"protocol={requested_protocol!r} "
         f"recommender_universe={selected_protocol!r}",
         flush=True,
     )
@@ -1487,7 +1537,7 @@ def run_meta_recommendation(
         protocol_matches_checkpoint = selected_protocol == checkpoint_protocol
         parity_verified = False
 
-        if not uploaded_file and protocol_matches_checkpoint:
+        if not using_uploaded and protocol_matches_checkpoint:
             reference_meta = metadata.get("raw_meta_features", {}).get(dataset)
             if reference_meta is not None:
                 current_meta = np.asarray(
@@ -1530,7 +1580,7 @@ def run_meta_recommendation(
         ]
         if parity_verified:
             details.append("Training-data meta-feature parity: verified")
-        elif not uploaded_file and not protocol_matches_checkpoint:
+        elif not using_uploaded and not protocol_matches_checkpoint:
             details.append(
                 "Checkpoint/input protocol differs: stored checkpoint meta-features "
                 "are not expected to match and parity was not enforced. The new "
@@ -1597,12 +1647,12 @@ def run_meta_recommendation(
             gr.update(interactive=True),
             gr.update(value=model_choice),
             generated_code,
-            gr.update(value=dataset) if not uploaded_file else gr.update(),
+            gr.update(value=dataset) if not using_uploaded else gr.update(),
             gr.update(value=requested_protocol),
             gr.update(
                 value=(
                     dataset_file or default_dataset_source(dataset)
-                    if not uploaded_file
+                    if not using_uploaded
                     else None
                 )
             ),
@@ -1720,16 +1770,19 @@ Run a reproducible server-side benchmark or propose a matrix-ready dataset.
             value=default_dataset_source("massbench_benchmark"),
             label="Dataset file for research recommendation",
             info=(
-                "Used for rotating train/valid/test and validation-only research. "
-                "Fixed-external recommendation continues to use the development split."
+                "Choose a built-in dataset file or upload your own CSV. "
+                "A completed upload is added here automatically and selected."
             ),
         )
         meta_dataset.change(
-            fn=lambda dataset: gr.update(
-                choices=dataset_source_choices(dataset),
-                value=default_dataset_source(dataset),
-            ),
-            inputs=[meta_dataset],
+            fn=update_meta_source_for_dataset,
+            inputs=[meta_dataset, meta_upload],
+            outputs=[meta_source_file],
+            queue=False,
+        )
+        meta_upload.change(
+            fn=update_meta_source_for_upload,
+            inputs=[meta_upload, meta_dataset],
             outputs=[meta_source_file],
             queue=False,
         )
