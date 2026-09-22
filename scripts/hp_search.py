@@ -343,9 +343,6 @@ def run_cyclic_batch_trial(cfg: dict, args, data, exp_id: str):
     y = np.asarray(y).astype(str)
     batches = np.asarray(batches).astype(str)
 
-    if bool(cfg.get("log1p", False)):
-        X = _apply_log1p_preprocessing(X)
-
     is_alzheimer = getattr(args, "dataset", "") == ALZHEIMER_DATASET
     supervised_mask = (
         np.isin(y, list(ALZHEIMER_SUPERVISED_LABELS))
@@ -685,18 +682,6 @@ def bernn_params_from_cfg(cfg: dict) -> dict:
     }
 
 
-def _apply_log1p_preprocessing(frame):
-    """Apply the requested log1p preprocessing directly to feature matrices."""
-    if frame is None:
-        return None
-    values = np.asarray(frame, dtype=float)
-    values = np.clip(values, 0.0, None)
-    transformed = np.log1p(values)
-    if isinstance(frame, pd.DataFrame):
-        return pd.DataFrame(transformed, index=frame.index, columns=frame.columns)
-    return transformed
-
-
 def _close_fit_resources(trainer) -> None:
     """Release resources owned by one BERNN fold, including failed fits."""
     close = getattr(trainer, "close_resources", None)
@@ -964,15 +949,10 @@ def run_trial(cfg: dict, args, data, exp_id: str, fixed_test_data=None):
     resolved_n_repeats = int(getattr(args, "resolved_n_repeats", resolve_n_repeats(args.n_repeats, batches)))
     is_alzheimer = getattr(args, "dataset", "") == ALZHEIMER_DATASET
     X_fixed = y_fixed = batches_fixed = None
-    if bool(cfg.get("log1p", False)):
-        X = _apply_log1p_preprocessing(X)
-
     if fixed_test_data is not None:
         X_fixed, y_fixed, batches_fixed = fixed_test_data
         if not (len(X_fixed) == len(y_fixed) == len(batches_fixed)):
             raise ValueError("Fixed-test features, labels, and batches must have equal length")
-        if bool(cfg.get("log1p", False)):
-            X_fixed = _apply_log1p_preprocessing(X_fixed)
     if is_alzheimer:
         supervised_indices = np.flatnonzero(np.isin(y.astype(str), list(ALZHEIMER_SUPERVISED_LABELS)))
         pool_indices = np.flatnonzero(~np.isin(y.astype(str), list(ALZHEIMER_SUPERVISED_LABELS)))
