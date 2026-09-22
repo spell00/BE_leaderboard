@@ -70,6 +70,8 @@ class Score(Base):
     test_mcc = Column(Float, nullable=True, default=0.0)  # Matthews Correlation Coefficient (primary metric)
     valid_mcc = Column(Float, nullable=True, default=0.0)
     valid_mcc_folds_json = Column(Text, nullable=True, default="[]")
+    evaluation_protocol = Column(String(32), default="fixed_external", nullable=False, index=True)
+    cv_folds = Column(Integer, default=0, nullable=False, index=True)
     train_mcc = Column(Float, nullable=True, default=0.0)
     accuracy = Column(Float, nullable=False)
     macro_f1 = Column(Float, nullable=False)
@@ -134,6 +136,8 @@ class DatabaseManager:
                 "test_mcc": "ALTER TABLE scores ADD COLUMN test_mcc FLOAT DEFAULT 0.0",
                 "valid_mcc": "ALTER TABLE scores ADD COLUMN valid_mcc FLOAT DEFAULT 0.0",
                 "valid_mcc_folds_json": "ALTER TABLE scores ADD COLUMN valid_mcc_folds_json TEXT DEFAULT '[]'",
+                "evaluation_protocol": "ALTER TABLE scores ADD COLUMN evaluation_protocol VARCHAR(32) NOT NULL DEFAULT 'fixed_external'",
+                "cv_folds": "ALTER TABLE scores ADD COLUMN cv_folds INTEGER NOT NULL DEFAULT 0",
                 "train_mcc": "ALTER TABLE scores ADD COLUMN train_mcc FLOAT DEFAULT 0.0",
                 "needs_recalc": "ALTER TABLE scores ADD COLUMN needs_recalc BOOLEAN NOT NULL DEFAULT 0",
                 "plots_json": "ALTER TABLE scores ADD COLUMN plots_json TEXT DEFAULT ''",
@@ -202,6 +206,8 @@ class DatabaseManager:
         test_mcc: float = 0.0,
         valid_mcc: float = 0.0,
         valid_mcc_folds: list[float] | None = None,
+        evaluation_protocol: str = "fixed_external",
+        cv_folds: int = 0,
         train_mcc: float = 0.0,
         log_loss: float | None = None,
         brier_score: float | None = None,
@@ -223,6 +229,8 @@ class DatabaseManager:
             valid_mcc_folds_json=json.dumps(
                 [float(value) for value in (valid_mcc_folds or [])]
             ),
+            evaluation_protocol=str(evaluation_protocol or "fixed_external"),
+            cv_folds=int(cv_folds),
             train_mcc=float(train_mcc),
             accuracy=float(accuracy),
             macro_f1=float(macro_f1),
@@ -328,14 +336,23 @@ class DatabaseManager:
         session.close()
         return submission
 
-    def get_leaderboard(self, dataset: str | None = None) -> list[dict]:
-        """Get leaderboard sorted by the lower of validation MCC and test MCC."""
+    def get_leaderboard(
+        self,
+        dataset: str | None = None,
+        evaluation_protocol: str | None = None,
+        cv_folds: int | None = None,
+    ) -> list[dict]:
+        """Get one comparable leaderboard slice."""
         session = self.get_session()
         query = session.query(Submission, Score).join(
             Score, Submission.id == Score.submission_id
         )
         if dataset:
             query = query.filter(Submission.dataset == dataset)
+        if evaluation_protocol is not None:
+            query = query.filter(Score.evaluation_protocol == str(evaluation_protocol))
+        if cv_folds is not None:
+            query = query.filter(Score.cv_folds == int(cv_folds))
 
         results = query.all()
 
@@ -355,6 +372,8 @@ class DatabaseManager:
                         f"{float(value):.4f}"
                         for value in json.loads(score.valid_mcc_folds_json or "[]")
                     ),
+                    "evaluation_protocol": score.evaluation_protocol,
+                    "cv_folds": score.cv_folds,
                     "train_mcc": score.train_mcc,
                     "accuracy": score.accuracy,
                     "macro_f1": score.macro_f1,
