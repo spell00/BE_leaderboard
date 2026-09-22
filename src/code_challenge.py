@@ -1826,72 +1826,75 @@ def _cross_validate_submission(
     }
 
 
-def _load_cyclic_research_dataset(
+def _default_research_source_filename(dataset: str) -> str:
+    """Prefer the merged whole-dataset CSV, falling back to the train CSV."""
+    try:
+        return ensure_all_dataset_file(ROOT, dataset).name
+    except Exception:
+        return f"{dataset}_train.csv"
+
+
+def _load_research_source_dataset(
     dataset: str,
+    dataset_file: str | None = None,
 ) -> tuple[pd.DataFrame, pd.Series, pd.Series, pd.Series]:
-    """Combine public development rows and hidden labeled batches for local research CV.
+    """Load exactly one selected CSV as the supervised research universe.
 
-    This must never be used for the public leaderboard because labels from the
-    normally hidden external split become train/validation labels in some rounds.
+    No *_inference.csv or private-label file is appended here. Rows without a
+    label are ignored for supervised CV. This makes *_all.csv safe when it is a
+    literal train+public-test concatenation and the public test rows are unlabeled.
     """
-    train_path = ROOT / "data" / "datasets" / dataset / f"{dataset}_train.csv"
-    if not train_path.exists():
-        raise FileNotFoundError(f"Public train split not found: {train_path}")
+    filename = str(dataset_file or _default_research_source_filename(dataset))
+    path = resolve_dataset_matrix_file(ROOT, dataset, filename)
+    raw = pd.read_csv(path)
 
-    public = prepare_builtin_training_frame(dataset, pd.read_csv(train_path))
-    private = load_private_inference(dataset).copy()
-    labels = load_private_labels(dataset).copy()
-    if not {"name", "prediction"}.issubset(labels.columns):
+    required = {"name", "batch", "label"}
+    missing_required = sorted(required - set(raw.columns))
+    if missing_required:
         raise ValueError(
-            f"Private labels for dataset '{dataset}' must contain name and prediction"
+            f"Selected source file '{filename}' is missing required columns: "
+            + ", ".join(missing_required)
         )
 
-    private["name"] = private["name"].astype(str)
-    labels["name"] = labels["name"].astype(str)
-    labels["prediction"] = labels["prediction"].astype(str)
-    private = private.drop(columns=["label"], errors="ignore").merge(
-        labels[["name", "prediction"]].rename(columns={"prediction": "label"}),
-        on="name",
-        how="inner",
-        validate="one_to_one",
-        sort=False,
-    )
-    private = prepare_builtin_training_frame(dataset, private)
+    frame = prepare_research_source_frame(dataset, raw)
+    feature_cols = task_feature_columns(frame)
+    if not feature_cols:
+        raise ValueError(f"Selected source file '{filename}' has no feature columns")
 
-    feature_cols = task_feature_columns(public)
-    missing = [column for column in feature_cols if column not in private.columns]
-    if missing:
-        raise ValueError(
-            f"Private cyclic split for {dataset} is missing {len(missing)} feature columns"
-        )
-
-    combined = pd.concat(
-        [
-            public[["name", "batch", "label", *feature_cols]],
-            private[["name", "batch", "label", *feature_cols]],
-        ],
-        ignore_index=True,
-    )
-    names = combined["name"].astype(str).reset_index(drop=True)
+    names = frame["name"].astype(str).reset_index(drop=True)
     if names.duplicated().any():
         duplicates = names[names.duplicated()].head(5).tolist()
-        raise ValueError(f"Duplicate sample names in cyclic dataset: {duplicates}")
+        raise ValueError(
+            f"Selected source file '{filename}' has duplicate sample names: {duplicates}"
+        )
 
-    X = _clean_features(combined, feature_cols)
-    y = combined["label"].astype(str).reset_index(drop=True)
-    batches = combined["batch"].astype(str).reset_index(drop=True)
-    eligible = (
-        y.astype(str).isin(ALZHEIMER_SUPERVISED_LABELS).to_numpy()
-        if dataset == ALZHEIMER_DATASET
-        else None
+    X = _clean_features(frame, feature_cols)
+    y = frame["label"].astype(str).reset_index(drop=True)
+    batches = frame["batch"].astype(str).reset_index(drop=True)
+
+    print(
+        f"[research-data] dataset={dataset} file={filename} "
+        f"labeled_rows={len(frame)} batches={batches.nunique()} "
+        f"features={len(feature_cols)}",
+        flush=True,
     )
-    cyclic_train_valid_test_splits(batches, eligible_mask=eligible, n_splits=-1)
     return X, y, batches, names
 
 
-def cyclic_evaluable_batch_count(dataset: str) -> int:
-    """Return the number of batches eligible for cyclic supervised scoring."""
-    _, y, batches, _ = _load_cyclic_research_dataset(dataset)
+def _load_cyclic_research_dataset(
+    dataset: str,
+    dataset_file: str | None = None,
+) -> tuple[pd.DataFrame, pd.Series, pd.Series, pd.Series]:
+    """Backward-compatible alias for selected-file research loading."""
+    return _load_research_source_dataset(dataset, dataset_file)
+
+
+def cyclic_evaluable_batch_count(
+    dataset: str,
+    dataset_file: str | None = None,
+) -> int:
+    """Return the number of supervised batches in the selected source CSV."""
+    _, y, batches, _ = _load_research_source_dataset(dataset, dataset_file)
     if dataset == ALZHEIMER_DATASET:
         mask = y.astype(str).isin(ALZHEIMER_SUPERVISED_LABELS).to_numpy()
         return int(batches.loc[mask].astype(str).nunique())
