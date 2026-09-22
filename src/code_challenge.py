@@ -27,7 +27,7 @@ from sklearn.svm import LinearSVC, SVC
 
 from src.hf_utils import load_private_inference, load_private_labels
 from src.leaderboard import evaluate_predictions, sorted_board
-from src.dataset_files import resolve_dataset_matrix_file
+from src.dataset_files import ensure_all_dataset_file, resolve_dataset_matrix_file
 from src.dataset_tasks import (
     ALZHEIMER_DATASET,
     ALZHEIMER_SUPERVISED_LABELS,
