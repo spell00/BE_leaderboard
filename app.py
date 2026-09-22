@@ -57,9 +57,18 @@ from src.baselines import (
     family_for_config,
     maybe_register_tuned,
 )
-from src.code_challenge import CodeValidationError, cyclic_evaluable_batch_count
+from src.code_challenge import (
+    CodeValidationError,
+    cyclic_evaluable_batch_count,
+    run_file_inference,
+)
 from src.database import DatabaseManager, PROJECT_VERSION, real_leaderboard_score
 from src.dataset_info import get_dataset_info_markdown
+from src.dataset_files import (
+    ensure_all_dataset_files,
+    inference_filenames,
+    research_source_filenames,
+)
 from src.dataset_submission import DatasetSubmissionError, stage_dataset_proposal
 from src.dataset_tasks import (
     clean_task_features,
@@ -127,6 +136,34 @@ DATASET_LABELS = {
     "massbench_alzheimer": "MassBench Alzheimer",
     "massbench_benchmark": "MassBench Benchmark",
 }
+
+ALL_DATASET_BUILD_STATUS = ensure_all_dataset_files(ROOT, set(DATASET_LABELS))
+for _dataset_key, _status in ALL_DATASET_BUILD_STATUS.items():
+    print(f"[dataset-all] {_dataset_key}: {_status}", flush=True)
+
+
+def dataset_source_choices(dataset: str):
+    """Return (_all first, _train second) choices for supervised research."""
+    names = research_source_filenames(ROOT, dataset)
+    choices = []
+    for name in names:
+        label = (
+            f"Whole dataset — {name}"
+            if name.endswith("_all.csv")
+            else f"Training split — {name}"
+        )
+        choices.append((label, name))
+    return choices
+
+
+def default_dataset_source(dataset: str) -> str | None:
+    names = research_source_filenames(ROOT, dataset)
+    return names[0] if names else None
+
+
+def inference_file_choices(dataset: str):
+    return [(name, name) for name in inference_filenames(ROOT, dataset)]
+
 
 HF_TOKEN_SET = bool(os.getenv("HF_TOKEN"))
 RESEARCH_CYCLIC_ENABLED = (
