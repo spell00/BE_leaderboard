@@ -892,7 +892,7 @@ def submit_real(
     if not team:
         return get_real_board(dataset), "Please sign in with Hugging Face before submitting.", ""
     if not model_name.strip():
-        return get_real_board(dataset, evaluation_protocol, cyclic_cv_folds), "Submission name is required.", ""
+        return get_real_board(dataset, evaluation_protocol, cyclic_cv_folds, dataset_file), "Submission name is required.", ""
 
     cyclic_n_batches = None
     cyclic_leaderboard_eligible = False
@@ -901,7 +901,7 @@ def submit_real(
             cyclic_n_batches = cyclic_evaluable_batch_count(dataset, dataset_file)
         except Exception as exc:
             return (
-                get_real_board(dataset, evaluation_protocol, cyclic_cv_folds),
+                get_real_board(dataset, evaluation_protocol, cyclic_cv_folds, dataset_file),
                 f"Could not determine evaluable batches for rotating CV: {exc}",
                 "",
             )
@@ -912,7 +912,7 @@ def submit_real(
             )
             if cyclic_n_batches < 5:
                 message += " The 5-fold leaderboard is unavailable for this dataset."
-            return get_real_board(dataset, evaluation_protocol, cyclic_cv_folds), message, ""
+            return get_real_board(dataset, evaluation_protocol, cyclic_cv_folds, dataset_file), message, ""
         cyclic_leaderboard_eligible = (
             evaluation_protocol == "cyclic_batches"
             and cyclic_cv_folds in {-1, 5}
@@ -964,7 +964,7 @@ def submit_real(
 
     if evaluation_protocol in {"cyclic_batches", "validation_only"} and not RESEARCH_CYCLIC_ENABLED:
         return _finish(
-            get_real_board(dataset, evaluation_protocol, cyclic_cv_folds),
+            get_real_board(dataset, evaluation_protocol, cyclic_cv_folds, dataset_file),
             "Cyclic batch rotation is disabled on this deployment. "
             "Enable it for local research with ENABLE_RESEARCH_CYCLIC=1.",
         )
@@ -993,12 +993,12 @@ def submit_real(
             )
         except CodeValidationError as exc:
             return _finish(
-                get_real_board(dataset, evaluation_protocol, cyclic_cv_folds),
+                get_real_board(dataset, evaluation_protocol, cyclic_cv_folds, dataset_file),
                 f"Submission rejected: {exc}",
             )
         except SubmissionCancelled as exc:
             return _finish(
-                get_real_board(dataset, evaluation_protocol, cyclic_cv_folds),
+                get_real_board(dataset, evaluation_protocol, cyclic_cv_folds, dataset_file),
                 str(exc),
             )
 
@@ -1102,7 +1102,7 @@ def submit_real(
                     "does not count for a leaderboard. Only -1 (LBO) and 5 are leaderboard modes."
                 )
             return _finish(
-                get_real_board(dataset, evaluation_protocol, cyclic_cv_folds),
+                get_real_board(dataset, evaluation_protocol, cyclic_cv_folds, dataset_file),
                 msg,
             )
 
@@ -1159,7 +1159,7 @@ def submit_real(
     except Exception as exc:
         print(f"[submission] ERROR during submission for {team.strip()} / {model_name.strip()} on {dataset}: {type(exc).__name__}: {exc}", flush=True)
         return _finish(
-            get_real_board(dataset, evaluation_protocol, cyclic_cv_folds),
+            get_real_board(dataset, evaluation_protocol, cyclic_cv_folds, dataset_file),
             _format_exec_error(exc),
         )
         # return _finish(get_real_board(dataset), _format_exec_error(exc), _captured_logs(logs_buffer))
@@ -1235,6 +1235,7 @@ def on_board_click(
     dataset: str,
     evaluation_protocol: str = "fixed_external",
     cyclic_cv_folds=-1,
+    source_file: str | None = None,
     profile: gr.OAuthProfile | None = None,
     request: gr.Request | None = None,
 ) -> tuple:
@@ -1262,7 +1263,16 @@ def on_board_click(
         if board_slice is None:
             return gr.update(), gr.update()
         protocol, folds = board_slice
-        board = db.get_leaderboard(dataset, protocol, folds)
+        board = db.get_leaderboard(
+            dataset,
+            protocol,
+            folds,
+            source_file=(
+                str(source_file or default_dataset_source(dataset) or "")
+                if protocol == "cyclic_batches"
+                else ""
+            ),
+        )
 
         if not board:
             return gr.update(), gr.update()
