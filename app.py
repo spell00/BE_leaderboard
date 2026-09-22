@@ -1277,11 +1277,14 @@ def _load_recommender_input(
         return pd.read_csv(path), f"uploaded file: {Path(path).name}"
 
     if protocol == "cyclic_batches":
-        from scripts.hp_search import load_cyclic_dataset
+        # Use the exact same research universe as the cyclic evaluator:
+        # MassBench appends hidden labeled external batches, while the hosted
+        # reconstructed GEO datasets use their public labeled development rows.
+        from src.code_challenge import _load_cyclic_research_dataset
 
-        X, y, batches = load_cyclic_dataset(dataset)
+        X, y, batches, names = _load_cyclic_research_dataset(dataset)
         normalized = pd.DataFrame({
-            "name": [f"{dataset}_{index}" for index in range(len(X))],
+            "name": pd.Series(names).astype(str),
             "batch": pd.Series(batches).astype(str),
             "label": pd.Series(y).astype(str),
         })
