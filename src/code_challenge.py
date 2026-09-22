@@ -109,11 +109,6 @@ def fit(
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# The reconstructed GEO cohorts are evaluated cyclically on their labeled
-# development universe in the hosted app. Their generated fixed-test
-# inference/label files are not stored in the private MassBench label repo.
-PUBLIC_ONLY_CYCLIC_DATASETS = {"normal_tissue_878", "colon_3041"}
-
 FORBIDDEN_CALLS = {
     "open",
     "eval",
@@ -1780,63 +1775,49 @@ def _cross_validate_submission(
 def _load_cyclic_research_dataset(
     dataset: str,
 ) -> tuple[pd.DataFrame, pd.Series, pd.Series, pd.Series]:
-    """Load the labeled universe used by research-only rotating batch CV.
+    """Combine public development rows and hidden labeled batches for local research CV.
 
-    MassBench datasets combine public development rows with their hidden
-    labeled external batches. The reconstructed GEO datasets are hosted
-    without corresponding private inference/label files, so their cyclic
-    universe is the labeled public development split only.
+    This must never be used for the public leaderboard because labels from the
+    normally hidden external split become train/validation labels in some rounds.
     """
     train_path = ROOT / "data" / "datasets" / dataset / f"{dataset}_train.csv"
     if not train_path.exists():
         raise FileNotFoundError(f"Public train split not found: {train_path}")
 
     public = prepare_builtin_training_frame(dataset, pd.read_csv(train_path))
+    private = load_private_inference(dataset).copy()
+    labels = load_private_labels(dataset).copy()
+    if not {"name", "prediction"}.issubset(labels.columns):
+        raise ValueError(
+            f"Private labels for dataset '{dataset}' must contain name and prediction"
+        )
+
+    private["name"] = private["name"].astype(str)
+    labels["name"] = labels["name"].astype(str)
+    labels["prediction"] = labels["prediction"].astype(str)
+    private = private.drop(columns=["label"], errors="ignore").merge(
+        labels[["name", "prediction"]].rename(columns={"prediction": "label"}),
+        on="name",
+        how="inner",
+        validate="one_to_one",
+        sort=False,
+    )
+    private = prepare_builtin_training_frame(dataset, private)
+
     feature_cols = task_feature_columns(public)
-
-    if dataset in PUBLIC_ONLY_CYCLIC_DATASETS:
-        combined = public[["name", "batch", "label", *feature_cols]].copy()
-        print(
-            f"[submission-cyclic] {dataset}: using public labeled development "
-            f"universe only ({len(combined)} samples); no private GEO inference "
-            "split is required.",
-            flush=True,
-        )
-    else:
-        private = load_private_inference(dataset).copy()
-        labels = load_private_labels(dataset).copy()
-        if not {"name", "prediction"}.issubset(labels.columns):
-            raise ValueError(
-                f"Private labels for dataset '{dataset}' must contain name and prediction"
-            )
-
-        private["name"] = private["name"].astype(str)
-        labels["name"] = labels["name"].astype(str)
-        labels["prediction"] = labels["prediction"].astype(str)
-        private = private.drop(columns=["label"], errors="ignore").merge(
-            labels[["name", "prediction"]].rename(columns={"prediction": "label"}),
-            on="name",
-            how="inner",
-            validate="one_to_one",
-            sort=False,
-        )
-        private = prepare_builtin_training_frame(dataset, private)
-
-        missing = [column for column in feature_cols if column not in private.columns]
-        if missing:
-            raise ValueError(
-                f"Private cyclic split for {dataset} is missing "
-                f"{len(missing)} feature columns"
-            )
-
-        combined = pd.concat(
-            [
-                public[["name", "batch", "label", *feature_cols]],
-                private[["name", "batch", "label", *feature_cols]],
-            ],
-            ignore_index=True,
+    missing = [column for column in feature_cols if column not in private.columns]
+    if missing:
+        raise ValueError(
+            f"Private cyclic split for {dataset} is missing {len(missing)} feature columns"
         )
 
+    combined = pd.concat(
+        [
+            public[["name", "batch", "label", *feature_cols]],
+            private[["name", "batch", "label", *feature_cols]],
+        ],
+        ignore_index=True,
+    )
     names = combined["name"].astype(str).reset_index(drop=True)
     if names.duplicated().any():
         duplicates = names[names.duplicated()].head(5).tolist()
@@ -1852,6 +1833,7 @@ def _load_cyclic_research_dataset(
     )
     cyclic_train_valid_test_splits(batches, eligible_mask=eligible, n_splits=-1)
     return X, y, batches, names
+
 
 def cyclic_evaluable_batch_count(dataset: str) -> int:
     """Return the number of batches eligible for cyclic supervised scoring."""
