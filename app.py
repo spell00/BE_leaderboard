@@ -167,6 +167,11 @@ def inference_file_choices(dataset: str):
     return [(name, name) for name in inference_filenames(ROOT, dataset)]
 
 
+def default_inference_file(dataset: str) -> str | None:
+    names = inference_filenames(ROOT, dataset)
+    return names[0] if names else None
+
+
 HF_TOKEN_SET = bool(os.getenv("HF_TOKEN"))
 RESEARCH_CYCLIC_ENABLED = (
     os.getenv(
