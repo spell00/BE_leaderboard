@@ -1021,6 +1021,10 @@ def _run_user_model(
 ) -> tuple[pd.Series, dict, object | None]:
     if "AEHeadPredictor" in model_code:
         model_kind = "BERNN AE + head sweep"
+    elif "TrainAEThenClassifierHoldout" in model_code and "TrainAEClassifierHoldout" in model_code:
+        # Generated BERNN code imports/references both trainer classes and chooses
+        # one at runtime from CONFIG["model_type"]. Do not guess from source text.
+        model_kind = "BERNN configurable AE classifier"
     elif "TrainAEThenClassifierHoldout" in model_code:
         model_kind = "BERNN two-stage AE classifier"
     elif "TrainAEClassifierHoldout" in model_code:
@@ -1314,6 +1318,13 @@ def _run_user_model(
             extra_metrics = {}
 
         preds_raw = pd.Series(preds).reset_index(drop=True)
+        if model is not None and model_kind == "BERNN configurable AE classifier":
+            mro_names = [cls.__name__ for cls in type(model).__mro__]
+            if any("TrainAEThenClassifierHoldout" in name for name in mro_names):
+                model_kind = "BERNN two-stage AE classifier"
+            elif any("TrainAEClassifierHoldout" in name for name in mro_names):
+                model_kind = "BERNN joint AE classifier"
+            print(f"[model-runner] Actual BERNN trainer: {model_kind}", flush=True)
         extra_metrics["model_kind"] = model_kind
         if model is not None and hasattr(model, "classes_"):
             try:
