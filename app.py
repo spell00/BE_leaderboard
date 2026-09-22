@@ -68,11 +68,13 @@ from src.dataset_files import (
     ensure_all_dataset_files,
     inference_filenames,
     research_source_filenames,
+    resolve_dataset_matrix_file,
 )
 from src.dataset_submission import DatasetSubmissionError, stage_dataset_proposal
 from src.dataset_tasks import (
     clean_task_features,
     prepare_builtin_training_frame,
+    prepare_research_source_frame,
     task_feature_columns,
 )
 from src.real_results_store import (
