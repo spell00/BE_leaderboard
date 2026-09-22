@@ -2079,6 +2079,7 @@ Datasets are ordered by submission date.
                     r_pip_pkg,
                     r_eval_protocol,
                     r_cyclic_cv_folds,
+                    r_source_file,
                 ],
                 outputs=[r_board_out, r_status_out, r_logs_out],
                 api_name="submit_real",
