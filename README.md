@@ -1,4 +1,5 @@
 ---
+
 title: Batch Effects Leaderboard
 emoji: 🧬
 colorFrom: blue
@@ -7,6 +8,7 @@ sdk: gradio
 sdk_version: "5.50.0"
 python_version: "3.11"
 app_file: app.py
+hf_oauth: true
 pinned: false
 ---
 
@@ -78,6 +80,7 @@ To also log the audit to W&B, omit `--no-wandb` and optionally provide
 RUN_STAMP=$(date +%Y%m%d_%H%M%S)
 RUN_NAME="optuna-tpe-bernn104-cv3-nw4-transductive-${RUN_STAMP}"
 RUN_DIR="results/optuna_tpe_bernn104_cv3_nw4_transductive_${RUN_STAMP}"
+
 mkdir -p "$RUN_DIR"
 
 PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1 python -u \
@@ -114,22 +117,29 @@ database required for recovery.
 ```bash
 python -u scripts/run_optuna_comparison.py \
   --resume \
-  --n-trials 1000 --n-epochs 1000 --n-repeats -1 \
-  --num-workers 4 --device cuda --seed 42 \
+  --n-trials 1000 \
+  --n-epochs 1000 \
+  --n-repeats -1 \
+  --num-workers 4 \
+  --device cuda \
+  --seed 42 \
   --wandb-project BE_leaderboard_meta_evolution \
-  --wandb-run-name "$RUN_NAME" --output-dir "$RUN_DIR" \
-  --log1p-mode on --meta-hidden-size 64 --meta-epochs 1000
+  --wandb-run-name "$RUN_NAME" \
+  --output-dir "$RUN_DIR" \
+  --log1p-mode on \
+  --meta-hidden-size 64 \
+  --meta-epochs 1000
 ```
 
 ## Results
 
 The comparison writes its durable state under `RUN_DIR`, including:
 
-- `optuna.sqlite3` and `run_metadata.json`
-- `solutions.jsonl` and `solutions.csv` as solutions complete
-- `validation_solutions.jsonl`
-- `latest_joint_meta_model.pt`
-- `launch.log`
+* `optuna.sqlite3` and `run_metadata.json`
+* `solutions.jsonl` and `solutions.csv` as solutions complete
+* `validation_solutions.jsonl`
+* `latest_joint_meta_model.pt`
+* `launch.log`
 
 W&B logs scores, figures, sampled configurations, and best configurations. The
 domain-loss choice is categorical and appears under keys such as
