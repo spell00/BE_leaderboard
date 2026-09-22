@@ -1591,6 +1591,48 @@ def run_meta_recommendation(
         )
 
 
+def run_inference_ui(
+    dataset: str,
+    source_file: str,
+    inference_file: str,
+    correction_code: str,
+    model_code: str,
+    cv_folds=-1,
+):
+    """Train on selected-file train/valid CV and predict a separate target file."""
+    try:
+        folds = _normalize_cyclic_cv_folds(cv_folds, min_groups=2)
+        pred_df, metrics = run_file_inference(
+            dataset=dataset,
+            source_file=source_file,
+            inference_file=inference_file,
+            correction_code=correction_code,
+            model_code=model_code,
+            cyclic_cv_folds=folds,
+        )
+        out_dir = ROOT / "logs" / "inference"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = out_dir / f"{dataset}_{stamp}_predictions.csv"
+        pred_df.to_csv(output_path, index=False)
+
+        valid_mcc = float(metrics.get("valid_mcc", -1.0))
+        valid_std = float(metrics.get("valid_mcc_std", 0.0))
+        status = (
+            f"Inference complete. Source={source_file}; target={inference_file}; "
+            f"predictions={len(pred_df)}. Mean train/valid MCC="
+            f"{valid_mcc:.4f} ± {valid_std:.4f}. "
+            "Target labels, if present, were ignored and were not scored."
+        )
+        return pred_df, status, str(output_path)
+    except Exception as exc:
+        return (
+            pd.DataFrame(columns=["name", "prediction"]),
+            _format_exec_error(exc),
+            None,
+        )
+
+
 def recommender_checkpoint_status() -> str:
     path = resolve_checkpoint_path()
     if path.exists():
