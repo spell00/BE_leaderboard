@@ -57,7 +57,7 @@ from src.baselines import (
     family_for_config,
     maybe_register_tuned,
 )
-from src.code_challenge import CodeValidationError
+from src.code_challenge import CodeValidationError, cyclic_evaluable_batch_count
 from src.database import DatabaseManager, PROJECT_VERSION, real_leaderboard_score
 from src.dataset_info import get_dataset_info_markdown
 from src.dataset_submission import DatasetSubmissionError, stage_dataset_proposal
@@ -233,6 +233,8 @@ def _insert_real_result_rows(rows: list[dict], source: str) -> int:
                 test_mcc=_finite_float(normalized.get("test_mcc"), 0.0),
                 valid_mcc=_finite_float(normalized.get("valid_mcc"), 0.0),
                 valid_mcc_folds=normalized.get("valid_mcc_folds", []),
+                evaluation_protocol=normalized.get("evaluation_protocol") or "fixed_external",
+                cv_folds=_finite_int(normalized.get("cv_folds"), 0),
                 train_mcc=_finite_float(normalized.get("train_mcc"), -1.0),
                 log_loss=_finite_float(normalized.get("log_loss")) if normalized.get("log_loss") is not None else None,
                 brier_score=_finite_float(normalized.get("brier_score")) if normalized.get("brier_score") is not None else None,
@@ -426,6 +428,7 @@ def _run_code_submission_cancellable(
     correction_code: str,
     model_code: str,
     evaluation_protocol: str = "fixed_external",
+    cyclic_cv_folds: int = -1,
 ) -> dict:
     with _ACTIVE_REAL_RUNS_LOCK:
         existing = _ACTIVE_REAL_RUNS.get(run_key)
@@ -455,6 +458,7 @@ def _run_code_submission_cancellable(
                         "correction_code": correction_code,
                         "model_code": model_code,
                         "evaluation_protocol": evaluation_protocol,
+                        "cyclic_cv_folds": int(cyclic_cv_folds),
                     },
                     fh,
                     protocol=pickle.HIGHEST_PROTOCOL,
@@ -534,10 +538,99 @@ seed_real_leaderboard_missing_rows()
 sync_real_leaderboard_to_hub()
 
 
-def get_real_board(dataset: str | None = None) -> pd.DataFrame:
-    leaderboard = db.get_leaderboard(dataset)
+def _normalize_cyclic_cv_folds(value) -> int:
+    """Parse the rotating batch-CV count from Gradio/API input."""
+    if value is None or str(value).strip() == "":
+        return -1
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("Number of batch CV folds must be -1 or an integer >= 3")
+    if not math.isfinite(numeric) or not numeric.is_integer():
+        raise ValueError("Number of batch CV folds must be -1 or an integer >= 3")
+    folds = int(numeric)
+    if folds != -1 and folds < 3:
+        raise ValueError(
+            "Number of batch CV folds must be -1 (leave-one-batch-out) or at least 3"
+        )
+    return folds
+
+
+def cyclic_cv_status(dataset: str, evaluation_protocol: str, cyclic_cv_folds=-1) -> str:
+    if evaluation_protocol != "cyclic_batches":
+        return ""
+    try:
+        folds = _normalize_cyclic_cv_folds(cyclic_cv_folds)
+        n_batches = cyclic_evaluable_batch_count(dataset)
+    except Exception as exc:
+        return f"**Batch CV unavailable:** {exc}"
+
+    if folds > n_batches:
+        return (
+            f"**Not enough evaluable batches.** Requested {folds} folds but this dataset "
+            f"has {n_batches} evaluable batches. Use -1 for LBO"
+            + ("; the 5-fold leaderboard is unavailable for this dataset." if n_batches < 5 else ".")
+        )
+    if folds == -1:
+        return (
+            f"**Leaderboard eligible — LBO (-1).** {n_batches} evaluable batches → "
+            f"{n_batches} rotating rounds; each batch is validation once and test once."
+        )
+    if folds == 5:
+        return (
+            f"**Leaderboard eligible — 5-fold batch CV.** {n_batches} evaluable batches "
+            "are partitioned across 5 rotating batch groups."
+        )
+    return (
+        f"**Research-only configuration.** {folds}-fold batch CV will run, but only "
+        "**-1 (LBO)** and **5** count for a leaderboard."
+    )
+
+
+def _leaderboard_slice(
+    evaluation_protocol: str,
+    cyclic_cv_folds=-1,
+) -> tuple[str, int] | None:
+    if evaluation_protocol == "fixed_external":
+        return "fixed_external", 0
+    if evaluation_protocol != "cyclic_batches":
+        return None
+    try:
+        folds = _normalize_cyclic_cv_folds(cyclic_cv_folds)
+    except ValueError:
+        return None
+    if folds not in {-1, 5}:
+        return None
+    return "cyclic_batches", folds
+
+
+def get_real_board(
+    dataset: str | None = None,
+    evaluation_protocol: str = "fixed_external",
+    cyclic_cv_folds=-1,
+) -> pd.DataFrame:
+    board_slice = _leaderboard_slice(evaluation_protocol, cyclic_cv_folds)
+    if board_slice is None:
+        leaderboard = []
+    else:
+        protocol, folds = board_slice
+        if protocol == "cyclic_batches" and dataset:
+            try:
+                n_batches = cyclic_evaluable_batch_count(dataset)
+                if folds == 5 and n_batches < 5:
+                    leaderboard = []
+                else:
+                    leaderboard = db.get_leaderboard(dataset, protocol, folds)
+            except Exception:
+                leaderboard = []
+        else:
+            leaderboard = db.get_leaderboard(dataset, protocol, folds)
+
     if not leaderboard:
-        return pd.DataFrame(columns=["username", "dataset", "submission_name", "score", "valid_mcc", "test_mcc", "created_at"])
+        return pd.DataFrame(columns=[
+            "username", "dataset", "submission_name", "score",
+            "valid_mcc", "test_mcc", "created_at",
+        ])
 
     core_cols = [
         "username",
@@ -551,9 +644,8 @@ def get_real_board(dataset: str | None = None) -> pd.DataFrame:
         "macro_f1",
         "n_samples",
         "created_at",
-        "batch_nbe",  # Always include NBE
+        "batch_nbe",
     ]
-    # Remove log_loss from optional columns, always include batch_nbe
     optional_cols = [
         "brier_score",
         "ece",
@@ -563,7 +655,6 @@ def get_real_board(dataset: str | None = None) -> pd.DataFrame:
         "batch_nri",
     ]
 
-    # Show optional metric columns only when at least one row has a value.
     present_optional_cols = []
     for col in optional_cols:
         if any(row.get(col) is not None for row in leaderboard):
@@ -585,7 +676,6 @@ def get_real_board(dataset: str | None = None) -> pd.DataFrame:
     if dataset is not None and len(frame) > LEADERBOARD_UI_LIMIT:
         frame = frame.head(LEADERBOARD_UI_LIMIT)
     return frame
-
 
 
 
@@ -611,10 +701,14 @@ def get_dataset_dropdown_choices():
     )
     return [(label, key) for key, label in sorted_datasets]
 
-def apply_dataset_selection(selected_dataset):
-    """Apply the selected dataset and update main view."""
+def apply_dataset_selection(
+    selected_dataset,
+    evaluation_protocol="fixed_external",
+    cyclic_cv_folds=-1,
+):
+    """Apply the selected dataset and update the matching leaderboard view."""
     info = get_dataset_info(selected_dataset)
-    board = get_real_board(selected_dataset)
+    board = get_real_board(selected_dataset, evaluation_protocol, cyclic_cv_folds)
     train_path, test_path = get_dataset_download_files(selected_dataset)
     return (
         selected_dataset,
@@ -683,6 +777,7 @@ def submit_real(
     model_code: str,
     custom_pip: str = "",
     evaluation_protocol: str = "fixed_external",
+    cyclic_cv_folds=-1,
     profile: gr.OAuthProfile | None = None,
     request: gr.Request | None = None,
 ) -> tuple[pd.DataFrame, str, str]:
@@ -694,10 +789,15 @@ def submit_real(
     model_code = str(model_code or "")
     custom_pip = str(custom_pip or "")
     evaluation_protocol = str(evaluation_protocol or "fixed_external")
+    try:
+        cyclic_cv_folds = _normalize_cyclic_cv_folds(cyclic_cv_folds)
+    except ValueError as exc:
+        return get_real_board(dataset, evaluation_protocol, -1), str(exc), ""
+
     print(
         f"[submission] Received submission from {team.strip() or 'anonymous'} / "
         f"{model_name.strip() or 'unnamed'} on {dataset}; "
-        f"evaluation_protocol={evaluation_protocol}",
+        f"evaluation_protocol={evaluation_protocol}; cyclic_cv_folds={cyclic_cv_folds}",
         flush=True,
     )
     if not dataset.strip():
@@ -705,7 +805,28 @@ def submit_real(
     if not team:
         return get_real_board(dataset), "Please sign in with Hugging Face before submitting.", ""
     if not model_name.strip():
-        return get_real_board(dataset), "Submission name is required.", ""
+        return get_real_board(dataset, evaluation_protocol, cyclic_cv_folds), "Submission name is required.", ""
+
+    cyclic_n_batches = None
+    cyclic_leaderboard_eligible = False
+    if evaluation_protocol == "cyclic_batches":
+        try:
+            cyclic_n_batches = cyclic_evaluable_batch_count(dataset)
+        except Exception as exc:
+            return (
+                get_real_board(dataset, evaluation_protocol, cyclic_cv_folds),
+                f"Could not determine evaluable batches for rotating CV: {exc}",
+                "",
+            )
+        if cyclic_cv_folds > cyclic_n_batches:
+            message = (
+                f"Not enough evaluable batches: requested {cyclic_cv_folds} folds, "
+                f"but {dataset} has {cyclic_n_batches}. Use -1 for leave-one-batch-out."
+            )
+            if cyclic_n_batches < 5:
+                message += " The 5-fold leaderboard is unavailable for this dataset."
+            return get_real_board(dataset, evaluation_protocol, cyclic_cv_folds), message, ""
+        cyclic_leaderboard_eligible = cyclic_cv_folds in {-1, 5}
 
     logs_buffer = _RunLogCapture(_new_run_log_path(team, model_name, dataset))
     print(f"[submission] Logs will be captured to {logs_buffer.path}", flush=True)
@@ -777,6 +898,7 @@ def submit_real(
                 correction_code=correction_code,
                 model_code=model_code,
                 evaluation_protocol=evaluation_protocol,
+                cyclic_cv_folds=cyclic_cv_folds,
             )
         except CodeValidationError as exc:
             return _finish(get_real_board(dataset), f"Submission rejected: {exc}")
@@ -790,11 +912,16 @@ def submit_real(
             test_mcc = float(metrics.get("test_mcc", metrics.get("mcc", -1.0)))
             fold_valid = metrics.get("valid_mcc_folds", [])
             fold_test = metrics.get("test_mcc_folds", [])
+            resolved_folds = int(metrics.get("cyclic_cv_folds_resolved", len(fold_valid)))
+            mode_label = (
+                f"LBO (-1; {resolved_folds} rounds)"
+                if cyclic_cv_folds == -1
+                else f"{cyclic_cv_folds}-fold batch CV"
+            )
             msg = (
-                f"Research cyclic batch result on {DATASET_LABELS.get(dataset, dataset)}. "
-                f"Mean Valid MCC={valid_mcc:.4f}, Mean Test MCC={test_mcc:.4f}, "
-                f"N={metrics.get('n_samples', 0)}. "
-                "This run is not written to the official leaderboard."
+                f"Rotating batch result on {DATASET_LABELS.get(dataset, dataset)} "
+                f"[{mode_label}]. Mean Valid MCC={valid_mcc:.4f}, "
+                f"Mean Test MCC={test_mcc:.4f}, N={metrics.get('n_samples', 0)}."
             )
             if fold_valid:
                 msg += "\n\nRotating batch rounds:"
@@ -812,7 +939,51 @@ def submit_real(
                         f"\n- Mean test MCC={test_mcc:.4f} "
                         f"± {float(metrics.get('test_mcc_std', metrics.get('test_mcc_fold_std', 0.0))):.4f}"
                     )
-            return _finish(get_real_board(dataset), msg)
+
+            if cyclic_leaderboard_eligible:
+                submission = db.create_submission(
+                    username=team.strip(),
+                    dataset=dataset,
+                    submission_name=model_name.strip(),
+                    correction_code=correction_code,
+                    model_code=model_code,
+                    is_public=False,
+                )
+                db.create_score(
+                    submission_id=submission.id,
+                    accuracy=_finite_float(metrics.get("accuracy"), 0.0),
+                    macro_f1=_finite_float(metrics.get("macro_f1"), 0.0),
+                    n_samples=_finite_int(metrics.get("n_samples"), 0),
+                    test_mcc=test_mcc,
+                    valid_mcc=valid_mcc,
+                    valid_mcc_folds=[float(value) for value in fold_valid],
+                    evaluation_protocol="cyclic_batches",
+                    cv_folds=cyclic_cv_folds,
+                    train_mcc=_finite_float(metrics.get("train_mcc"), -1.0),
+                    log_loss=_finite_float(metrics.get("log_loss")) if "log_loss" in metrics else None,
+                    brier_score=_finite_float(metrics.get("brier_score")) if "brier_score" in metrics else None,
+                    ece=_finite_float(metrics.get("ece")) if "ece" in metrics else None,
+                    batch_silhouette=_finite_float(metrics.get("batch_silhouette")) if "batch_silhouette" in metrics else None,
+                    batch_centroid_dispersion=_finite_float(metrics.get("batch_centroid_dispersion")) if "batch_centroid_dispersion" in metrics else None,
+                    batch_nbe=_finite_float(metrics.get("batch_nbe")) if "batch_nbe" in metrics else None,
+                    batch_nmi=_finite_float(metrics.get("batch_nmi")) if "batch_nmi" in metrics else None,
+                    batch_nri=_finite_float(metrics.get("batch_nri")) if "batch_nri" in metrics else None,
+                )
+                sync_real_leaderboard_to_hub()
+                msg += (
+                    "\n\nThis result was saved to the "
+                    + ("LBO (-1)" if cyclic_cv_folds == -1 else "5-fold")
+                    + " leaderboard."
+                )
+            else:
+                msg += (
+                    f"\n\n{cyclic_cv_folds}-fold rotating CV is research-only and "
+                    "does not count for a leaderboard. Only -1 (LBO) and 5 are leaderboard modes."
+                )
+            return _finish(
+                get_real_board(dataset, evaluation_protocol, cyclic_cv_folds),
+                msg,
+            )
 
         submission = db.create_submission(
             username=team.strip(),
@@ -836,6 +1007,8 @@ def submit_real(
             valid_mcc_folds=[
                 float(value) for value in metrics.get("valid_mcc_folds", [])
             ],
+            evaluation_protocol="fixed_external",
+            cv_folds=0,
             train_mcc=_finite_float(metrics.get("train_mcc"), -1.0),
             log_loss=_finite_float(metrics.get("log_loss")) if "log_loss" in metrics else None,
             brier_score=_finite_float(metrics.get("brier_score")) if "brier_score" in metrics else None,
@@ -935,6 +1108,8 @@ def submit_real(
 def on_board_click(
     evt: gr.SelectData,
     dataset: str,
+    evaluation_protocol: str = "fixed_external",
+    cyclic_cv_folds=-1,
     profile: gr.OAuthProfile | None = None,
     request: gr.Request | None = None,
 ) -> tuple:
@@ -957,9 +1132,12 @@ def on_board_click(
 
         row_index = evt.index[0]
 
-        # IMPORTANT:
-        # Load the same dataset displayed in the UI
-        board = db.get_leaderboard(dataset)
+        # Load the exact leaderboard slice displayed in the UI.
+        board_slice = _leaderboard_slice(evaluation_protocol, cyclic_cv_folds)
+        if board_slice is None:
+            return gr.update(), gr.update()
+        protocol, folds = board_slice
+        board = db.get_leaderboard(dataset, protocol, folds)
 
         if not board:
             return gr.update(), gr.update()
@@ -1434,8 +1612,7 @@ Submit batch correction and model code. Evaluation runs server-side.
                         "fixed_external",
                     ),
                     (
-                        "Rotating batch LBO — each evaluable batch is validation once "
-                        "and test once",
+                        "Rotating batch CV — -1 uses leave-one-batch-out",
                         "cyclic_batches",
                     ),
                 ],
@@ -1444,10 +1621,21 @@ Submit batch correction and model code. Evaluation runs server-side.
                 info=(
                     "Adenocarcinoma example: never-seen mode uses batches 1/2 for "
                     "train-validation and keeps batch 3 as external test (2 folds). "
-                    "Rotating LBO runs 3 rounds: 1→2→3, 2→3→1, 3→1→2. "
-                    "Rotating runs are research-only and are not written to the official leaderboard."
+                    "Rotating -1 runs true leave-one-batch-out. A value of 5 groups "
+                    "all evaluable batches into five rotating CV folds."
                 ),
             )
+            r_cyclic_cv_folds = gr.Number(
+                value=-1,
+                precision=0,
+                label="Number of rotating batch CV folds",
+                info=(
+                    "-1 = leave-one-batch-out (one round per evaluable batch). "
+                    "5 = five grouped batch folds. Other values are research-only."
+                ),
+                visible=False,
+            )
+            r_cv_status = gr.Markdown("")
             r_protocol_summary = gr.Markdown(
                 "**Selected:** Never-seen external test. "
                 "For adenocarcinoma this means 2 train/validation folds and batch 3 is never "
@@ -1461,14 +1649,14 @@ Submit batch correction and model code. Evaluation runs server-side.
                 if protocol == "cyclic_batches":
                     if dataset == "massbench_adenocarcinoma":
                         return (
-                            "**Selected: Rotating batch LBO.** Adenocarcinoma runs 3 rounds: "
-                            "R1 train=1, valid=2, test=3; "
-                            "R2 train=2, valid=3, test=1; "
-                            "R3 train=3, valid=1, test=2."
+                            "**Selected: Rotating batch CV.** With the default -1 setting, "
+                            "adenocarcinoma has 3 LBO rounds: R1 train=1, valid=2, test=3; "
+                            "R2 train=2, valid=3, test=1; R3 train=3, valid=1, test=2."
                         )
                     return (
-                        "**Selected: Rotating batch LBO.** Each evaluable batch is used exactly "
-                        "once as validation and exactly once as test; all other batches train."
+                        "**Selected: Rotating batch CV.** -1 performs true batch LBO. "
+                        "A positive fold count partitions all evaluable batches into that many "
+                        "groups so every batch is still validation once and test once."
                     )
                 if dataset == "massbench_adenocarcinoma":
                     return (
@@ -1510,9 +1698,34 @@ Submit batch correction and model code. Evaluation runs server-side.
                 queue=False,
             )
 
+            def cv_control_state(protocol: str, dataset: str, folds):
+                return (
+                    gr.update(visible=(protocol == "cyclic_batches")),
+                    cyclic_cv_status(dataset, protocol, folds),
+                )
+
+            r_eval_protocol.change(
+                fn=cv_control_state,
+                inputs=[r_eval_protocol, r_dataset_in, r_cyclic_cv_folds],
+                outputs=[r_cyclic_cv_folds, r_cv_status],
+                queue=False,
+            )
+            r_dataset_in.change(
+                fn=cv_control_state,
+                inputs=[r_eval_protocol, r_dataset_in, r_cyclic_cv_folds],
+                outputs=[r_cyclic_cv_folds, r_cv_status],
+                queue=False,
+            )
+            r_cyclic_cv_folds.change(
+                fn=lambda dataset, protocol, folds: cyclic_cv_status(dataset, protocol, folds),
+                inputs=[r_dataset_in, r_eval_protocol, r_cyclic_cv_folds],
+                outputs=[r_cv_status],
+                queue=False,
+            )
+
             r_board_out = gr.Dataframe(
                 label=f"Real Leaderboard (top {LEADERBOARD_UI_LIMIT} rows)",
-                value=get_real_board("massbench_benchmark"),
+                value=get_real_board("massbench_benchmark", "fixed_external", -1),
                 wrap=True,
                 interactive=False,
             )
@@ -1524,8 +1737,20 @@ Submit batch correction and model code. Evaluation runs server-side.
             # Update Real Leaderboard table when dataset changes
             r_dataset_in.change(
                 fn=get_real_board,
-                inputs=[r_dataset_in],
+                inputs=[r_dataset_in, r_eval_protocol, r_cyclic_cv_folds],
                 outputs=[r_board_out],
+            )
+            r_eval_protocol.change(
+                fn=get_real_board,
+                inputs=[r_dataset_in, r_eval_protocol, r_cyclic_cv_folds],
+                outputs=[r_board_out],
+                queue=False,
+            )
+            r_cyclic_cv_folds.change(
+                fn=get_real_board,
+                inputs=[r_dataset_in, r_eval_protocol, r_cyclic_cv_folds],
+                outputs=[r_board_out],
+                queue=False,
             )
             # Interactive Dataset Selector Modal
             with gr.Group(visible=False) as dataset_selector_modal:
@@ -1695,6 +1920,8 @@ Datasets are ordered by submission date.
                 fn=on_board_click,
                 inputs=[
                     r_dataset_in,
+                    r_eval_protocol,
+                    r_cyclic_cv_folds,
                 ],
                 outputs=[
                     r_correction_code,
@@ -1717,6 +1944,7 @@ Datasets are ordered by submission date.
                     r_model_code,
                     r_pip_pkg,
                     r_eval_protocol,
+                    r_cyclic_cv_folds,
                 ],
                 outputs=[r_board_out, r_status_out, r_logs_out],
                 api_name="submit_real",
@@ -1766,8 +1994,12 @@ Datasets are ordered by submission date.
             def close_dataset_selector():
                 return dataset_selector_modal.update(visible=False)
             
-            def confirm_dataset_selection(selected_dataset):
-                new_dataset, new_board, new_info, train_file, test_file = apply_dataset_selection(selected_dataset)
+            def confirm_dataset_selection(selected_dataset, evaluation_protocol, cyclic_cv_folds):
+                new_dataset, new_board, new_info, train_file, test_file = apply_dataset_selection(
+                    selected_dataset,
+                    evaluation_protocol,
+                    cyclic_cv_folds,
+                )
                 return {
                     dataset_selector_modal: gr.update(visible=False),
                     r_dataset_in: gr.update(value=new_dataset),
@@ -1795,7 +2027,7 @@ Datasets are ordered by submission date.
             
             ds_selector_confirm.click(
                 fn=confirm_dataset_selection,
-                inputs=[ds_selector_dropdown],
+                inputs=[ds_selector_dropdown, r_eval_protocol, r_cyclic_cv_folds],
                 outputs=[dataset_selector_modal, r_dataset_in, r_board_out, r_dataset_info, r_train_download, r_test_download]
             )
 
