@@ -1831,8 +1831,17 @@ def _load_cyclic_research_dataset(
         if dataset == ALZHEIMER_DATASET
         else None
     )
-    cyclic_train_valid_test_splits(batches, eligible_mask=eligible)
+    cyclic_train_valid_test_splits(batches, eligible_mask=eligible, n_splits=-1)
     return X, y, batches, names
+
+
+def cyclic_evaluable_batch_count(dataset: str) -> int:
+    """Return the number of batches eligible for cyclic supervised scoring."""
+    _, y, batches, _ = _load_cyclic_research_dataset(dataset)
+    if dataset == ALZHEIMER_DATASET:
+        mask = y.astype(str).isin(ALZHEIMER_SUPERVISED_LABELS).to_numpy()
+        return int(batches.loc[mask].astype(str).nunique())
+    return int(batches.astype(str).nunique())
 
 
 def _cross_validate_cyclic_submission(
@@ -1843,6 +1852,7 @@ def _cross_validate_cyclic_submission(
     y: pd.Series,
     batches: pd.Series,
     names: pd.Series,
+    cyclic_cv_folds: int = -1,
 ) -> dict:
     """Research-only symmetric batch rotation.
 
@@ -1856,7 +1866,14 @@ def _cross_validate_cyclic_submission(
         if is_alzheimer
         else None
     )
-    splits = cyclic_train_valid_test_splits(batches, eligible_mask=eligible)
+    try:
+        splits = cyclic_train_valid_test_splits(
+            batches,
+            eligible_mask=eligible,
+            n_splits=cyclic_cv_folds,
+        )
+    except ValueError as exc:
+        raise CodeValidationError(str(exc)) from exc
     is_bernn_model = any(
         token in model_code
         for token in ("TrainAEClassifierHoldout", "TrainAEThenClassifierHoldout", "AEHeadPredictor")
@@ -1885,7 +1902,7 @@ def _cross_validate_cyclic_submission(
 
     print(
         f"[submission-cyclic] Protocol: cyclic train/valid/test by batch "
-        f"({len(splits)} rounds)",
+        f"(requested_folds={cyclic_cv_folds}, resolved_rounds={len(splits)})",
         flush=True,
     )
 
@@ -1942,7 +1959,7 @@ def _cross_validate_cyclic_submission(
         print(
             f"[submission-cyclic][round {fold}/{len(splits)}] "
             f"train_batches={split['train_batches']} "
-            f"valid_batch={split['valid_batch']} test_batch={split['test_batch']}",
+            f"valid_batches={split['valid_batches']} test_batches={split['test_batches']}",
             flush=True,
         )
 
@@ -1988,13 +2005,13 @@ def _cross_validate_cyclic_submission(
             score_valid_preds = score_valid_preds.loc[keep_valid].reset_index(drop=True)
         if len(score_y_valid) == 0:
             raise CodeValidationError(
-                f"Cyclic validation batch {split['valid_batch']} has no supervised rows."
+                f"Cyclic validation batch group {split['valid_batches']} has no supervised rows."
             )
 
         test_keep = fold_y_test_score.isin(supervised_labels).to_numpy()
         if not np.any(test_keep):
             raise CodeValidationError(
-                f"Cyclic test batch {split['test_batch']} has no supervised rows."
+                f"Cyclic test batch group {split['test_batches']} has no supervised rows."
             )
 
         valid_mcc = float(matthews_corrcoef(score_y_valid, score_valid_preds))
@@ -2025,8 +2042,8 @@ def _cross_validate_cyclic_submission(
             "n_valid": int(len(valid_idx)),
             "n_test": int(np.sum(test_keep)),
             "train_batches": list(split["train_batches"]),
-            "valid_batches": [split["valid_batch"]],
-            "test_batches": [split["test_batch"]],
+            "valid_batches": list(split["valid_batches"]),
+            "test_batches": list(split["test_batches"]),
         })
         print(
             f"[submission-cyclic][round {fold}/{len(splits)}] "
@@ -2077,9 +2094,11 @@ def _cross_validate_cyclic_submission(
         "test_mcc_folds": [float(v) for v in test_scores],
         "test_mcc_fold_mean": mean_test_mcc,
         "test_mcc_fold_std": std_test_mcc,
-        "cv_protocol": "cyclic_train_valid_test_by_batch_v1",
+        "cv_protocol": "cyclic_train_valid_test_by_batch_v2",
         "valid_fold_details": fold_details,
         "evaluation_protocol": "cyclic_batches",
+        "cyclic_cv_folds_requested": int(cyclic_cv_folds),
+        "cyclic_cv_folds_resolved": int(len(splits)),
     })
 
     print(
@@ -2101,6 +2120,7 @@ def run_cyclic_research_submission(
     dataset: str,
     correction_code: str,
     model_code: str,
+    cyclic_cv_folds: int = -1,
 ) -> tuple[pd.DataFrame, dict[str, float | int], str, str]:
     """Run the optional local/research cyclic batch protocol."""
     print(
@@ -2117,6 +2137,7 @@ def run_cyclic_research_submission(
         y,
         batches,
         names,
+        cyclic_cv_folds=cyclic_cv_folds,
     )
     metrics = result["metrics"]
     metrics["train_batches"] = int(batches.nunique())
@@ -2133,6 +2154,7 @@ def run_code_submission(
     correction_code: str,
     model_code: str,
     evaluation_protocol: str = "fixed_external",
+    cyclic_cv_folds: int = -1,
     # groups: pd.Series = None,
 ) -> tuple[pd.DataFrame, dict[str, float | int], str, str]:
     """
@@ -2151,6 +2173,7 @@ def run_code_submission(
             dataset=dataset,
             correction_code=correction_code,
             model_code=model_code,
+            cyclic_cv_folds=cyclic_cv_folds,
         )
     if evaluation_protocol != "fixed_external":
         raise ValueError(f"Unknown evaluation protocol: {evaluation_protocol}")
