@@ -442,6 +442,12 @@ BERNN_DEFAULTS = {
     "n_repeats": 3,              # repeated BERNN seeds for monitor-based model selection
     "bs": 32,
     "device": default_device(),  # cuda when a GPU is present, else cpu
+    # Keep runtime precision/performance aligned with BERNN defaults.
+    "precision": "bf16",
+    "tf32": False,
+    "torch_compile": False,
+    "torch_compile_mode": "default",
+    "cpu_threads": 0,
     # --- fine-tuning hyperparameters (searched by hp_search.py) ---
     "lr": 1e-3,
     "wd": 1e-5,
@@ -456,7 +462,10 @@ BERNN_DEFAULTS = {
 
 # Keys injected as attributes on the config *after* construction (bernn reads
 # them via getattr; they are not TrainingConfig constructor fields).
-_BERNN_ATTR_KEYS = ("lr", "wd", "nu", "margin", "smoothing", "dropout", "thres", "gamma", "beta")
+_BERNN_ATTR_KEYS = (
+    "lr", "wd", "nu", "margin", "smoothing", "dropout", "thres", "gamma", "beta",
+    "precision", "tf32", "torch_compile", "torch_compile_mode", "cpu_threads",
+)
 
 # Ordered spec used to build UI controls and to render the CONFIG block.
 BERNN_KNOBS = [
@@ -481,6 +490,11 @@ BERNN_KNOBS = [
     {"key": "n_repeats",    "label": "Repeats (folds)",     "kind": "int",    "min": 3,  "max": 10,    "help": "Cross-val repeats; must be >=3"},
     {"key": "bs",           "label": "Batch size",          "kind": "int",    "min": 8,  "max": 512,   "help": "Mini-batch size (keep well below the smallest split size)"},
     {"key": "device",       "label": "Device",              "kind": "choice", "choices": ["cpu", "cuda"], "help": "Compute device"},
+    {"key": "precision",    "label": "Precision",           "kind": "choice", "choices": ["bf16", "fp32", "fp16"], "help": "CUDA autocast precision. BF16 is the BERNN and app default."},
+    {"key": "tf32",         "label": "TF32",                "kind": "bool",   "help": "Optional TensorFloat-32 acceleration for float32 matmul; off by default."},
+    {"key": "torch_compile","label": "torch.compile",       "kind": "bool",   "help": "Compile the BERNN model with torch.compile; off by default for easy A/B benchmarking."},
+    {"key": "torch_compile_mode", "label": "Compile mode",  "kind": "choice", "choices": ["default", "reduce-overhead", "max-autotune"], "help": "torch.compile optimization mode when compilation is enabled."},
+    {"key": "cpu_threads",  "label": "CPU threads",          "kind": "int",    "min": 0, "max": 128, "help": "Fallback CPU/MKL thread count. 0 keeps PyTorch defaults."},
     # --- fine-tuning hyperparameters (paper search ranges; tuned by hp_search.py) ---
     {"key": "lr",           "label": "Learning rate",       "kind": "float",  "min": 1e-4, "max": 1e-2, "help": "Optimizer learning rate [1e-4, 1e-2]"},
     {"key": "wd",           "label": "Weight decay",        "kind": "float",  "min": 1e-6, "max": 1e-3, "help": "Optimizer weight decay [1e-6, 1e-3]"},
@@ -766,6 +780,11 @@ def build_bernn_code(cfg=None, preset=None, *, meta_predicted=False):
         rec_loss = cfg.get("rec_loss", "l1")
         use_l1 = cfg.get("use_l1", True)
         prune_network = cfg.get("prune_network", True)
+        precision = cfg.get("precision", "bf16")
+        tf32 = cfg.get("tf32", False)
+        torch_compile = cfg.get("torch_compile", False)
+        torch_compile_mode = cfg.get("torch_compile_mode", "default")
+        cpu_threads = cfg.get("cpu_threads", 0)
         attr_block = "\n".join(f'    cfg.{key} = CONFIG[{key!r}]' for key in _BERNN_ATTR_KEYS)
         # Keep the nested model-selection step bounded. The leaderboard's
         # authoritative score comes from the shared outer CV in code_challenge.
@@ -814,6 +833,11 @@ def build_bernn_code(cfg=None, preset=None, *, meta_predicted=False):
             f"        \'rec_loss\':    {rec_loss!r},\n"
             f"        \'use_l1\':      {use_l1},\n"
             f"        \'prune_network\': {prune_network},\n"
+            f"        \'precision\':   {precision!r},\n"
+            f"        \'tf32\':        {tf32!r},\n"
+            f"        \'torch_compile\': {torch_compile!r},\n"
+            f"        \'torch_compile_mode\': {torch_compile_mode!r},\n"
+            f"        \'cpu_threads\': {cpu_threads!r},\n"
             f"        \'lr\':          {cfg.get('lr', 1e-3)!r},\n"
             f"        \'wd\':          {cfg.get('wd', 1e-5)!r},\n"
             f"        \'nu\':          {cfg.get('nu', 1.0)!r},\n"
