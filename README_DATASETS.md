@@ -157,11 +157,12 @@ Every non-ERCC RefSeq gene is retained. There is no variance filtering, PCA, or
 top-gene selection. Counts are normalized to CPM within each prepared replicate
 and transformed with `log1p`.
 
+Only one matrix is written (no duplicate train copy), to keep the test lightweight.
+
 Generated files:
 
 ```text
 data/datasets/seqc_maqc/seqc_maqc_all.csv
-data/datasets/seqc_maqc/seqc_maqc_train.csv
 data/datasets/seqc_maqc/provenance.json
 ```
 
