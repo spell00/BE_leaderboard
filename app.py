@@ -248,6 +248,49 @@ def stage_uploaded_research_dataset(uploaded_file) -> tuple[str, str, str] | Non
         shutil.copy2(source, temporary)
         os.replace(temporary, target)
 
+    metadata_path = target_dir / "research_metadata.json"
+    if not metadata_path.exists():
+        header = pd.read_csv(target, nrows=0)
+        required = {"name", "batch", "label"}
+        missing = sorted(required - set(header.columns))
+        if missing:
+            raise ValueError(
+                "Uploaded CSV is missing required columns: " + ", ".join(missing)
+            )
+
+        n_samples = 0
+        batch_values = set()
+        class_values = set()
+        for chunk in pd.read_csv(
+            target,
+            usecols=["batch", "label"],
+            chunksize=100_000,
+        ):
+            n_samples += len(chunk)
+            batch_values.update(
+                chunk["batch"].dropna().astype(str).str.strip().tolist()
+            )
+            labels = chunk["label"].astype("string").str.strip()
+            labels = labels[
+                labels.notna()
+                & labels.ne("")
+                & labels.ne(UNSUPERVISED_LABEL)
+                & labels.ne("pool")
+            ]
+            class_values.update(labels.astype(str).tolist())
+
+        metadata = {
+            "dataset_id": dataset_id,
+            "source_name": source.name,
+            "n_samples": int(n_samples),
+            "n_features": int(max(len(header.columns) - 3, 0)),
+            "n_batches": int(len(batch_values)),
+            "n_classes": int(len(class_values)),
+        }
+        temporary_metadata = metadata_path.with_suffix(".json.tmp")
+        temporary_metadata.write_text(json.dumps(metadata, indent=2) + "\n")
+        os.replace(temporary_metadata, metadata_path)
+
     DATASET_LABELS[dataset_id] = dataset_label
     return dataset_id, filename, dataset_label
 
@@ -290,27 +333,17 @@ def real_protocol_summary(
 
 
 def _uploaded_dataset_info(dataset_id: str, filename: str, label: str) -> str:
-    path = resolve_dataset_matrix_file(ROOT, dataset_id, filename)
-    frame = pd.read_csv(path)
-    n_samples = len(frame)
-    n_features = max(len(frame.columns) - 3, 0)
-    n_batches = frame["batch"].astype(str).nunique() if "batch" in frame.columns else 0
-    labels = (
-        frame["label"].dropna().astype(str)
-        if "label" in frame.columns
-        else pd.Series(dtype=str)
-    )
-    labels = labels[labels.str.strip().ne("")]
-    n_classes = labels.nunique()
+    metadata_path = ROOT / "data" / "datasets" / dataset_id / "research_metadata.json"
+    metadata = json.loads(metadata_path.read_text())
     return (
         f"### {label}\n\n"
         f"**Uploaded research dataset**\n\n"
         f"| Metric | Value |\n"
         f"|---|---:|\n"
-        f"| Samples | {n_samples:,} |\n"
-        f"| Features | {n_features:,} |\n"
-        f"| Batches | {n_batches:,} |\n"
-        f"| Labeled classes | {n_classes:,} |\n\n"
+        f"| Samples | {metadata['n_samples']:,} |\n"
+        f"| Features | {metadata['n_features']:,} |\n"
+        f"| Batches | {metadata['n_batches']:,} |\n"
+        f"| Labeled classes | {metadata['n_classes']:,} |\n\n"
         "This dataset is available for rotating research CV only; "
         "it has no designated private external test split."
     )
