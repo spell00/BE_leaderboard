@@ -215,6 +215,7 @@ def persist_trials(output_dir: Path, rows: list[dict]) -> None:
     atomic_json(output_dir / "trials.json", rows)
     fields = (
         "trial_index", "trial_number", "valid_mcc", "test_mcc",
+        "valid_mcc_folds", "test_mcc_folds",
         "valid_mcc_std", "test_mcc_std", "test_mcc_fold_mean",
         "test_mcc_fold_std", "test_mcc_global_oof", "fit_seconds",
         "protocol", "error",
@@ -229,6 +230,8 @@ def persist_trials(output_dir: Path, rows: list[dict]) -> None:
                 "trial_number": row["trial_number"],
                 "valid_mcc": row["valid_mcc"],
                 "test_mcc": row["test_mcc"],
+                "valid_mcc_folds": json.dumps(metrics.get("valid_mcc_folds", [])),
+                "test_mcc_folds": json.dumps(metrics.get("test_mcc_folds", [])),
                 "valid_mcc_std": metrics.get("valid_mcc_std"),
                 "test_mcc_std": metrics.get("test_mcc_std"),
                 "test_mcc_fold_mean": metrics.get("test_mcc_fold_mean"),
