@@ -454,10 +454,6 @@ def run_launcher(args) -> int:
         raise ValueError("--n-trials must be positive")
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.prepare_missing:
-        for dataset, protocol in jobs:
-            prepare_missing(dataset, protocol)
-
     manifest = {
         "schema_version": 1,
         "datasets": [{"dataset": d, "protocol": p} for d, p in jobs],
