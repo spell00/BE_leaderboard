@@ -920,6 +920,7 @@ def run_trial(cfg: dict, args, data, exp_id: str, fixed_test_data=None):
     fold_metrics = []
     epoch_traces_by_fold = {}
     fixed_test_predictions = []
+    fixed_test_mcc_scores = []
     resolved_n_repeats = int(getattr(args, "resolved_n_repeats", resolve_n_repeats(args.n_repeats, batches)))
     is_alzheimer = getattr(args, "dataset", "") == ALZHEIMER_DATASET
     X_fixed = y_fixed = batches_fixed = None
@@ -1037,6 +1038,7 @@ def run_trial(cfg: dict, args, data, exp_id: str, fixed_test_data=None):
             metrics["test_mcc"] = float(matthews_corrcoef(
                 np.asarray(y_fixed).astype(str), predictions
             ))
+            fixed_test_mcc_scores.append(float(metrics["test_mcc"]))
         metrics["fold"] = float(fold_idx)
         fold_scores.append(float(mcc))
         fold_metrics.append(metrics)
@@ -1050,6 +1052,7 @@ def run_trial(cfg: dict, args, data, exp_id: str, fixed_test_data=None):
         metrics["_epoch_traces_by_fold"] = epoch_traces_by_fold
     metrics["valid_mcc"] = float(np.mean(fold_scores))
     metrics["valid_mcc_std"] = float(np.std(fold_scores)) if len(fold_scores) > 1 else 0.0
+    metrics["valid_mcc_folds"] = [float(value) for value in fold_scores]
     if fixed_test_predictions:
         from sklearn.metrics import matthews_corrcoef
 
@@ -1059,7 +1062,11 @@ def run_trial(cfg: dict, args, data, exp_id: str, fixed_test_data=None):
             for column in prediction_matrix.T
         ])
         y_fixed = np.asarray(fixed_test_data[1]).astype(str)
-        metrics["test_mcc_fold_mean"] = float(metrics.get("test_mcc", np.nan))
+        metrics["test_mcc_folds"] = [float(value) for value in fixed_test_mcc_scores]
+        metrics["test_mcc_fold_mean"] = float(np.mean(fixed_test_mcc_scores))
+        metrics["test_mcc_fold_std"] = (
+            float(np.std(fixed_test_mcc_scores)) if len(fixed_test_mcc_scores) > 1 else 0.0
+        )
         metrics["test_mcc"] = float(matthews_corrcoef(y_fixed, ensemble))
         print(
             "[trial test] monitoring-only fixed-test ensemble "
