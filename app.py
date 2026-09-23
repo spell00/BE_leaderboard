@@ -170,6 +170,7 @@ def default_dataset_source(dataset: str) -> str | None:
 
 
 UPLOADED_RESEARCH_SOURCE = "__uploaded_research_source__"
+NO_META_DATASET = ""
 
 
 def _uploaded_file_path(uploaded_file) -> Path | None:
@@ -179,36 +180,48 @@ def _uploaded_file_path(uploaded_file) -> Path | None:
 
 
 def meta_source_choices(dataset: str, uploaded_file=None):
-    """Built-in dataset files plus the currently uploaded research CSV."""
-    choices = list(dataset_source_choices(dataset))
+    """Return the active recommender source choices.
+
+    An uploaded CSV deliberately dominates the built-in dataset selector.
+    """
     path = _uploaded_file_path(uploaded_file)
     if path is not None:
-        choices.append((f"Uploaded CSV — {path.name}", UPLOADED_RESEARCH_SOURCE))
-    return choices
+        return [(f"Uploaded CSV — {path.name}", UPLOADED_RESEARCH_SOURCE)]
+    if not dataset:
+        return []
+    return list(dataset_source_choices(dataset))
 
 
 def update_meta_source_for_dataset(dataset: str, uploaded_file=None):
-    """Refresh source choices without hiding an existing uploaded CSV."""
+    """Refresh source choices, keeping an existing upload dominant."""
     choices = meta_source_choices(dataset, uploaded_file)
     path = _uploaded_file_path(uploaded_file)
-    value = (
-        UPLOADED_RESEARCH_SOURCE
-        if path is not None
-        else default_dataset_source(dataset)
-    )
+    if path is not None:
+        return gr.update(choices=choices, value=UPLOADED_RESEARCH_SOURCE)
+    value = default_dataset_source(dataset) if dataset else None
     return gr.update(choices=choices, value=value)
 
 
 def update_meta_source_for_upload(uploaded_file, dataset: str):
-    """Select an uploaded CSV as soon as Gradio finishes receiving it."""
-    choices = meta_source_choices(dataset, uploaded_file)
+    """Make a completed upload the unambiguous active recommender dataset."""
     path = _uploaded_file_path(uploaded_file)
-    value = (
-        UPLOADED_RESEARCH_SOURCE
-        if path is not None
-        else default_dataset_source(dataset)
+    if path is not None:
+        return (
+            gr.update(
+                choices=[(f"Uploaded CSV — {path.name}", UPLOADED_RESEARCH_SOURCE)],
+                value=UPLOADED_RESEARCH_SOURCE,
+            ),
+            gr.update(value=NO_META_DATASET),
+        )
+
+    restored_dataset = dataset or "massbench_benchmark"
+    return (
+        gr.update(
+            choices=dataset_source_choices(restored_dataset),
+            value=default_dataset_source(restored_dataset),
+        ),
+        gr.update(value=restored_dataset),
     )
-    return gr.update(choices=choices, value=value)
 
 
 def _file_sha256(path: Path) -> str:
@@ -2005,7 +2018,10 @@ Run a reproducible server-side benchmark or propose a matrix-ready dataset.
 
         with gr.Row():
             meta_dataset = gr.Dropdown(
-                choices=[(label, key) for key, label in DATASET_LABELS.items()],
+                choices=[
+                    ("Select a dataset", NO_META_DATASET),
+                    *[(label, key) for key, label in DATASET_LABELS.items()],
+                ],
                 value="massbench_benchmark",
                 label="Existing dataset",
             )
@@ -2032,7 +2048,7 @@ Run a reproducible server-side benchmark or propose a matrix-ready dataset.
         meta_upload.change(
             fn=update_meta_source_for_upload,
             inputs=[meta_upload, meta_dataset],
-            outputs=[meta_source_file],
+            outputs=[meta_source_file, meta_dataset],
             queue=False,
         )
 
