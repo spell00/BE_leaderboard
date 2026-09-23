@@ -54,6 +54,13 @@ def ensure_all_dataset_file(root: str | Path, dataset: str) -> Path:
     test_path = base / f"{dataset}_test.csv"
     all_path = base / f"{dataset}_all.csv"
 
+    # The merged whole-dataset file is a first-class source. If it already
+    # exists, do not rebuild it at application startup: it may contain labels
+    # or rows that are intentionally richer than a literal train+test merge,
+    # and large datasets would otherwise be reread and rewritten on every boot.
+    if all_path.exists():
+        return all_path
+
     if not train_path.exists():
         raise FileNotFoundError(f"Training CSV not found: {train_path}")
 
