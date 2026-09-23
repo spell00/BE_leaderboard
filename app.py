@@ -78,6 +78,7 @@ from src.dataset_files import (
 )
 from src.dataset_submission import DatasetSubmissionError, stage_dataset_proposal
 from src.dataset_tasks import (
+    UNSUPERVISED_LABEL,
     clean_task_features,
     prepare_builtin_training_frame,
     prepare_research_source_frame,
