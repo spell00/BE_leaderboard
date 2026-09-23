@@ -266,7 +266,9 @@ def persist_multifidelity_trials(output_dir: Path, study, max_resource: int) -> 
         )
         predicted_total = attrs.get("predicted_total")
         partial_total = attrs.get("partial_total")
-        if observed_total is not None:
+        if trial.state == optuna.trial.TrialState.FAIL:
+            total, total_source = None, "failed"
+        elif observed_total is not None:
             total, total_source = observed_total, "observed"
         elif predicted_total is not None:
             total, total_source = float(predicted_total), "predicted"
