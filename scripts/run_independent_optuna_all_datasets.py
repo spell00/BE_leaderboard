@@ -32,11 +32,17 @@ if str(ROOT) not in sys.path:
 
 from scripts import hp_search
 from src.evolutionary_meta import recommended_batch_size
+from src.multifidelity_hpo import (
+    OptunaProgressReporter,
+    deterministic_force_full,
+    make_pruner,
+)
 
 DATASETS = (
     # New datasets first.
     ("jdlber_sle_maldi", "cyclic"),
     ("seqc_maqc", "cyclic"),
+    ("bacteria_2024_mz10", "cyclic"),
     ("scib_pancreas", "cyclic"),
     # Existing meta-hpo-bank datasets.
     ("normal_tissue_878", "fixed_external"),
@@ -75,6 +81,22 @@ def parse_args(argv=None):
     p.add_argument("--no-wandb", action="store_true")
     p.add_argument("--wandb-project", default="BE_leaderboard_meta_evolution")
     p.add_argument("--wandb-group", default="independent-optuna-all-datasets-20")
+    p.add_argument(
+        "--pruner", choices=("none", "sha", "hyperband"), default="sha",
+        help="Multi-fidelity scheduler. sha is the safe default for 20-trial studies.",
+    )
+    p.add_argument("--pruner-min-resource", type=int, default=30)
+    p.add_argument("--pruner-reduction-factor", type=int, default=3)
+    p.add_argument("--pruner-bootstrap-count", type=int, default=0)
+    p.add_argument("--pruner-report-every", type=int, default=10)
+    p.add_argument(
+        "--force-full-fraction", type=float, default=0.15,
+        help="Fraction of otherwise-prunable trials forced to full budget for audit labels.",
+    )
+    p.add_argument(
+        "--force-full-first", type=int, default=3,
+        help="Always fully evaluate the first N trials in each dataset study.",
+    )
     p.add_argument("--worker-dataset", default=None, help=argparse.SUPPRESS)
     p.add_argument("--worker-protocol", choices=("fixed_external", "cyclic"), help=argparse.SUPPRESS)
     return p.parse_args(argv)
@@ -131,6 +153,18 @@ def mark_interrupted_failed(study) -> None:
         if trial.state == optuna.trial.TrialState.RUNNING:
             study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
             print(f"[resume] marked trial {trial.number} FAIL", flush=True)
+
+
+def attempted(study):
+    import optuna
+    terminal = {
+        optuna.trial.TrialState.COMPLETE,
+        optuna.trial.TrialState.PRUNED,
+    }
+    return [
+        trial for trial in study.get_trials(deepcopy=False)
+        if trial.state in terminal
+    ]
 
 
 def json_metric(value):
@@ -209,6 +243,51 @@ def records_for(study, protocol: str) -> list[dict]:
             "test_role": "monitoring_only_excluded_from_optuna",
         })
     return rows
+
+
+def persist_multifidelity_trials(output_dir: Path, study, max_resource: int) -> None:
+    import optuna
+
+    rows = []
+    for trial in sorted(study.get_trials(deepcopy=False), key=lambda row: row.number):
+        if trial.state not in {
+            optuna.trial.TrialState.COMPLETE,
+            optuna.trial.TrialState.PRUNED,
+        }:
+            continue
+        attrs = dict(trial.user_attrs)
+        observed_total = (
+            float(trial.value)
+            if trial.state == optuna.trial.TrialState.COMPLETE and trial.value is not None
+            else None
+        )
+        predicted_total = attrs.get("predicted_total")
+        partial_total = attrs.get("partial_total")
+        if observed_total is not None:
+            total, total_source = observed_total, "observed"
+        elif predicted_total is not None:
+            total, total_source = float(predicted_total), "predicted"
+        else:
+            total, total_source = partial_total, "partial_proxy"
+        step = int(attrs.get("budget_step", 0) or 0)
+        rows.append({
+            "trial_number": int(trial.number),
+            "state": trial.state.name,
+            "total": total,
+            "total_source": total_source,
+            "observed_total": observed_total,
+            "predicted_total": predicted_total,
+            "partial_total": partial_total,
+            "budget_step": step,
+            "budget_fraction": float(np.clip(step / max(1, int(max_resource)), 0.0, 1.0)),
+            "force_full": bool(attrs.get("force_full", False)),
+            "would_prune_at_step": attrs.get("would_prune_at_step"),
+            "pruned_at_step": attrs.get("pruned_at_step"),
+            "curve_path": attrs.get("curve_path"),
+            "config": attrs.get("config", {}),
+            "error": attrs.get("error"),
+        })
+    atomic_json(output_dir / "multifidelity_trials.json", rows)
 
 
 def persist_trials(output_dir: Path, rows: list[dict]) -> None:
@@ -298,10 +377,24 @@ def run_worker(args) -> int:
     mlruns.mkdir(exist_ok=True)
     mlflow.set_tracking_uri(mlruns.resolve().as_uri())
     storage = optuna.storages.RDBStorage(url=f"sqlite:///{(out / 'optuna.sqlite3').resolve()}")
+    budget_folds = (
+        len(batch_values)
+        if protocol == "cyclic"
+        else hp_search.resolve_n_repeats(CV_FOLDS.get(dataset, args.n_repeats), batches)
+    )
+    max_resource = max(1, int(args.n_epochs) * int(budget_folds))
+    pruner = make_pruner(
+        args.pruner,
+        min_resource=args.pruner_min_resource,
+        max_resource=max_resource,
+        reduction_factor=args.pruner_reduction_factor,
+        bootstrap_count=args.pruner_bootstrap_count,
+    )
     study = optuna.create_study(
         study_name=f"independent_{dataset}",
         direction="maximize",
         sampler=optuna.samplers.TPESampler(seed=args.seed),
+        pruner=pruner,
         storage=storage,
         load_if_exists=True,
     )
@@ -326,14 +419,28 @@ def run_worker(args) -> int:
         wandb.define_metric("best/*", step_metric="trial_index")
 
     try:
-        start = len(completed(study))
+        start = len(attempted(study))
         print(
             f"[worker] {dataset}: protocol={protocol} samples={len(X)} "
-            f"features={X.shape[1]} batches={len(batch_values)} completed={start}/{args.n_trials}",
+            f"features={X.shape[1]} batches={len(batch_values)} attempted={start}/{args.n_trials} "
+            f"pruner={args.pruner} max_resource={max_resource}",
             flush=True,
         )
         for index in range(start, args.n_trials):
             trial = study.ask()
+            force_full = deterministic_force_full(
+                trial.number,
+                seed=args.seed,
+                fraction=args.force_full_fraction,
+                first_n=args.force_full_first,
+            )
+            trial.set_user_attr("force_full", bool(force_full))
+            reporter = OptunaProgressReporter(
+                trial,
+                force_full=force_full,
+                report_every=args.pruner_report_every,
+                max_resource=max_resource,
+            )
             run_args = hp_search.parse_args([])
             run_args.dataset = dataset
             run_args.n_epochs = args.n_epochs
@@ -367,57 +474,120 @@ def run_worker(args) -> int:
             })
 
             metrics, error = {}, None
+            trial_state = "complete"
             started = time.monotonic()
             try:
                 exp_id = f"independent_{meta['run_id']}_{dataset}_t{trial.number}"
                 if protocol == "cyclic":
-                    score, metrics = hp_search.run_cyclic_batch_trial(config, run_args, data, exp_id)
+                    score, metrics = hp_search.run_cyclic_batch_trial(
+                        config, run_args, data, exp_id, progress_callback=reporter
+                    )
                 else:
                     score, metrics = hp_search.run_trial(
-                        config, run_args, data, exp_id, fixed_test_data=fixed_test
+                        config, run_args, data, exp_id,
+                        fixed_test_data=fixed_test,
+                        progress_callback=reporter,
                     )
                 score = float(score)
+            except optuna.TrialPruned as exc:
+                trial_state = "pruned"
+                score = reporter.last_score
+                error = str(exc)
+                print(
+                    f"[worker] {dataset} trial {trial.number} PRUNED "
+                    f"step={reporter.last_step} partial_total={score}",
+                    flush=True,
+                )
             except Exception as exc:
                 score = -1.0
                 error = f"{type(exc).__name__}: {exc}"
                 print(f"[worker] {dataset} trial {trial.number} failed: {error}", flush=True)
 
             clean = compact_metrics(metrics)
-            clean.setdefault("valid_mcc", score)
+            if trial_state == "complete":
+                clean.setdefault("valid_mcc", score)
             fit_seconds = time.monotonic() - started
+            curve_path = out / "curves" / f"trial_{trial.number:05d}.json"
+            atomic_json(curve_path, reporter.history)
             trial.set_user_attr("config", config)
             trial.set_user_attr("metrics", clean)
             trial.set_user_attr("fit_seconds", fit_seconds)
+            trial.set_user_attr("curve_path", str(curve_path.relative_to(out)))
+            trial.set_user_attr("budget_step", int(reporter.last_step))
+            trial.set_user_attr("partial_total", reporter.last_score)
+            trial.set_user_attr("pruning_granularity", (
+                reporter.history[-1].get("granularity") if reporter.history else None
+            ))
             if error:
                 trial.set_user_attr("error", error)
-            study.tell(trial, score)
+
+            if trial_state == "pruned":
+                study.tell(trial, state=optuna.trial.TrialState.PRUNED)
+            else:
+                study.tell(trial, float(score))
 
             rows = records_for(study, protocol)
             persist_trials(out, rows)
+            persist_multifidelity_trials(out, study, max_resource)
             done = sorted(completed(study), key=lambda x: x.number)
-            current = done[-1]
-            best = max(done, key=lambda x: float(x.value))
-            current_metrics = dict(current.user_attrs.get("metrics", {}))
-            best_metrics = dict(best.user_attrs.get("metrics", {}))
-            if wb:
-                wb.log({
-                    "trial_index": index,
-                    "trial_number": int(current.number),
-                    "metrics/valid_mcc": float(current.value),
-                    "metrics/test_mcc": current_metrics.get("test_mcc"),
-                    "runtime/fit_seconds": current.user_attrs.get("fit_seconds"),
-                    "best/valid_mcc": float(best.value),
-                    "best/test_mcc": best_metrics.get("test_mcc"),
-                    "best/trial_number": int(best.number),
-                    **wandb_metrics(current_metrics),
-                    **config_metrics(dict(current.user_attrs.get("config", {}))),
-                })
-            print(
-                f"[worker] {dataset} {index + 1}/{args.n_trials}: "
-                f"valid={float(current.value):.4f} test={current_metrics.get('test_mcc')} "
-                f"best_valid={float(best.value):.4f} best_test={best_metrics.get('test_mcc')}",
-                flush=True,
-            )
+            best = max(done, key=lambda x: float(x.value)) if done else None
+
+            if trial_state == "complete":
+                current = next(row for row in done if row.number == trial.number)
+                current_metrics = dict(current.user_attrs.get("metrics", {}))
+                if wb:
+                    payload = {
+                        "trial_index": index,
+                        "trial_number": int(current.number),
+                        "trial/state_complete": 1,
+                        "trial/force_full": int(force_full),
+                        "trial/budget_fraction": 1.0,
+                        "metrics/valid_mcc": float(current.value),
+                        "metrics/test_mcc": current_metrics.get("test_mcc"),
+                        "runtime/fit_seconds": current.user_attrs.get("fit_seconds"),
+                        **wandb_metrics(current_metrics),
+                        **config_metrics(dict(current.user_attrs.get("config", {}))),
+                    }
+                    if best is not None:
+                        best_metrics = dict(best.user_attrs.get("metrics", {}))
+                        payload.update({
+                            "best/valid_mcc": float(best.value),
+                            "best/test_mcc": best_metrics.get("test_mcc"),
+                            "best/trial_number": int(best.number),
+                        })
+                    wb.log(payload)
+                best_text = "n/a" if best is None else f"{float(best.value):.4f}"
+                print(
+                    f"[worker] {dataset} {index + 1}/{args.n_trials}: "
+                    f"COMPLETE valid={float(current.value):.4f} "
+                    f"test={current_metrics.get('test_mcc')} best_valid={best_text}",
+                    flush=True,
+                )
+            else:
+                if wb:
+                    payload = {
+                        "trial_index": index,
+                        "trial_number": int(trial.number),
+                        "trial/state_pruned": 1,
+                        "trial/force_full": int(force_full),
+                        "trial/budget_step": int(reporter.last_step),
+                        "trial/budget_fraction": float(
+                            np.clip(reporter.last_step / max_resource, 0.0, 1.0)
+                        ),
+                        "metrics/partial_total": reporter.last_score,
+                        "runtime/fit_seconds": fit_seconds,
+                        **config_metrics(config),
+                    }
+                    if best is not None:
+                        payload["best/valid_mcc"] = float(best.value)
+                        payload["best/trial_number"] = int(best.number)
+                    wb.log(payload)
+                print(
+                    f"[worker] {dataset} {index + 1}/{args.n_trials}: PRUNED "
+                    f"partial_total={reporter.last_score} "
+                    f"budget={reporter.last_step}/{max_resource}",
+                    flush=True,
+                )
 
         best = max(completed(study), key=lambda x: float(x.value))
         best_metrics = dict(best.user_attrs.get("metrics", {}))
@@ -463,6 +633,12 @@ def run_launcher(args) -> int:
         "n_epochs": args.n_epochs,
         "selection_metric": "valid_mcc",
         "test_role": "monitoring_only_excluded_from_optuna",
+        "pruner": args.pruner,
+        "pruner_min_resource": args.pruner_min_resource,
+        "pruner_reduction_factor": args.pruner_reduction_factor,
+        "pruner_report_every": args.pruner_report_every,
+        "force_full_fraction": args.force_full_fraction,
+        "force_full_first": args.force_full_first,
         "wandb_project": args.wandb_project,
         "wandb_group": args.wandb_group,
     }
@@ -482,6 +658,13 @@ def run_launcher(args) -> int:
                 "--n-repeats", str(args.n_repeats), "--batch-size", str(args.batch_size),
                 "--num-workers", str(args.num_workers), "--seed", str(args.seed),
                 "--wandb-project", args.wandb_project, "--wandb-group", args.wandb_group,
+                "--pruner", args.pruner,
+                "--pruner-min-resource", str(args.pruner_min_resource),
+                "--pruner-reduction-factor", str(args.pruner_reduction_factor),
+                "--pruner-bootstrap-count", str(args.pruner_bootstrap_count),
+                "--pruner-report-every", str(args.pruner_report_every),
+                "--force-full-fraction", str(args.force_full_fraction),
+                "--force-full-first", str(args.force_full_first),
             ]
             if args.resume:
                 cmd.append("--resume")
