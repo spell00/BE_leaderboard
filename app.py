@@ -477,6 +477,29 @@ def sync_uploaded_dataset_to_real(
     )
 
 
+def sync_uploaded_dataset_everywhere(
+    uploaded_file,
+    meta_dataset_value: str,
+    upload_state=None,
+    request: gr.Request | None = None,
+):
+    """Atomically synchronize an upload across recommender and Real controls."""
+    meta_source_update, meta_dataset_update = update_meta_source_for_upload(
+        uploaded_file,
+        meta_dataset_value,
+    )
+    real_updates = sync_uploaded_dataset_to_real(
+        uploaded_file,
+        upload_state,
+        request,
+    )
+    return (
+        meta_source_update,
+        meta_dataset_update,
+        *real_updates,
+    )
+
+
 def inference_file_choices(dataset: str):
     return [(name, name) for name in inference_filenames(ROOT, dataset)]
 
@@ -2069,13 +2092,6 @@ Run a reproducible server-side benchmark or propose a matrix-ready dataset.
             outputs=[meta_source_file],
             queue=False,
         )
-        meta_upload.change(
-            fn=update_meta_source_for_upload,
-            inputs=[meta_upload, meta_dataset],
-            outputs=[meta_source_file, meta_dataset],
-            queue=False,
-        )
-
         meta_eval_protocol = gr.Radio(
             choices=[
                 (
@@ -2430,22 +2446,33 @@ Datasets are ordered by submission date.
                 outputs=[r_model_code],
             )
 
-            meta_upload.change(
-                fn=sync_uploaded_dataset_to_real,
-                inputs=[meta_upload, uploaded_research_state],
-                outputs=[
-                    r_dataset_in,
-                    r_source_file,
-                    r_eval_protocol,
-                    r_cyclic_cv_folds,
-                    r_protocol_summary,
-                    r_cv_status,
-                    r_dataset_info,
-                    r_board_out,
-                    r_train_download,
-                    r_test_download,
-                    uploaded_research_state,
-                ],
+            _upload_outputs = [
+                meta_source_file,
+                meta_dataset,
+                r_dataset_in,
+                r_source_file,
+                r_eval_protocol,
+                r_cyclic_cv_folds,
+                r_protocol_summary,
+                r_cv_status,
+                r_dataset_info,
+                r_board_out,
+                r_train_download,
+                r_test_download,
+                uploaded_research_state,
+            ]
+
+            meta_upload.upload(
+                fn=sync_uploaded_dataset_everywhere,
+                inputs=[meta_upload, meta_dataset, uploaded_research_state],
+                outputs=_upload_outputs,
+                queue=False,
+                show_progress="full",
+            )
+            meta_upload.clear(
+                fn=sync_uploaded_dataset_everywhere,
+                inputs=[meta_upload, meta_dataset, uploaded_research_state],
+                outputs=_upload_outputs,
                 queue=False,
             )
 
