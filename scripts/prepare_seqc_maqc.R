@@ -107,8 +107,15 @@ aggregate_site <- function(df, site, feature_mask, feature_names) {
     stop(sprintf("%s produced %d replicate groups; expected %d", site, length(groups), expected))
   }
 
-  rows <- vector("list", length(groups))
   group_names <- names(groups)
+  values_matrix <- matrix(
+    NA_real_,
+    nrow = length(groups),
+    ncol = length(feature_names),
+    dimnames = list(NULL, feature_names)
+  )
+  sample_names <- character(length(groups))
+  labels <- character(length(groups))
 
   for (i in seq_along(groups)) {
     key <- group_names[[i]]
@@ -120,22 +127,20 @@ aggregate_site <- function(df, site, feature_mask, feature_names) {
     if (!is.finite(total) || total <= 0) {
       stop(sprintf("%s %s has non-positive library size", site, key))
     }
-    values <- log1p(counts / total * 1e6)
+
+    values_matrix[i, ] <- log1p(counts / total * 1e6)
     label <- sub("_.*$", "", key)
     replicate <- sub("^[ABCD]_", "", key)
-
-    row <- data.frame(
-      name = sprintf("%s_%s_R%s", site, label, replicate),
-      batch = site,
-      label = label,
-      stringsAsFactors = FALSE,
-      check.names = FALSE
-    )
-    row[feature_names] <- as.list(values)
-    rows[[i]] <- row
+    sample_names[[i]] <- sprintf("%s_%s_R%s", site, label, replicate)
+    labels[[i]] <- label
   }
 
-  data.table::rbindlist(rows, use.names = TRUE, fill = FALSE)
+  metadata <- data.table::data.table(
+    name = sample_names,
+    batch = rep(site, length(groups)),
+    label = labels
+  )
+  cbind(metadata, data.table::as.data.table(values_matrix))
 }
 
 main <- function() {
@@ -156,20 +161,20 @@ main <- function() {
   sites <- c("AGR", "BGI", "CNL", "COH", "MAY", "NVS")
   object_names <- paste0("ILM_refseq_gene_", sites)
 
-  first <- get(object_names[[1]], envir = asNamespace("seqc"))
+  seqc_env <- as.environment("package:seqc")
+  first <- get(object_names[[1]], envir = seqc_env)
   meta_cols <- c("EntrezID", "Symbol", "GeneLength", "IsERCC")
   reference_meta <- first[, meta_cols, drop = FALSE]
 
   for (obj_name in object_names[-1]) {
-    current <- get(obj_name, envir = asNamespace("seqc"))
+    current <- get(obj_name, envir = seqc_env)
     current_meta <- current[, meta_cols, drop = FALSE]
     if (!identical(reference_meta, current_meta)) {
       stop(sprintf("RefSeq gene metadata differs between %s and %s", object_names[[1]], obj_name))
     }
   }
 
-  is_ercc <- as.logical(reference_meta$IsERCC)
-  is_ercc[is.na(is_ercc)] <- FALSE
+  is_ercc <- tolower(safe_text(reference_meta$IsERCC)) %in% c("true", "t", "1", "yes")
   feature_mask <- !is_ercc
   feature_meta <- reference_meta[feature_mask, , drop = FALSE]
   feature_names <- feature_names_from_metadata(feature_meta)
@@ -179,7 +184,7 @@ main <- function() {
     site <- sites[[i]]
     obj_name <- object_names[[i]]
     message(sprintf("[seqc] Aggregating %s", obj_name))
-    df <- get(obj_name, envir = asNamespace("seqc"))
+    df <- get(obj_name, envir = seqc_env)
     frames[[i]] <- aggregate_site(df, site, feature_mask, feature_names)
   }
 
