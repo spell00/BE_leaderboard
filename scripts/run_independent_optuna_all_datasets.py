@@ -161,6 +161,7 @@ def attempted(study):
     terminal = {
         optuna.trial.TrialState.COMPLETE,
         optuna.trial.TrialState.PRUNED,
+        optuna.trial.TrialState.FAIL,
     }
     return [
         trial for trial in study.get_trials(deepcopy=False)
@@ -254,6 +255,7 @@ def persist_multifidelity_trials(output_dir: Path, study, max_resource: int) -> 
         if trial.state not in {
             optuna.trial.TrialState.COMPLETE,
             optuna.trial.TrialState.PRUNED,
+            optuna.trial.TrialState.FAIL,
         }:
             continue
         attrs = dict(trial.user_attrs)
@@ -507,9 +509,10 @@ def run_worker(args) -> int:
                     flush=True,
                 )
             except Exception as exc:
-                score = -1.0
+                trial_state = "failed"
+                score = None
                 error = f"{type(exc).__name__}: {exc}"
-                print(f"[worker] {dataset} trial {trial.number} failed: {error}", flush=True)
+                print(f"[worker] {dataset} trial {trial.number} FAILED: {error}", flush=True)
 
             clean = compact_metrics(metrics)
             if trial_state == "complete":
@@ -531,6 +534,8 @@ def run_worker(args) -> int:
 
             if trial_state == "pruned":
                 study.tell(trial, state=optuna.trial.TrialState.PRUNED)
+            elif trial_state == "failed":
+                study.tell(trial, state=optuna.trial.TrialState.FAIL)
             else:
                 study.tell(trial, float(score))
 
@@ -574,7 +579,7 @@ def run_worker(args) -> int:
                     f"test={current_metrics.get('test_mcc')} best_valid={best_text}",
                     flush=True,
                 )
-            else:
+            elif trial_state == "pruned":
                 if wb:
                     payload = {
                         "trial_index": index,
@@ -599,6 +604,26 @@ def run_worker(args) -> int:
                     f"budget={reporter.last_step}/{max_resource}",
                     flush=True,
                 )
+            else:
+                if wb:
+                    payload = {
+                        "trial_index": index,
+                        "trial_number": int(trial.number),
+                        "trial/state_failed": 1,
+                        "trial/force_full": int(force_full),
+                        "trial/budget_step": int(reporter.last_step),
+                        "runtime/fit_seconds": fit_seconds,
+                        **config_metrics(config),
+                    }
+                    if best is not None:
+                        payload["best/valid_mcc"] = float(best.value)
+                        payload["best/trial_number"] = int(best.number)
+                    wb.log(payload)
+                print(
+                    f"[worker] {dataset} {index + 1}/{args.n_trials}: FAILED "
+                    f"{error}",
+                    flush=True,
+                )
 
         backfill = backfill_multifidelity_totals(
             out,
@@ -621,7 +646,14 @@ def run_worker(args) -> int:
             "protocol": protocol,
             "attempted_trials": len(attempted(study)),
             "completed_trials": len(completed(study)),
-            "pruned_trials": len(attempted(study)) - len(completed(study)),
+            "pruned_trials": sum(
+                trial.state == optuna.trial.TrialState.PRUNED
+                for trial in attempted(study)
+            ),
+            "failed_trials": sum(
+                trial.state == optuna.trial.TrialState.FAIL
+                for trial in attempted(study)
+            ),
             "curve_total_completed_labels": int(backfill["completed"]),
             "curve_total_predictions": int(backfill["predicted"]),
             "best_trial_number": int(best.number),
