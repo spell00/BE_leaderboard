@@ -9,9 +9,11 @@ mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/bacteria_2024_mz10_insert.log"
 
 find_launcher() {
-  local pid cmd
+  local pid cmd exe
   while read -r pid; do
     [[ -r "/proc/$pid/cmdline" ]] || continue
+    exe="$(basename "$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)")"
+    [[ "$exe" == python* ]] || continue
     cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline")"
     if [[ "$cmd" == *"run_independent_optuna_all_datasets.py"* ]] \
        && [[ "$cmd" == *"--gpus"* ]] \
@@ -32,7 +34,7 @@ process_done() {
 }
 
 launcher_pid="$(find_launcher)" || {
-  echo "Could not find the active independent Optuna launcher" >&2
+  echo "Could not find the active Python independent Optuna launcher" >&2
   exit 1
 }
 
