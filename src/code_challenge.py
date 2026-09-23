@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 from datetime import datetime, timezone
 from pathlib import Path
+from functools import lru_cache
 import builtins
 from io import StringIO
 import base64
@@ -1889,16 +1890,51 @@ def _load_cyclic_research_dataset(
     return _load_research_source_dataset(dataset, dataset_file)
 
 
+@lru_cache(maxsize=128)
+def _cached_cyclic_evaluable_batch_count(
+    dataset: str,
+    path_text: str,
+    mtime_ns: int,
+    size_bytes: int,
+) -> int:
+    """Count supervised batches without loading the feature matrix."""
+    path = Path(path_text)
+
+    metadata_path = path.parent / "research_metadata.json"
+    if dataset.startswith("uploaded_") and metadata_path.exists():
+        try:
+            metadata = json.loads(metadata_path.read_text())
+            return int(metadata["n_batches"])
+        except Exception:
+            pass
+
+    frame = pd.read_csv(path, usecols=["batch", "label"])
+    prepared = prepare_research_source_frame(dataset, frame)
+    labels = prepared["label"].astype(str)
+    batches = prepared["batch"].astype(str)
+
+    if dataset == ALZHEIMER_DATASET:
+        mask = labels.isin(ALZHEIMER_SUPERVISED_LABELS)
+    else:
+        mask = labels.ne(UNSUPERVISED_LABEL)
+
+    return int(batches.loc[mask].nunique())
+
+
 def cyclic_evaluable_batch_count(
     dataset: str,
     dataset_file: str | None = None,
 ) -> int:
-    """Return the number of supervised batches in the selected source CSV."""
-    _, y, batches, _ = _load_research_source_dataset(dataset, dataset_file)
-    if dataset == ALZHEIMER_DATASET:
-        mask = y.astype(str).isin(ALZHEIMER_SUPERVISED_LABELS).to_numpy()
-        return int(batches.loc[mask].astype(str).nunique())
-    return int(batches.astype(str).nunique())
+    """Return supervised batch count without parsing all feature columns."""
+    filename = str(dataset_file or _default_research_source_filename(dataset))
+    path = resolve_dataset_matrix_file(ROOT, dataset, filename)
+    stat = path.stat()
+    return _cached_cyclic_evaluable_batch_count(
+        str(dataset),
+        str(path),
+        int(stat.st_mtime_ns),
+        int(stat.st_size),
+    )
 
 
 def _cross_validate_cyclic_submission(
