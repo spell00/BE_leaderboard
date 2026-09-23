@@ -219,13 +219,44 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def stage_uploaded_research_dataset(uploaded_file) -> tuple[str, str, str] | None:
-    """Stage one uploaded CSV as an ephemeral research dataset.
+def cleanup_uploaded_research_state(state) -> None:
+    """Delete one session-scoped staged research upload."""
+    if not state:
+        return
+    try:
+        target_dir = Path(state.get("target_dir", "")).resolve()
+        datasets_root = (ROOT / "data" / "datasets").resolve()
+        if (
+            target_dir.parent == datasets_root
+            and target_dir.name.startswith("uploaded_")
+            and target_dir.exists()
+        ):
+            shutil.rmtree(target_dir, ignore_errors=True)
+        dataset_id = str(state.get("dataset_id", ""))
+        if dataset_id.startswith("uploaded_"):
+            DATASET_LABELS.pop(dataset_id, None)
+    except Exception as exc:
+        print(f"[upload-cleanup] Could not remove temporary upload: {exc}", flush=True)
 
-    The staged copy lives under data/datasets so the existing research-CV
-    evaluator can use its normal safe dataset-file resolver. The content hash
-    gives concurrent uploads distinct dataset IDs and allows reuse within the
-    current app runtime.
+
+def cleanup_stale_uploaded_research_datasets() -> None:
+    """Remove staged uploads left behind by a previous app process."""
+    datasets_root = ROOT / "data" / "datasets"
+    if not datasets_root.exists():
+        return
+    for path in datasets_root.iterdir():
+        if path.is_dir() and path.name.startswith("uploaded_"):
+            shutil.rmtree(path, ignore_errors=True)
+
+
+def stage_uploaded_research_dataset(
+    uploaded_file,
+    session_key: str,
+) -> tuple[str, str, str, dict] | None:
+    """Stage one uploaded CSV only for the current browser session.
+
+    The copy is temporary and is deleted when the Gradio session state is
+    released. A session-specific dataset ID keeps concurrent users isolated.
     """
     source = _uploaded_file_path(uploaded_file)
     if source is None:
@@ -236,63 +267,68 @@ def stage_uploaded_research_dataset(uploaded_file) -> tuple[str, str, str] | Non
         raise FileNotFoundError(f"Uploaded CSV is no longer available: {source}")
 
     digest = _file_sha256(source)[:12]
-    dataset_id = f"uploaded_{digest}"
+    safe_session = "".join(ch for ch in str(session_key) if ch.isalnum())[:12] or "session"
+    dataset_id = f"uploaded_{safe_session}_{digest}"
     dataset_label = f"Uploaded — {source.name}"
     filename = f"{dataset_id}_all.csv"
     target_dir = ROOT / "data" / "datasets" / dataset_id
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / filename
 
-    if not target.exists() or target.stat().st_size != source.stat().st_size:
-        temporary = target.with_suffix(target.suffix + ".tmp")
-        shutil.copy2(source, temporary)
-        os.replace(temporary, target)
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    shutil.copy2(source, temporary)
+    os.replace(temporary, target)
 
+    header = pd.read_csv(target, nrows=0)
+    required = {"name", "batch", "label"}
+    missing = sorted(required - set(header.columns))
+    if missing:
+        shutil.rmtree(target_dir, ignore_errors=True)
+        raise ValueError(
+            "Uploaded CSV is missing required columns: " + ", ".join(missing)
+        )
+
+    n_samples = 0
+    batch_values = set()
+    class_values = set()
+    for chunk in pd.read_csv(
+        target,
+        usecols=["batch", "label"],
+        chunksize=100_000,
+    ):
+        n_samples += len(chunk)
+        batch_values.update(
+            chunk["batch"].dropna().astype(str).str.strip().tolist()
+        )
+        labels = chunk["label"].astype("string").str.strip()
+        labels = labels[
+            labels.notna()
+            & labels.ne("")
+            & labels.ne(UNSUPERVISED_LABEL)
+            & labels.ne("pool")
+        ]
+        class_values.update(labels.astype(str).tolist())
+
+    metadata = {
+        "dataset_id": dataset_id,
+        "source_name": source.name,
+        "n_samples": int(n_samples),
+        "n_features": int(max(len(header.columns) - 3, 0)),
+        "n_batches": int(len(batch_values)),
+        "n_classes": int(len(class_values)),
+    }
     metadata_path = target_dir / "research_metadata.json"
-    if not metadata_path.exists():
-        header = pd.read_csv(target, nrows=0)
-        required = {"name", "batch", "label"}
-        missing = sorted(required - set(header.columns))
-        if missing:
-            raise ValueError(
-                "Uploaded CSV is missing required columns: " + ", ".join(missing)
-            )
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
 
-        n_samples = 0
-        batch_values = set()
-        class_values = set()
-        for chunk in pd.read_csv(
-            target,
-            usecols=["batch", "label"],
-            chunksize=100_000,
-        ):
-            n_samples += len(chunk)
-            batch_values.update(
-                chunk["batch"].dropna().astype(str).str.strip().tolist()
-            )
-            labels = chunk["label"].astype("string").str.strip()
-            labels = labels[
-                labels.notna()
-                & labels.ne("")
-                & labels.ne(UNSUPERVISED_LABEL)
-                & labels.ne("pool")
-            ]
-            class_values.update(labels.astype(str).tolist())
-
-        metadata = {
-            "dataset_id": dataset_id,
-            "source_name": source.name,
-            "n_samples": int(n_samples),
-            "n_features": int(max(len(header.columns) - 3, 0)),
-            "n_batches": int(len(batch_values)),
-            "n_classes": int(len(class_values)),
-        }
-        temporary_metadata = metadata_path.with_suffix(".json.tmp")
-        temporary_metadata.write_text(json.dumps(metadata, indent=2) + "\n")
-        os.replace(temporary_metadata, metadata_path)
-
+    state = {
+        "dataset_id": dataset_id,
+        "target_dir": str(target_dir),
+    }
     DATASET_LABELS[dataset_id] = dataset_label
-    return dataset_id, filename, dataset_label
+    return dataset_id, filename, dataset_label, state
+
+
+cleanup_stale_uploaded_research_datasets()
 
 
 def real_dataset_choices(extra_dataset: tuple[str, str] | None = None):
@@ -349,8 +385,14 @@ def _uploaded_dataset_info(dataset_id: str, filename: str, label: str) -> str:
     )
 
 
-def sync_uploaded_dataset_to_real(uploaded_file):
-    """Atomically synchronize an uploaded CSV into the Real research controls."""
+def sync_uploaded_dataset_to_real(
+    uploaded_file,
+    upload_state=None,
+    request: gr.Request | None = None,
+):
+    """Synchronize one session-scoped uploaded CSV into research controls."""
+    cleanup_uploaded_research_state(upload_state)
+
     if not uploaded_file:
         dataset = "massbench_benchmark"
         source = default_dataset_source(dataset)
@@ -368,9 +410,14 @@ def sync_uploaded_dataset_to_real(uploaded_file):
             get_dataset_info(dataset),
             get_real_board(dataset, protocol, -1, source),
             *get_dataset_download_files(dataset),
+            None,
         )
 
-    dataset_id, filename, dataset_label = stage_uploaded_research_dataset(uploaded_file)
+    session_key = getattr(request, "session_hash", None) or "session"
+    dataset_id, filename, dataset_label, new_state = stage_uploaded_research_dataset(
+        uploaded_file,
+        session_key=session_key,
+    )
     protocol = "cyclic_batches"
     return (
         gr.update(
@@ -389,6 +436,7 @@ def sync_uploaded_dataset_to_real(uploaded_file):
         get_real_board(dataset_id, protocol, -1, filename),
         None,
         None,
+        new_state,
     )
 
 
@@ -1922,7 +1970,10 @@ def recommender_checkpoint_status() -> str:
     )
 
 
-with gr.Blocks(title="MassBench Batch Effects Leaderboard") as demo:
+with gr.Blocks(
+    title="MassBench Batch Effects Leaderboard",
+    delete_cache=(3600, 6 * 3600),
+) as demo:
     gr.Markdown(f"""
 # MassBench Batch Effects Classification Leaderboard
 
@@ -1933,6 +1984,11 @@ Run a reproducible server-side benchmark or propose a matrix-ready dataset.
 {get_baseline_text()}
 """)
     gr.LoginButton()
+
+    uploaded_research_state = gr.State(
+        value=None,
+        delete_callback=cleanup_uploaded_research_state,
+    )
 
     with gr.Accordion("BERNN Recommender", open=True):
         gr.Markdown(
@@ -2336,7 +2392,7 @@ Datasets are ordered by submission date.
 
             meta_upload.change(
                 fn=sync_uploaded_dataset_to_real,
-                inputs=[meta_upload],
+                inputs=[meta_upload, uploaded_research_state],
                 outputs=[
                     r_dataset_in,
                     r_source_file,
@@ -2348,6 +2404,7 @@ Datasets are ordered by submission date.
                     r_board_out,
                     r_train_download,
                     r_test_download,
+                    uploaded_research_state,
                 ],
                 queue=False,
             )
