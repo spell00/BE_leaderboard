@@ -1953,11 +1953,16 @@ def run_meta_recommendation(
             gr.update(interactive=True),
             gr.update(value=model_choice),
             generated_code,
-            gr.update(value=dataset) if not using_uploaded else gr.update(),
-            gr.update(value=requested_protocol) if not using_uploaded else gr.update(),
+            # Never overwrite the Real-dataset controls with a built-in
+            # recommender selection while an upload is active. During an upload
+            # those controls intentionally accept only the temporary uploaded_*
+            # dataset, and Gradio 6 validates output values against current
+            # dropdown choices.
+            gr.update(value=dataset) if not uploaded_file else gr.update(),
+            gr.update(value=requested_protocol) if not uploaded_file else gr.update(),
             gr.update(
                 value=(dataset_file or default_dataset_source(dataset))
-            ) if not using_uploaded else gr.update(),
+            ) if not uploaded_file else gr.update(),
         )
     except Exception as exc:
         print(
