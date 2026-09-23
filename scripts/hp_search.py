@@ -382,9 +382,12 @@ def run_cyclic_batch_trial(
             epoch_number = int(payload.get("epoch", 0)) + 1
             epoch_state["seen"] = max(epoch_state["seen"], epoch_number)
             current = float(payload.get("valid_mcc", np.nan))
-            if progress_callback is None or not np.isfinite(current):
+            best_current = float(payload.get("best_valid_mcc", current))
+            if progress_callback is None or not np.isfinite(best_current):
                 return
-            running_total = float(np.mean([*valid_scores, current]))
+            # BERNN restores the best-validation checkpoint at fold completion,
+            # so prune against an estimate of that same eventual objective.
+            running_total = float(np.mean([*valid_scores, best_current]))
             progress_callback({
                 "step": int(_offset + epoch_number),
                 "score": running_total,
@@ -393,7 +396,7 @@ def run_cyclic_batch_trial(
                 "folds_completed": int(len(valid_scores)),
                 "granularity": "epoch",
                 "current_fold_valid_mcc": current,
-                "best_current_fold_valid_mcc": float(payload.get("best_valid_mcc", current)),
+                "best_current_fold_valid_mcc": best_current,
             })
 
         trainer, valid_mcc = _fit_one(
@@ -1080,9 +1083,12 @@ def run_trial(
             epoch_number = int(payload.get("epoch", 0)) + 1
             epoch_state["seen"] = max(epoch_state["seen"], epoch_number)
             current = float(payload.get("valid_mcc", np.nan))
-            if progress_callback is None or not np.isfinite(current):
+            best_current = float(payload.get("best_valid_mcc", current))
+            if progress_callback is None or not np.isfinite(best_current):
                 return
-            running_total = float(np.mean([*fold_scores, current]))
+            # BERNN restores the best-validation checkpoint at fold completion,
+            # so prune against an estimate of that same eventual objective.
+            running_total = float(np.mean([*fold_scores, best_current]))
             progress_callback({
                 "step": int(_offset + epoch_number),
                 "score": running_total,
@@ -1091,7 +1097,7 @@ def run_trial(
                 "folds_completed": int(len(fold_scores)),
                 "granularity": "epoch",
                 "current_fold_valid_mcc": current,
-                "best_current_fold_valid_mcc": float(payload.get("best_valid_mcc", current)),
+                "best_current_fold_valid_mcc": best_current,
             })
 
         trainer, mcc = _fit_one(
