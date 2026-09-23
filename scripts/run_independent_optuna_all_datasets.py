@@ -37,6 +37,7 @@ from src.multifidelity_hpo import (
     deterministic_force_full,
     make_pruner,
 )
+from src.learning_curve_surrogate import backfill_multifidelity_totals
 
 DATASETS = (
     # New datasets first.
@@ -279,6 +280,7 @@ def persist_multifidelity_trials(output_dir: Path, study, max_resource: int) -> 
             "predicted_total": predicted_total,
             "partial_total": partial_total,
             "budget_step": step,
+            "max_resource": int(max_resource),
             "budget_fraction": float(np.clip(step / max(1, int(max_resource)), 0.0, 1.0)),
             "force_full": bool(attrs.get("force_full", False)),
             "would_prune_at_step": attrs.get("would_prune_at_step"),
@@ -365,6 +367,12 @@ def run_worker(args) -> int:
         "batches": batch_values,
         "selection_metric": "valid_mcc",
         "test_role": "monitoring_only_excluded_from_optuna",
+        "pruner": args.pruner,
+        "pruner_min_resource": int(args.pruner_min_resource),
+        "pruner_reduction_factor": int(args.pruner_reduction_factor),
+        "pruner_report_every": int(args.pruner_report_every),
+        "force_full_fraction": float(args.force_full_fraction),
+        "force_full_first": int(args.force_full_first),
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "wandb_run_id": meta.get("wandb_run_id") or uuid.uuid4().hex[:8],
     })
@@ -541,7 +549,10 @@ def run_worker(args) -> int:
                         "trial_number": int(current.number),
                         "trial/state_complete": 1,
                         "trial/force_full": int(force_full),
-                        "trial/budget_fraction": 1.0,
+                        "trial/budget_step": int(reporter.last_step),
+                        "trial/budget_fraction": float(
+                            np.clip(reporter.last_step / max_resource, 0.0, 1.0)
+                        ),
                         "metrics/valid_mcc": float(current.value),
                         "metrics/test_mcc": current_metrics.get("test_mcc"),
                         "runtime/fit_seconds": current.user_attrs.get("fit_seconds"),
@@ -589,12 +600,30 @@ def run_worker(args) -> int:
                     flush=True,
                 )
 
+        backfill = backfill_multifidelity_totals(
+            out,
+            max_warmup=max(1, min(50, args.n_epochs)),
+            seed=args.seed,
+            min_completed=3,
+        )
+        if backfill["predicted"]:
+            print(
+                f"[curve-total] {dataset}: predicted final totals for "
+                f"{backfill['predicted']} pruned trial(s) from "
+                f"{backfill['completed']} completed curves",
+                flush=True,
+            )
+
         best = max(completed(study), key=lambda x: float(x.value))
         best_metrics = dict(best.user_attrs.get("metrics", {}))
         summary = {
             "dataset": dataset,
             "protocol": protocol,
+            "attempted_trials": len(attempted(study)),
             "completed_trials": len(completed(study)),
+            "pruned_trials": len(attempted(study)) - len(completed(study)),
+            "curve_total_completed_labels": int(backfill["completed"]),
+            "curve_total_predictions": int(backfill["predicted"]),
             "best_trial_number": int(best.number),
             "best_valid_mcc": float(best.value),
             "paired_test_mcc_at_best_valid": best_metrics.get("test_mcc"),
