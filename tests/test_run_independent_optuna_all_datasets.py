@@ -6,13 +6,14 @@ from scripts.run_independent_optuna_all_datasets import (
 
 
 def test_default_dataset_order_puts_new_benchmarks_first():
-    assert [dataset for dataset, _ in DATASETS[:3]] == [
+    assert [dataset for dataset, _ in DATASETS[:4]] == [
         "jdlber_sle_maldi",
         "seqc_maqc",
+        "bacteria_2024_mz10",
         "scib_pancreas",
     ]
-    assert len(DATASETS) == 8
-    assert len({dataset for dataset, _ in DATASETS}) == 8
+    assert len(DATASETS) == 9
+    assert len({dataset for dataset, _ in DATASETS}) == 9
 
 
 def test_explicit_dataset_subset_keeps_requested_order():
