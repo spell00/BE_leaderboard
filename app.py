@@ -263,19 +263,81 @@ def real_dataset_choices(extra_dataset: tuple[str, str] | None = None):
     return choices
 
 
-def sync_uploaded_dataset_to_real(uploaded_file):
-    """Make the uploaded recommender CSV the active Real research dataset."""
-    if not uploaded_file:
+def real_protocol_summary(
+    protocol: str,
+    dataset: str,
+    source_file: str | None,
+) -> str:
+    source = source_file or default_dataset_source(dataset) or "selected file"
+    if protocol == "validation_only":
         return (
-            gr.update(choices=real_dataset_choices(), value="massbench_benchmark"),
+            f"**Selected: train/validation only.** Source: {source}. "
+            "The selected file is split by batch into rotating train/valid "
+            "folds. No test set and no inference file are supplied."
+        )
+    if protocol == "cyclic_batches":
+        return (
+            f"**Selected: rotating train/valid/test batch CV.** "
+            f"Source: {source}. -1 performs leave-one-batch-out; distinct "
+            "batch groups are used for train, validation, and test. "
+            "No *_inference.csv file is auto-loaded."
+        )
+    return (
+        "**Selected: official fixed external test.** The existing "
+        "server-managed training split and hidden/private external test "
+        "are used. The research source-file selector is ignored."
+    )
+
+
+def _uploaded_dataset_info(dataset_id: str, filename: str, label: str) -> str:
+    path = resolve_dataset_matrix_file(ROOT, dataset_id, filename)
+    frame = pd.read_csv(path)
+    n_samples = len(frame)
+    n_features = max(len(frame.columns) - 3, 0)
+    n_batches = frame["batch"].astype(str).nunique() if "batch" in frame.columns else 0
+    labels = (
+        frame["label"].dropna().astype(str)
+        if "label" in frame.columns
+        else pd.Series(dtype=str)
+    )
+    labels = labels[labels.str.strip().ne("")]
+    n_classes = labels.nunique()
+    return (
+        f"### {label}\n\n"
+        f"**Uploaded research dataset**\n\n"
+        f"| Metric | Value |\n"
+        f"|---|---:|\n"
+        f"| Samples | {n_samples:,} |\n"
+        f"| Features | {n_features:,} |\n"
+        f"| Batches | {n_batches:,} |\n"
+        f"| Labeled classes | {n_classes:,} |\n\n"
+        "This dataset is available for rotating research CV only; "
+        "it has no designated private external test split."
+    )
+
+
+def sync_uploaded_dataset_to_real(uploaded_file):
+    """Atomically synchronize an uploaded CSV into the Real research controls."""
+    if not uploaded_file:
+        dataset = "massbench_benchmark"
+        source = default_dataset_source(dataset)
+        protocol = "fixed_external"
+        return (
+            gr.update(choices=real_dataset_choices(), value=dataset),
             gr.update(
-                choices=dataset_source_choices("massbench_benchmark"),
-                value=default_dataset_source("massbench_benchmark"),
+                choices=dataset_source_choices(dataset),
+                value=source,
             ),
-            gr.update(value="fixed_external"),
+            gr.update(value=protocol),
+            real_protocol_summary(protocol, dataset, source),
+            "",
+            get_dataset_info(dataset),
+            get_real_board(dataset, protocol, -1, source),
+            *get_dataset_download_files(dataset),
         )
 
     dataset_id, filename, dataset_label = stage_uploaded_research_dataset(uploaded_file)
+    protocol = "cyclic_batches"
     return (
         gr.update(
             choices=real_dataset_choices((dataset_label, dataset_id)),
@@ -285,7 +347,13 @@ def sync_uploaded_dataset_to_real(uploaded_file):
             choices=[(f"Uploaded CSV — {Path(_uploaded_file_path(uploaded_file)).name}", filename)],
             value=filename,
         ),
-        gr.update(value="cyclic_batches"),
+        gr.update(value=protocol),
+        real_protocol_summary(protocol, dataset_id, filename),
+        cyclic_cv_status(dataset_id, protocol, -1, filename),
+        _uploaded_dataset_info(dataset_id, filename, dataset_label),
+        get_real_board(dataset_id, protocol, -1, filename),
+        None,
+        None,
     )
 
 
@@ -2020,31 +2088,6 @@ Submit batch correction and model code. Evaluation runs server-side.
                 value=get_dataset_info("massbench_benchmark"),
                 label="Dataset Information"
             )
-            def protocol_summary(
-                protocol: str,
-                dataset: str,
-                source_file: str | None,
-            ) -> str:
-                source = source_file or default_dataset_source(dataset) or "selected file"
-                if protocol == "validation_only":
-                    return (
-                        f"**Selected: train/validation only.** Source: {source}. "
-                        "The selected file is split by batch into rotating train/valid "
-                        "folds. No test set and no inference file are supplied."
-                    )
-                if protocol == "cyclic_batches":
-                    return (
-                        f"**Selected: rotating train/valid/test batch CV.** "
-                        f"Source: {source}. -1 performs leave-one-batch-out; distinct "
-                        "batch groups are used for train, validation, and test. "
-                        "No *_inference.csv file is auto-loaded."
-                    )
-                return (
-                    "**Selected: official fixed external test.** The existing "
-                    "server-managed training split and hidden/private external test "
-                    "are used. The research source-file selector is ignored."
-                )
-
             def source_file_state(dataset: str):
                 choices = dataset_source_choices(dataset)
                 return gr.update(
@@ -2052,7 +2095,7 @@ Submit batch correction and model code. Evaluation runs server-side.
                     value=default_dataset_source(dataset),
                 )
 
-            r_dataset_in.change(
+            r_dataset_in.input(
                 fn=source_file_state,
                 inputs=[r_dataset_in],
                 outputs=[r_source_file],
@@ -2081,8 +2124,8 @@ Submit batch correction and model code. Evaluation runs server-side.
             )
 
             for _component in (r_eval_protocol, r_dataset_in, r_source_file):
-                _component.change(
-                    fn=protocol_summary,
+                _component.input(
+                    fn=real_protocol_summary,
                     inputs=[r_eval_protocol, r_dataset_in, r_source_file],
                     outputs=[r_protocol_summary],
                     queue=False,
@@ -2101,7 +2144,7 @@ Submit batch correction and model code. Evaluation runs server-side.
                 r_cyclic_cv_folds,
                 r_source_file,
             ):
-                _component.change(
+                _component.input(
                     fn=cv_control_state,
                     inputs=[
                         r_eval_protocol,
@@ -2119,30 +2162,30 @@ Submit batch correction and model code. Evaluation runs server-side.
                 wrap=True,
                 interactive=False,
             )
-            r_dataset_in.change(
+            r_dataset_in.input(
                 fn=get_dataset_info,
                 inputs=[r_dataset_in],
                 outputs=[r_dataset_info],
             )
             # Update Real Leaderboard table when dataset changes
-            r_dataset_in.change(
+            r_dataset_in.input(
                 fn=get_real_board,
                 inputs=[r_dataset_in, r_eval_protocol, r_cyclic_cv_folds, r_source_file],
                 outputs=[r_board_out],
             )
-            r_eval_protocol.change(
-                fn=get_real_board,
-                inputs=[r_dataset_in, r_eval_protocol, r_cyclic_cv_folds, r_source_file],
-                outputs=[r_board_out],
-                queue=False,
-            )
-            r_cyclic_cv_folds.change(
+            r_eval_protocol.input(
                 fn=get_real_board,
                 inputs=[r_dataset_in, r_eval_protocol, r_cyclic_cv_folds, r_source_file],
                 outputs=[r_board_out],
                 queue=False,
             )
-            r_source_file.change(
+            r_cyclic_cv_folds.input(
+                fn=get_real_board,
+                inputs=[r_dataset_in, r_eval_protocol, r_cyclic_cv_folds, r_source_file],
+                outputs=[r_board_out],
+                queue=False,
+            )
+            r_source_file.input(
                 fn=get_real_board,
                 inputs=[r_dataset_in, r_eval_protocol, r_cyclic_cv_folds, r_source_file],
                 outputs=[r_board_out],
@@ -2186,7 +2229,7 @@ Datasets are ordered by submission date.
                     value=str(ROOT / "data" / "datasets" / "massbench_benchmark" / "massbench_benchmark_test.csv"),
                     interactive=False,
                 )
-            r_dataset_in.change(
+            r_dataset_in.input(
                 fn=get_dataset_download_files,
                 inputs=[r_dataset_in],
                 outputs=[r_train_download, r_test_download],
@@ -2259,7 +2302,17 @@ Datasets are ordered by submission date.
             meta_upload.change(
                 fn=sync_uploaded_dataset_to_real,
                 inputs=[meta_upload],
-                outputs=[r_dataset_in, r_source_file, r_eval_protocol],
+                outputs=[
+                    r_dataset_in,
+                    r_source_file,
+                    r_eval_protocol,
+                    r_protocol_summary,
+                    r_cv_status,
+                    r_dataset_info,
+                    r_board_out,
+                    r_train_download,
+                    r_test_download,
+                ],
                 queue=False,
             )
 
