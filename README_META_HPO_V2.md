@@ -469,3 +469,71 @@ config = predict_from_checkpoint(
 
 This loads the meta network and returns a BERNN configuration. Training BERNN on
 that configuration is a separate step.
+
+
+---
+
+# Independent Optuna refresh across every current dataset
+
+Use the dedicated two-GPU launcher when each dataset must have its own Optuna
+study rather than sharing one meta/evolutionary search.
+
+```bash
+python scripts/run_independent_optuna_all_datasets.py \
+  --n-trials 20 \
+  --n-epochs 1000 \
+  --gpus 0,1 \
+  --prepare-missing \
+  --output-dir results/independent_optuna_all_20 \
+  --wandb-group independent-optuna-all-datasets-20
+```
+
+The queue is intentionally new-first:
+
+```text
+jdlber_sle_maldi
+seqc_maqc
+scib_pancreas
+normal_tissue_878
+colon_3041
+massbench_adenocarcinoma
+massbench_benchmark
+massbench_alzheimer
+```
+
+Every dataset owns a separate Optuna SQLite database and a separate W&B run
+inside the common group. Two dataset workers run concurrently, one per GPU.
+When one finishes, the next queued dataset takes that GPU.
+
+The five existing meta-HPO datasets retain the fixed-external protocol used by
+the previous trial bank: grouped-CV validation MCC is the Optuna objective and
+the labeled `*_inference.csv` cross-test is monitoring-only. The three new
+whole-dataset benchmarks use cyclic batch train/valid/test on `*_all.csv`.
+In both protocols, test scores are excluded from Optuna selection.
+
+Every trial now persists and logs:
+
+- mean validation MCC;
+- every validation-fold MCC;
+- paired test/cross-test MCC;
+- every test-fold MCC;
+- test fold mean and standard deviation when applicable;
+- cyclic global out-of-fold test MCC when applicable;
+- all other scalar validation/test metrics returned by BERNN;
+- the sampled hyperparameters and fit time.
+
+Resume an interrupted experiment without mixing studies:
+
+```bash
+python scripts/run_independent_optuna_all_datasets.py \
+  --n-trials 20 \
+  --n-epochs 1000 \
+  --gpus 0,1 \
+  --output-dir results/independent_optuna_all_20 \
+  --wandb-group independent-optuna-all-datasets-20 \
+  --resume
+```
+
+DRIAMS is not included in this list until a compact prepared dataset is actually
+available in the repository; it should be added as another independent study
+rather than silently falling back to the 145 GB upstream download.
