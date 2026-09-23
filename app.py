@@ -411,10 +411,24 @@ def sync_uploaded_dataset_to_real(
         source = default_dataset_source(dataset)
         protocol = "fixed_external"
         return (
-            gr.update(choices=real_dataset_choices(), value=dataset),
+            gr.update(
+                choices=real_dataset_choices(),
+                value=dataset,
+                label="Dataset",
+                info=None,
+                interactive=True,
+            ),
             gr.update(
                 choices=dataset_source_choices(dataset),
                 value=source,
+                label="Dataset file for research CV",
+                info=(
+                    "Defaults to *_all.csv (train + public test). You can instead "
+                    "use *_train.csv. Rows without labels are ignored by CV. "
+                    "Official fixed-external leaderboard mode keeps its existing "
+                    "server-managed train/private-test behavior."
+                ),
+                interactive=True,
             ),
             gr.update(value=protocol),
             gr.update(value=-1, visible=False),
@@ -431,15 +445,25 @@ def sync_uploaded_dataset_to_real(
         uploaded_file,
         session_key=session_key,
     )
+    upload_name = Path(_uploaded_file_path(uploaded_file)).name
     protocol = "cyclic_batches"
     return (
         gr.update(
-            choices=real_dataset_choices((dataset_label, dataset_id)),
+            choices=[(f"Uploaded CSV — {upload_name}", dataset_id)],
             value=dataset_id,
+            label="Uploaded dataset",
+            info="Temporary custom upload selected. Built-in datasets are disabled while this upload is active.",
+            interactive=False,
         ),
         gr.update(
-            choices=[(f"Uploaded CSV — {Path(_uploaded_file_path(uploaded_file)).name}", filename)],
+            choices=[(f"Uploaded CSV — {upload_name}", filename)],
             value=filename,
+            label="Uploaded CSV used for research CV",
+            info=(
+                "This temporary uploaded CSV is the sole source for research CV. "
+                "It is not added to the permanent dataset collection."
+            ),
+            interactive=False,
         ),
         gr.update(value=protocol),
         gr.update(value=-1, visible=True),
