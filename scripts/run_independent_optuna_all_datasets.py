@@ -161,11 +161,18 @@ def attempted(study):
     terminal = {
         optuna.trial.TrialState.COMPLETE,
         optuna.trial.TrialState.PRUNED,
-        optuna.trial.TrialState.FAIL,
     }
     return [
         trial for trial in study.get_trials(deepcopy=False)
         if trial.state in terminal
+    ]
+
+
+def failed_trials(study):
+    import optuna
+    return [
+        trial for trial in study.get_trials(deepcopy=False)
+        if trial.state == optuna.trial.TrialState.FAIL
     ]
 
 
@@ -646,16 +653,14 @@ def run_worker(args) -> int:
         summary = {
             "dataset": dataset,
             "protocol": protocol,
-            "attempted_trials": len(attempted(study)),
+            "counted_trials": len(attempted(study)),
+            "attempted_trials": len(attempted(study)) + len(failed_trials(study)),
             "completed_trials": len(completed(study)),
             "pruned_trials": sum(
                 trial.state == optuna.trial.TrialState.PRUNED
                 for trial in attempted(study)
             ),
-            "failed_trials": sum(
-                trial.state == optuna.trial.TrialState.FAIL
-                for trial in attempted(study)
-            ),
+            "failed_trials": len(failed_trials(study)),
             "curve_total_completed_labels": int(backfill["completed"]),
             "curve_total_predictions": int(backfill["predicted"]),
             "best_trial_number": int(best.number),
