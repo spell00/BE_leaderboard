@@ -135,3 +135,40 @@ python scripts/download_prepare_scib_pancreas.py --max-features 4096
 python scripts/download_prepare_scib_pancreas.py --figshare-file FILE.h5ad
 ```
 
+
+
+## SEQC / MAQC-III: compact held-out batch-effect test
+
+For a small cross-site RNA-seq test, the repository can prepare a compact
+SEQC/MAQC-III matrix directly from the Bioconductor `seqc` experiment package.
+
+Prepare it locally:
+
+```bash
+python scripts/download_prepare_seqc_maqc.py
+```
+
+The script uses the six Illumina HiSeq sites `AGR`, `BGI`, `CNL`, `COH`,
+`MAY`, and `NVS`. Lane/flowcell columns are summed to one row per prepared
+A/B/C/D replicate, giving 108 samples total. The site is the batch and A/B/C/D
+is the class label.
+
+Every non-ERCC RefSeq gene is retained. There is no variance filtering, PCA, or
+top-gene selection. Counts are normalized to CPM within each prepared replicate
+and transformed with `log1p`.
+
+Generated files:
+
+```text
+data/datasets/seqc_maqc/seqc_maqc_all.csv
+data/datasets/seqc_maqc/seqc_maqc_train.csv
+data/datasets/seqc_maqc/provenance.json
+```
+
+To upload the prepared files to the leaderboard Hugging Face Dataset repository:
+
+```bash
+python scripts/download_prepare_seqc_maqc.py --upload-hf
+```
+
+Use `--overwrite` to intentionally replace an existing local preparation.
