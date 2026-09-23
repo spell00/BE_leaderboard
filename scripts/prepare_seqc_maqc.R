@@ -151,10 +151,9 @@ main <- function() {
   dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
 
   all_path <- file.path(outdir, paste0(dataset_id, "_all.csv"))
-  train_path <- file.path(outdir, paste0(dataset_id, "_train.csv"))
   provenance_path <- file.path(outdir, "provenance.json")
 
-  if (!args$overwrite && (file.exists(all_path) || file.exists(train_path))) {
+  if (!args$overwrite && file.exists(all_path)) {
     stop(sprintf("Output already exists under %s. Re-run with --overwrite to replace it.", outdir))
   }
 
@@ -203,7 +202,6 @@ main <- function() {
 
   message(sprintf("[seqc] Writing %d samples x %d features", nrow(combined), length(feature_names)))
   data.table::fwrite(combined, all_path)
-  file.copy(all_path, train_path, overwrite = TRUE)
 
   provenance <- list(
     dataset = dataset_id,
@@ -227,7 +225,6 @@ main <- function() {
   writeLines(jsonlite::toJSON(provenance, auto_unbox = TRUE, pretty = TRUE), provenance_path)
 
   message(sprintf("[done] %s", all_path))
-  message(sprintf("[done] %s", train_path))
   message(sprintf("[done] %s", provenance_path))
 }
 
