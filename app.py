@@ -272,7 +272,7 @@ def sync_uploaded_dataset_to_real(uploaded_file):
                 choices=dataset_source_choices("massbench_benchmark"),
                 value=default_dataset_source("massbench_benchmark"),
             ),
-            gr.update(value="cyclic_batches"),
+            gr.update(value="fixed_external"),
         )
 
     dataset_id, filename, dataset_label = stage_uploaded_research_dataset(uploaded_file)
