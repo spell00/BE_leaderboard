@@ -5,7 +5,9 @@ import os
 import sys
 import traceback
 import argparse
+import hashlib
 import pickle
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -207,6 +209,84 @@ def update_meta_source_for_upload(uploaded_file, dataset: str):
         else default_dataset_source(dataset)
     )
     return gr.update(choices=choices, value=value)
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def stage_uploaded_research_dataset(uploaded_file) -> tuple[str, str, str] | None:
+    """Stage one uploaded CSV as an ephemeral research dataset.
+
+    The staged copy lives under data/datasets so the existing research-CV
+    evaluator can use its normal safe dataset-file resolver. The content hash
+    gives concurrent uploads distinct dataset IDs and allows reuse within the
+    current app runtime.
+    """
+    source = _uploaded_file_path(uploaded_file)
+    if source is None:
+        return None
+    if source.suffix.lower() != ".csv":
+        raise ValueError("Uploaded research dataset must be a CSV file")
+    if not source.exists():
+        raise FileNotFoundError(f"Uploaded CSV is no longer available: {source}")
+
+    digest = _file_sha256(source)[:12]
+    dataset_id = f"uploaded_{digest}"
+    dataset_label = f"Uploaded — {source.name}"
+    filename = f"{dataset_id}_all.csv"
+    target_dir = ROOT / "data" / "datasets" / dataset_id
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / filename
+
+    if not target.exists() or target.stat().st_size != source.stat().st_size:
+        temporary = target.with_suffix(target.suffix + ".tmp")
+        shutil.copy2(source, temporary)
+        os.replace(temporary, target)
+
+    DATASET_LABELS[dataset_id] = dataset_label
+    return dataset_id, filename, dataset_label
+
+
+def real_dataset_choices(extra_dataset: tuple[str, str] | None = None):
+    choices = [
+        (label, key)
+        for key, label in DATASET_LABELS.items()
+        if not key.startswith("uploaded_")
+    ]
+    if extra_dataset is not None:
+        choices.append(extra_dataset)
+    return choices
+
+
+def sync_uploaded_dataset_to_real(uploaded_file):
+    """Make the uploaded recommender CSV the active Real research dataset."""
+    if not uploaded_file:
+        return (
+            gr.update(choices=real_dataset_choices(), value="massbench_benchmark"),
+            gr.update(
+                choices=dataset_source_choices("massbench_benchmark"),
+                value=default_dataset_source("massbench_benchmark"),
+            ),
+            gr.update(value="cyclic_batches"),
+        )
+
+    dataset_id, filename, dataset_label = stage_uploaded_research_dataset(uploaded_file)
+    return (
+        gr.update(
+            choices=real_dataset_choices((dataset_label, dataset_id)),
+            value=dataset_id,
+        ),
+        gr.update(
+            choices=[(f"Uploaded CSV — {Path(_uploaded_file_path(uploaded_file)).name}", filename)],
+            value=filename,
+        ),
+        gr.update(value="cyclic_batches"),
+    )
 
 
 def inference_file_choices(dataset: str):
@@ -935,6 +1015,13 @@ def submit_real(
     )
     if not dataset.strip():
         return get_real_board(dataset), "Dataset is required.", ""
+    if dataset.startswith("uploaded_") and evaluation_protocol == "fixed_external":
+        return (
+            get_real_board(dataset, "cyclic_batches", cyclic_cv_folds, dataset_file),
+            "Uploaded single-file datasets do not have a designated external test split. "
+            "Use rotating train/valid/test or train/valid-only research mode.",
+            "",
+        )
     if not team:
         return get_real_board(dataset), "Please sign in with Hugging Face before submitting.", ""
     if not model_name.strip():
@@ -962,6 +1049,7 @@ def submit_real(
         cyclic_leaderboard_eligible = (
             evaluation_protocol == "cyclic_batches"
             and cyclic_cv_folds in {-1, 5}
+            and not dataset.startswith("uploaded_")
         )
 
     logs_buffer = _RunLogCapture(_new_run_log_path(team, model_name, dataset))
@@ -1143,10 +1231,16 @@ def submit_real(
                     + " leaderboard."
                 )
             else:
-                msg += (
-                    f"\n\n{cyclic_cv_folds}-fold rotating CV is research-only and "
-                    "does not count for a leaderboard. Only -1 (LBO) and 5 are leaderboard modes."
-                )
+                if dataset.startswith("uploaded_"):
+                    msg += (
+                        "\n\nUploaded datasets are evaluated as research-only and "
+                        "are not written to the shared leaderboard."
+                    )
+                else:
+                    msg += (
+                        f"\n\n{cyclic_cv_folds}-fold rotating CV is research-only and "
+                        "does not count for a leaderboard. Only -1 (LBO) and 5 are leaderboard modes."
+                    )
             return _finish(
                 get_real_board(dataset, evaluation_protocol, cyclic_cv_folds, dataset_file),
                 msg,
@@ -1648,14 +1742,10 @@ def run_meta_recommendation(
             gr.update(value=model_choice),
             generated_code,
             gr.update(value=dataset) if not using_uploaded else gr.update(),
-            gr.update(value=requested_protocol),
+            gr.update(value=requested_protocol) if not using_uploaded else gr.update(),
             gr.update(
-                value=(
-                    dataset_file or default_dataset_source(dataset)
-                    if not using_uploaded
-                    else None
-                )
-            ),
+                value=(dataset_file or default_dataset_source(dataset))
+            ) if not using_uploaded else gr.update(),
         )
     except Exception as exc:
         print(
@@ -1866,7 +1956,7 @@ Submit batch correction and model code. Evaluation runs server-side.
             r_model_in = gr.Textbox(label="Submission Name", value="my_submission")
 
             r_dataset_in = gr.Dropdown(
-                choices=[(label, key) for key, label in DATASET_LABELS.items()],
+                choices=real_dataset_choices(),
                 value="massbench_benchmark",
                 label="Dataset",
             )
@@ -2164,6 +2254,13 @@ Datasets are ordered by submission date.
                 fn=lambda x: load_baseline(x, False),
                 inputs=[r_model_baseline],
                 outputs=[r_model_code],
+            )
+
+            meta_upload.change(
+                fn=sync_uploaded_dataset_to_real,
+                inputs=[meta_upload],
+                outputs=[r_dataset_in, r_source_file, r_eval_protocol],
+                queue=False,
             )
 
             meta_run.click(
