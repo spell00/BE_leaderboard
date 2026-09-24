@@ -296,10 +296,27 @@ def main(argv=None):
     install_fp16_training()
 
     out = args.output_dir / DATASET
+    run_meta_path = out / "run_metadata.json"
+
+    # Never mix trials produced by the earlier five-fold mz10 protocol with
+    # the new three-fold protocol. Preserve the old directory for auditability.
+    if run_meta_path.exists():
+        previous_meta = json.loads(run_meta_path.read_text())
+        previous_folds = previous_meta.get("cv_folds")
+        if previous_folds is not None and int(previous_folds) != N_SPLITS:
+            suffix = f"_archive_cv{int(previous_folds)}_{int(time.time())}"
+            archive = out.with_name(out.name + suffix)
+            out.rename(archive)
+            print(
+                f"[bacteria resume] archived incompatible {previous_folds}-fold "
+                f"results to {archive}",
+                flush=True,
+            )
+            run_meta_path = out / "run_metadata.json"
+
     out.mkdir(parents=True, exist_ok=True)
     atomic_json(out / "split_groups.json", split_payload)
 
-    run_meta_path = out / "run_metadata.json"
     exists = run_meta_path.exists()
     if exists and not args.resume:
         raise FileExistsError(f"{out} already exists; pass --resume")
