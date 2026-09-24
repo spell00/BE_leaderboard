@@ -8,7 +8,10 @@ datasets first.
 Existing datasets keep the meta-hpo-bank fixed-external protocol: Optuna sees
 only grouped-CV validation MCC, while the labeled *_inference.csv cross-test is
 monitoring-only. New whole-dataset benchmarks use cyclic batch train/valid/test
-on *_all.csv; test MCC is likewise excluded from selection.
+on *_all.csv; test MCC is likewise excluded from selection. The paper-aligned
+bacteria_2024_mz10 dataset is the one exception: it stays in its compact sparse
+bundle and is dispatched through its dedicated runner instead of requiring an
+_all.csv duplicate.
 """
 
 from __future__ import annotations
@@ -718,28 +721,51 @@ def run_launcher(args) -> int:
             if gpu in active or not queue:
                 continue
             dataset, protocol = queue.pop(0)
-            cmd = [
-                sys.executable, str(Path(__file__).resolve()),
-                "--worker-dataset", dataset, "--worker-protocol", protocol,
-                "--output-dir", str(args.output_dir),
-                "--n-trials", str(args.n_trials), "--n-epochs", str(args.n_epochs),
-                "--n-repeats", str(args.n_repeats), "--batch-size", str(args.batch_size),
-                "--num-workers", str(args.num_workers), "--seed", str(args.seed),
-                "--wandb-project", args.wandb_project, "--wandb-group", args.wandb_group,
-                "--pruner", args.pruner,
-                "--pruner-min-resource", str(args.pruner_min_resource),
-                "--pruner-reduction-factor", str(args.pruner_reduction_factor),
-                "--pruner-bootstrap-count", str(args.pruner_bootstrap_count),
-                "--pruner-report-every", str(args.pruner_report_every),
-                "--force-full-fraction", str(args.force_full_fraction),
-                "--force-full-first", str(args.force_full_first),
-            ]
-            if args.resume:
-                cmd.append("--resume")
-            if args.no_wandb:
-                cmd.append("--no-wandb")
-            if args.prepare_missing:
-                cmd.append("--prepare-missing")
+            if dataset == "bacteria_2024_mz10":
+                # Keep the bacteria matrix in its existing CSR + metadata bundle.
+                # Its dedicated runner implements the paper-aligned five-group
+                # cyclic train/valid/test protocol and FP16 training without
+                # materializing a multi-GB *_all.csv duplicate.
+                cmd = [
+                    sys.executable,
+                    str(ROOT / "scripts" / "run_bacteria_2024_mz10_optuna.py"),
+                    "--output-dir", str(args.output_dir),
+                    "--n-trials", str(args.n_trials),
+                    "--n-epochs", str(args.n_epochs),
+                    "--batch-size", str(args.batch_size),
+                    "--num-workers", str(args.num_workers),
+                    "--seed", str(args.seed),
+                    "--device", "cuda",
+                    "--wandb-project", args.wandb_project,
+                    "--wandb-group", args.wandb_group,
+                ]
+                if args.resume:
+                    cmd.append("--resume")
+                if args.no_wandb:
+                    cmd.append("--no-wandb")
+            else:
+                cmd = [
+                    sys.executable, str(Path(__file__).resolve()),
+                    "--worker-dataset", dataset, "--worker-protocol", protocol,
+                    "--output-dir", str(args.output_dir),
+                    "--n-trials", str(args.n_trials), "--n-epochs", str(args.n_epochs),
+                    "--n-repeats", str(args.n_repeats), "--batch-size", str(args.batch_size),
+                    "--num-workers", str(args.num_workers), "--seed", str(args.seed),
+                    "--wandb-project", args.wandb_project, "--wandb-group", args.wandb_group,
+                    "--pruner", args.pruner,
+                    "--pruner-min-resource", str(args.pruner_min_resource),
+                    "--pruner-reduction-factor", str(args.pruner_reduction_factor),
+                    "--pruner-bootstrap-count", str(args.pruner_bootstrap_count),
+                    "--pruner-report-every", str(args.pruner_report_every),
+                    "--force-full-fraction", str(args.force_full_fraction),
+                    "--force-full-first", str(args.force_full_first),
+                ]
+                if args.resume:
+                    cmd.append("--resume")
+                if args.no_wandb:
+                    cmd.append("--no-wandb")
+                if args.prepare_missing:
+                    cmd.append("--prepare-missing")
 
             env = os.environ.copy()
             env["CUDA_VISIBLE_DEVICES"] = gpu
