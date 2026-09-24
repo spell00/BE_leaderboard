@@ -302,7 +302,9 @@ def load_cyclic_dataset(name: str, source_file: str | None = None):
     return X, y, batches
 
 
-def run_cyclic_batch_trial(cfg: dict, args, data, exp_id: str):
+def run_cyclic_batch_trial(
+    cfg: dict, args, data, exp_id: str, progress_callback=None,
+):
     """Evaluate one BERNN config with symmetric cyclic batch roles.
 
     Every batch is validation exactly once and test exactly once. For N>3,
@@ -340,6 +342,7 @@ def run_cyclic_batch_trial(cfg: dict, args, data, exp_id: str):
     epoch_traces_by_fold = {}
     oof_test_predictions = np.full(len(y), "", dtype=object)
     oof_test_mask = np.zeros(len(y), dtype=bool)
+    completed_epoch_offset = 0
 
     for fold_idx, split in enumerate(splits):
         train_idx = split["train_idx"]
@@ -373,6 +376,29 @@ def run_cyclic_batch_trial(cfg: dict, args, data, exp_id: str):
         )
 
         fold_exp_id = f"{exp_id}_fold{fold_idx}"
+        epoch_state = {"seen": 0}
+
+        def on_epoch(payload, _fold_idx=fold_idx, _offset=completed_epoch_offset):
+            epoch_number = int(payload.get("epoch", 0)) + 1
+            epoch_state["seen"] = max(epoch_state["seen"], epoch_number)
+            current = float(payload.get("valid_mcc", np.nan))
+            best_current = float(payload.get("best_valid_mcc", current))
+            if progress_callback is None or not np.isfinite(best_current):
+                return
+            # BERNN restores the best-validation checkpoint at fold completion,
+            # so prune against an estimate of that same eventual objective.
+            running_total = float(np.mean([*valid_scores, best_current]))
+            progress_callback({
+                "step": int(_offset + epoch_number),
+                "score": running_total,
+                "fold": int(_fold_idx),
+                "epoch": int(epoch_number),
+                "folds_completed": int(len(valid_scores)),
+                "granularity": "epoch",
+                "current_fold_valid_mcc": current,
+                "best_current_fold_valid_mcc": best_current,
+            })
+
         trainer, valid_mcc = _fit_one(
             cfg,
             fold_args,
@@ -380,6 +406,7 @@ def run_cyclic_batch_trial(cfg: dict, args, data, exp_id: str):
             fold_exp_id,
             seed=int(getattr(args, "seed", 42)) + fold_idx,
             keep_models=False,
+            epoch_callback=on_epoch if progress_callback is not None else None,
         )
 
         try:
@@ -424,6 +451,31 @@ def run_cyclic_batch_trial(cfg: dict, args, data, exp_id: str):
             "test_mcc": test_mcc,
         })
         fold_metrics.append(metrics)
+
+        observed_epochs = int(epoch_state["seen"])
+        if epoch_traces:
+            observed_epochs = max(
+                observed_epochs,
+                max(int(row.get("epoch", -1)) + 1 for row in epoch_traces),
+            )
+        if observed_epochs <= 0:
+            observed_epochs = int(args.n_epochs)
+        completed_epoch_offset += observed_epochs
+
+        if (
+            progress_callback is not None
+            and not getattr(trainer, "_external_epoch_callback_supported", False)
+        ):
+            progress_callback({
+                "step": int(completed_epoch_offset),
+                "score": float(np.mean(valid_scores)),
+                "fold": int(fold_idx),
+                "epoch": int(observed_epochs),
+                "folds_completed": int(len(valid_scores)),
+                "granularity": "fold",
+                "current_fold_valid_mcc": float(valid_mcc),
+                "best_current_fold_valid_mcc": float(valid_mcc),
+            })
 
         print(
             f"[cyclic cv] round {fold_idx + 1}/{n_rounds} "
@@ -685,7 +737,10 @@ def _close_fit_resources(trainer) -> None:
         pass
 
 
-def _fit_one(cfg, args, data, exp_id: str, seed: int, keep_models: bool):
+def _fit_one(
+    cfg, args, data, exp_id: str, seed: int, keep_models: bool,
+    epoch_callback=None,
+):
     """One stable BERNN fit. Returns (trainer, heldout_mcc_or_monitor_mcc).
 
     BERNN fit is sklearn-style: train on X/y only. If data contains an external
@@ -708,14 +763,26 @@ def _fit_one(cfg, args, data, exp_id: str, seed: int, keep_models: bool):
     tc = build_trainer_config(cfg, args, exp_id)
     set_bernn_seed(seed)       # reproducibility: same config/seed -> same result
     trainer_cls = TrainAEThenClassifierHoldout if cfg.get("model_type") == "two_stage" else TrainAEClassifierHoldout
-    trainer = trainer_cls(
-        # BERNN's aggregate metrics hook includes the expensive LISI diagnostics.
-        # HPO scoring is computed directly below, so these diagnostics are not
-        # needed for model selection and are intentionally disabled.
-        config=tc, log_metrics=False, keep_models=keep_models, log_mlflow=True,
+    import inspect
+
+    trainer_kwargs = {
+        "config": tc,
+        "log_metrics": False,
+        "keep_models": keep_models,
+        "log_mlflow": True,
+    }
+    # Newer BERNN versions expose an explicit observer after every held-out
+    # validation epoch. Never rely on **kwargs swallowing this argument: an old
+    # BERNN must fall back to fold-level reporting rather than pretending that
+    # epoch-level pruning is active.
+    supports_epoch_callback = "epoch_callback" in inspect.signature(trainer_cls.__init__).parameters
+    if epoch_callback is not None and supports_epoch_callback:
+        trainer_kwargs["epoch_callback"] = epoch_callback
+    trainer = trainer_cls(**trainer_kwargs)
+    trainer._external_epoch_callback_supported = bool(
+        epoch_callback is not None and supports_epoch_callback
     )
     trainer.seed = int(seed)   # vary stochastic BERNN initialization across folds
-    import inspect
 
     fit_sig = inspect.signature(trainer.fit)
     legacy_holdout_args = {"X_test", "y_test", "batches_test"}
@@ -908,7 +975,10 @@ def _aggregate_fold_metrics(fold_metrics: list[dict]) -> dict:
     return out
 
 
-def run_trial(cfg: dict, args, data, exp_id: str, fixed_test_data=None):
+def run_trial(
+    cfg: dict, args, data, exp_id: str, fixed_test_data=None,
+    progress_callback=None,
+):
     """Run one BERNN train/eval trial.
 
     One sampled config is evaluated over the resolved CV folds. ``n_repeats=-1``
@@ -921,6 +991,7 @@ def run_trial(cfg: dict, args, data, exp_id: str, fixed_test_data=None):
     epoch_traces_by_fold = {}
     fixed_test_predictions = []
     fixed_test_mcc_scores = []
+    completed_epoch_offset = 0
     resolved_n_repeats = int(getattr(args, "resolved_n_repeats", resolve_n_repeats(args.n_repeats, batches)))
     is_alzheimer = getattr(args, "dataset", "") == ALZHEIMER_DATASET
     X_fixed = y_fixed = batches_fixed = None
@@ -1006,6 +1077,29 @@ def run_trial(cfg: dict, args, data, exp_id: str, fixed_test_data=None):
             f"test_batches={sorted(fixed_batch_values)}",
             flush=True,
         )
+        epoch_state = {"seen": 0}
+
+        def on_epoch(payload, _fold_idx=fold_idx, _offset=completed_epoch_offset):
+            epoch_number = int(payload.get("epoch", 0)) + 1
+            epoch_state["seen"] = max(epoch_state["seen"], epoch_number)
+            current = float(payload.get("valid_mcc", np.nan))
+            best_current = float(payload.get("best_valid_mcc", current))
+            if progress_callback is None or not np.isfinite(best_current):
+                return
+            # BERNN restores the best-validation checkpoint at fold completion,
+            # so prune against an estimate of that same eventual objective.
+            running_total = float(np.mean([*fold_scores, best_current]))
+            progress_callback({
+                "step": int(_offset + epoch_number),
+                "score": running_total,
+                "fold": int(_fold_idx),
+                "epoch": int(epoch_number),
+                "folds_completed": int(len(fold_scores)),
+                "granularity": "epoch",
+                "current_fold_valid_mcc": current,
+                "best_current_fold_valid_mcc": best_current,
+            })
+
         trainer, mcc = _fit_one(
             cfg,
             fold_args,
@@ -1013,6 +1107,7 @@ def run_trial(cfg: dict, args, data, exp_id: str, fixed_test_data=None):
             fold_exp_id,
             seed=int(getattr(args, "seed", 42)) + fold_idx,
             keep_models=False,
+            epoch_callback=on_epoch if progress_callback is not None else None,
         )
         metrics = extract_mlflow_metrics(fold_exp_id)
         epoch_traces = extract_mlflow_epoch_traces(fold_exp_id)
@@ -1042,6 +1137,32 @@ def run_trial(cfg: dict, args, data, exp_id: str, fixed_test_data=None):
         metrics["fold"] = float(fold_idx)
         fold_scores.append(float(mcc))
         fold_metrics.append(metrics)
+
+        observed_epochs = int(epoch_state["seen"])
+        if epoch_traces:
+            observed_epochs = max(
+                observed_epochs,
+                max(int(row.get("epoch", -1)) + 1 for row in epoch_traces),
+            )
+        if observed_epochs <= 0:
+            observed_epochs = int(args.n_epochs)
+        completed_epoch_offset += observed_epochs
+
+        if (
+            progress_callback is not None
+            and not getattr(trainer, "_external_epoch_callback_supported", False)
+        ):
+            progress_callback({
+                "step": int(completed_epoch_offset),
+                "score": float(np.mean(fold_scores)),
+                "fold": int(fold_idx),
+                "epoch": int(observed_epochs),
+                "folds_completed": int(len(fold_scores)),
+                "granularity": "fold",
+                "current_fold_valid_mcc": float(mcc),
+                "best_current_fold_valid_mcc": float(mcc),
+            })
+
         held_batches = sorted(set(np.asarray(batches)[test_idx].astype(str)))
         print(
             f"[trial cv] fold {fold_idx + 1}/{resolved_n_repeats} "
