@@ -21,11 +21,19 @@ while read -r pid; do
   fi
 done < <(pgrep -f "run_independent_optuna_all_datasets.py" || true)
 
+collect_descendants() {
+  local parent="$1"
+  local child
+  while read -r child; do
+    [[ -n "$child" ]] || continue
+    collect_descendants "$child"
+    victims+=("$child")
+  done < <(pgrep -P "$parent" || true)
+}
+
 declare -a victims=()
 for launcher in "${launchers[@]}"; do
-  while read -r child; do
-    [[ -n "$child" ]] && victims+=("$child")
-  done < <(pgrep -P "$launcher" || true)
+  collect_descendants "$launcher"
   victims+=("$launcher")
 done
 
