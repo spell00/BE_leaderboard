@@ -62,6 +62,13 @@ CV_FOLDS = {
     "massbench_benchmark": 3,
     "massbench_alzheimer": 3,
 }
+
+# Once a dataset reaches a mathematically perfect validation MCC, additional
+# Optuna trials cannot improve the optimization objective. Keep this narrowly
+# dataset-specific so other studies still consume their declared budgets.
+SATURATION_VALID_MCC = {
+    "seqc_maqc": 1.0,
+}
 PREPARE = {
     "jdlber_sle_maldi": [sys.executable, str(ROOT / "scripts" / "prepare_jdlber_sle_maldi.py")],
     "seqc_maqc": [sys.executable, str(ROOT / "scripts" / "download_prepare_seqc_maqc.py")],
@@ -440,6 +447,7 @@ def run_worker(args) -> int:
         wandb.define_metric("folds/*", step_metric="trial_index")
         wandb.define_metric("best/*", step_metric="trial_index")
 
+    saturation_threshold = SATURATION_VALID_MCC.get(dataset)
     try:
         start = len(attempted(study))
         print(
@@ -591,6 +599,18 @@ def run_worker(args) -> int:
                     f"test={current_metrics.get('test_mcc')} best_valid={best_text}",
                     flush=True,
                 )
+                if (
+                    saturation_threshold is not None
+                    and best is not None
+                    and float(best.value) >= float(saturation_threshold) - 1e-12
+                ):
+                    print(
+                        f"[worker] {dataset}: saturation threshold reached "
+                        f"(best_valid={float(best.value):.4f} >= {float(saturation_threshold):.4f}); "
+                        "ending this study early so the GPU can advance to the next dataset",
+                        flush=True,
+                    )
+                    break
             elif trial_state == "pruned":
                 if wb:
                     payload = {
@@ -664,6 +684,11 @@ def run_worker(args) -> int:
                 for trial in attempted(study)
             ),
             "failed_trials": len(failed_trials(study)),
+            "saturation_threshold": saturation_threshold,
+            "saturated": bool(
+                saturation_threshold is not None
+                and float(best.value) >= float(saturation_threshold) - 1e-12
+            ),
             "curve_total_completed_labels": int(backfill["completed"]),
             "curve_total_predictions": int(backfill["predicted"]),
             "best_trial_number": int(best.number),
