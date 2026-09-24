@@ -34,16 +34,21 @@ from scripts import hp_search
 from src.evolutionary_meta import recommended_batch_size
 
 DATASETS = (
-    # New datasets first.
+    # Active queue: mz10 first. seqc_maqc is saturated (valid MCC 1.0) and
+    # scib_pancreas is intentionally excluded from the default HPO queue because
+    # its full 16k x 19k matrix makes 20-trial BERNN optimization impractical.
+    ("bacteria_2024_mz10", "cyclic"),
     ("jdlber_sle_maldi", "cyclic"),
-    ("seqc_maqc", "cyclic"),
-    ("scib_pancreas", "cyclic"),
     # Existing meta-hpo-bank datasets.
     ("normal_tissue_878", "fixed_external"),
     ("colon_3041", "fixed_external"),
     ("massbench_adenocarcinoma", "fixed_external"),
     ("massbench_benchmark", "fixed_external"),
     ("massbench_alzheimer", "fixed_external"),
+)
+OPTIONAL_DATASETS = (
+    ("seqc_maqc", "cyclic"),
+    ("scib_pancreas", "cyclic"),
 )
 CV_FOLDS = {
     "normal_tissue_878": 3,
@@ -90,7 +95,7 @@ def atomic_json(path: Path, payload) -> None:
 def selected_datasets(raw: str | None) -> list[tuple[str, str]]:
     if not raw:
         return list(DATASETS)
-    protocol = dict(DATASETS)
+    protocol = dict(DATASETS + OPTIONAL_DATASETS)
     names = [x.strip() for x in raw.split(",") if x.strip()]
     unknown = [x for x in names if x not in protocol]
     if unknown:
@@ -353,8 +358,9 @@ def run_worker(args) -> int:
                 run_args.resolved_n_repeats = hp_search.resolve_n_repeats(requested, batches)
                 run_args.cv_split_cache = str(out / "cv_splits.npz")
             else:
-                run_args.n_repeats = len(batch_values)
-                run_args.resolved_n_repeats = len(batch_values)
+                requested = min(max(3, int(args.n_repeats)), len(batch_values))
+                run_args.n_repeats = requested
+                run_args.resolved_n_repeats = requested
                 run_args.trainer_n_repeats = 1
 
             config = hp_search.sample_config(trial, run_args)
@@ -474,20 +480,34 @@ def run_launcher(args) -> int:
             if gpu in active or not queue:
                 continue
             dataset, protocol = queue.pop(0)
-            cmd = [
-                sys.executable, str(Path(__file__).resolve()),
-                "--worker-dataset", dataset, "--worker-protocol", protocol,
-                "--output-dir", str(args.output_dir),
-                "--n-trials", str(args.n_trials), "--n-epochs", str(args.n_epochs),
-                "--n-repeats", str(args.n_repeats), "--batch-size", str(args.batch_size),
-                "--num-workers", str(args.num_workers), "--seed", str(args.seed),
-                "--wandb-project", args.wandb_project, "--wandb-group", args.wandb_group,
-            ]
+            if dataset == "bacteria_2024_mz10":
+                cmd = [
+                    sys.executable,
+                    str(ROOT / "scripts" / "run_bacteria_2024_mz10_optuna.py"),
+                    "--output-dir", str(args.output_dir),
+                    "--n-trials", str(args.n_trials),
+                    "--n-epochs", str(args.n_epochs),
+                    "--batch-size", str(args.batch_size),
+                    "--num-workers", str(args.num_workers),
+                    "--seed", str(args.seed),
+                    "--wandb-project", args.wandb_project,
+                    "--wandb-group", args.wandb_group,
+                ]
+            else:
+                cmd = [
+                    sys.executable, str(Path(__file__).resolve()),
+                    "--worker-dataset", dataset, "--worker-protocol", protocol,
+                    "--output-dir", str(args.output_dir),
+                    "--n-trials", str(args.n_trials), "--n-epochs", str(args.n_epochs),
+                    "--n-repeats", str(args.n_repeats), "--batch-size", str(args.batch_size),
+                    "--num-workers", str(args.num_workers), "--seed", str(args.seed),
+                    "--wandb-project", args.wandb_project, "--wandb-group", args.wandb_group,
+                ]
             if args.resume:
                 cmd.append("--resume")
             if args.no_wandb:
                 cmd.append("--no-wandb")
-            if args.prepare_missing:
+            if args.prepare_missing and dataset != "bacteria_2024_mz10":
                 cmd.append("--prepare-missing")
 
             env = os.environ.copy()
