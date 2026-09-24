@@ -323,9 +323,13 @@ def run_cyclic_batch_trial(cfg: dict, args, data, exp_id: str):
         if is_alzheimer
         else np.ones(len(y), dtype=bool)
     )
+    requested_cyclic_folds = int(
+        getattr(args, "resolved_n_repeats", getattr(args, "n_repeats", -1))
+    )
     splits = cyclic_train_valid_test_splits(
         batches,
         eligible_mask=supervised_mask if is_alzheimer else None,
+        n_splits=requested_cyclic_folds,
     )
     n_rounds = len(splits)
 
