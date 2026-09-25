@@ -278,6 +278,10 @@ def download_wandb_seed_trials(args, dataset: str, protocol: str, output_dir: Pa
         root = output_dir / "seed_history" / "wandb"
         paths = []
         for run in runs:
+            # Never seed a new study from a currently active W&B run. Finished
+            # Optuna trials inside older finished/crashed runs are safe to reuse.
+            if str(getattr(run, "state", "")).lower() == "running":
+                continue
             config = dict(getattr(run, "config", {}) or {})
             run_protocol = config.get("protocol")
             if run_protocol and str(run_protocol) != str(protocol):
@@ -1316,8 +1320,22 @@ def run_launcher(args) -> int:
                 "--n-trials", str(args.n_trials), "--n-epochs", str(args.n_epochs),
                 "--n-repeats", str(args.n_repeats), "--batch-size", str(args.batch_size),
                 "--num-workers", str(args.num_workers), "--seed", str(args.seed),
-                "--wandb-project", args.wandb_project, "--wandb-group", args.wandb_group,
+                "--wandb-project", args.wandb_project,
+                "--wandb-entity", args.wandb_entity,
+                "--wandb-group", args.wandb_group,
+                "--repeat1-prune-percentile", str(args.repeat1_prune_percentile),
+                "--repeat2-prune-percentile", str(args.repeat2_prune_percentile),
+                "--prune-min-reference-trials", str(args.prune_min_reference_trials),
             ]
+            cmd.append("--pruning" if args.pruning else "--no-pruning")
+            cmd.append(
+                "--auto-seed-history" if args.auto_seed_history
+                else "--no-auto-seed-history"
+            )
+            cmd.append(
+                "--seed-from-wandb" if args.seed_from_wandb
+                else "--no-seed-from-wandb"
+            )
             if args.resume:
                 cmd.append("--resume")
             if args.no_wandb:
