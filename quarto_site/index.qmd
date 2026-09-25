@@ -146,7 +146,7 @@ page-layout: full
   ["datasets","runs","protocols","contributors"].forEach(k=>{const e=$("stat-"+k);if(e)e.textContent=d.stats[k]||0;});
 
   const backend=$("backend-url");
-  backend.value=(d.backend&&d.backend.url)||"http://127.0.0.1:7898";
+  backend.value=(d.backend&&d.backend.url)||"http://127.0.0.1:7899";
   const backendBase=()=>backend.value.trim().replace(/\/$/,"");
   const openBackend=$("open-backend");
   const syncBackendLink=()=>{openBackend.href=backendBase();};
