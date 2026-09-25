@@ -1,0 +1,311 @@
+---
+title: "BE Leaderboard"
+page-layout: full
+---
+
+<script src="data/site-data.js"></script>
+
+<div class="hero-shell">
+  <div class="eyebrow">REPRODUCIBLE DOMAIN-ADAPTATION BENCHMARKING</div>
+  <h1>Benchmark it. Reproduce it. Use it.</h1>
+  <p class="hero-copy">BE Leaderboard evaluates classification methods on sample-by-feature matrices with explicit technical domains. A method on the benchmark should not be a score you cannot reproduce: public benchmark implementations can be loaded back into the same runner and applied to data.</p>
+  <div class="hero-actions">
+    <a class="button-primary" href="#leaderboard">Explore leaderboard</a>
+    <a class="button-secondary" href="#workbench">Run a method</a>
+    <a class="button-secondary" href="#apply">Apply a benchmarked method</a>
+  </div>
+</div>
+
+<div class="stat-grid">
+  <div class="stat-card"><span id="stat-datasets">—</span><small>datasets available</small></div>
+  <div class="stat-card"><span id="stat-runs">—</span><small>scored runs</small></div>
+  <div class="stat-card"><span id="stat-protocols">—</span><small>evaluation protocols</small></div>
+  <div class="stat-card"><span id="stat-contributors">—</span><small>contributors</small></div>
+</div>
+
+## One contract, many matrix domains
+
+<div class="feature-grid">
+  <article class="feature-card"><div class="feature-index">01</div><h3>Matrix-first</h3><p>Samples × features, one classification target, and an explicit domain/batch column. The benchmark is not tied to one assay technology.</p></article>
+  <article class="feature-card"><div class="feature-index">02</div><h3>Benchmark-owned evaluation</h3><p>Dataset loading, domain-aware splitting, validation/test separation, metrics, and provenance belong to the benchmark rather than each submitted method.</p></article>
+  <article class="feature-card"><div class="feature-index">03</div><h3>Runnable methods</h3><p>Public benchmark code can be loaded directly into the workbench instead of leaving users to reconstruct the winning implementation from a paper.</p></article>
+  <article class="feature-card"><div class="feature-index">04</div><h3>Same code, two jobs</h3><p>The same correction/model blocks used for benchmarking can be sent through the inference runner for practical application.</p></article>
+</div>
+
+## Current leaders {#leaderboard}
+
+<p class="section-copy">Score = min(validation MCC, test MCC). Select a row to inspect the exact public implementation and load it into the workbench.</p>
+
+<div class="leaderboard-controls">
+  <label>Dataset<select id="filter-dataset"></select></label>
+  <label>Protocol<select id="filter-protocol"></select></label>
+  <label>Search<input id="filter-search" type="search" placeholder="Method, contributor, dataset…"></label>
+</div>
+
+<div class="table-note"><span id="row-count"></span> · click a heading to sort · click a row to inspect it</div>
+<div class="leaderboard-table-wrap">
+<table class="leaderboard-table">
+<thead><tr><th>#</th><th data-key="submission_name">Method</th><th data-key="dataset">Dataset</th><th data-key="score">Score</th><th data-key="valid_mcc">Valid MCC</th><th data-key="test_mcc">Test MCC</th><th data-key="accuracy">Accuracy</th><th data-key="evaluation_protocol">Protocol</th><th>Code</th></tr></thead>
+<tbody id="leaderboard-body"></tbody>
+</table>
+</div>
+
+<div id="method-detail" class="method-detail hidden">
+  <div>
+    <div class="eyebrow">SELECTED BENCHMARK METHOD</div>
+    <h3 id="detail-title">—</h3>
+    <p id="detail-meta" class="muted"></p>
+  </div>
+  <div class="metric-strip">
+    <div><small>Score</small><strong id="detail-score">—</strong></div>
+    <div><small>Valid MCC</small><strong id="detail-valid">—</strong></div>
+    <div><small>Test MCC</small><strong id="detail-test">—</strong></div>
+  </div>
+  <p id="detail-code-note" class="section-copy"></p>
+  <div class="runner-actions">
+    <button id="detail-benchmark" class="button-primary compact" type="button">Load into benchmark workbench</button>
+    <button id="detail-apply" class="button-secondary compact" type="button">Load for inference</button>
+  </div>
+</div>
+
+## Benchmark workbench {#workbench}
+
+<p class="section-copy">Two code blocks are the public method interface. The server still owns the data, domain-aware splits, metrics, hidden labels, and scoring. “Preflight” checks the interface in the browser; authoritative validation happens again in the benchmark worker before execution.</p>
+
+<div class="workbench">
+  <div class="runner-grid">
+    <label>Backend URL<input id="backend-url" type="text"></label>
+    <label>Submission name<input id="submission-name" type="text" value="quarto_submission"></label>
+    <label>Dataset<select id="submit-dataset"></select></label>
+    <label>Protocol<select id="submit-protocol"><option value="fixed_external">Fixed external test</option><option value="cyclic_batches">Rotating train / valid / test</option><option value="validation_only">Train / validation only</option></select></label>
+    <label>Batch CV folds<input id="submit-folds" type="number" value="-1" step="1"></label>
+    <label>Source file<input id="submit-source" type="text" placeholder="dataset_all.csv"></label>
+    <label class="wide">Optional PyPI requirements<input id="submit-pip" type="text" placeholder="package==version"></label>
+  </div>
+  <div class="security-note"><strong>Package status:</strong> the legacy Gradio control can install packages into the host environment, but arbitrary third-party imports are intentionally not enabled by this Quarto workbench until they run in an isolated evaluator. Built-in/preloaded benchmark libraries remain available.</div>
+  <div class="editor-grid">
+    <label><span>1 · Batch correction code</span><textarea id="correction-code" class="code-editor" spellcheck="false">def batch_correct(X_train, train_batches, X_test, test_batches):
+    return X_train, X_test</textarea></label>
+    <label><span>2 · Classification model code</span><textarea id="model-code" class="code-editor" spellcheck="false">def fit(
+    X_train,
+    y_train,
+    X_test,
+    X_valid,
+    y_valid,
+    y_test,
+    batches_train,
+    batches_test,
+    batches_valid,
+):
+    clf = GaussianNB()
+    clf.fit(X_train, y_train)
+    return clf</textarea></label>
+  </div>
+  <div class="runner-actions">
+    <button id="preflight-btn" class="button-secondary compact" type="button">Preflight</button>
+    <button id="submit-btn" class="button-primary compact" type="button">Run benchmark</button>
+    <button id="stop-btn" class="button-secondary compact" type="button">Stop run</button>
+    <button id="refresh-logs-btn" class="button-secondary compact" type="button">Refresh logs</button>
+    <a id="open-backend" class="button-secondary compact" target="_blank" rel="noopener">Open / sign in to backend</a>
+  </div>
+  <div id="submit-status" class="status-panel">Ready.</div>
+  <pre id="run-logs" class="run-logs">No active run.</pre>
+</div>
+
+## Apply a benchmarked method {#apply}
+
+<p class="section-copy">Load a public leaderboard implementation, choose one labeled source matrix and a separate target matrix, then send that same implementation through the inference runner. Target labels, if present, are ignored by the inference path.</p>
+
+<div class="workbench">
+  <div class="runner-grid">
+    <label>Method<select id="apply-method"></select></label>
+    <label>Dataset<select id="apply-dataset"></select></label>
+    <label>Source matrix<input id="apply-source" type="text" placeholder="dataset_all.csv"></label>
+    <label>Target matrix<input id="apply-target" type="text" placeholder="new_samples.csv"></label>
+    <label>Batch CV folds<input id="apply-folds" type="number" value="-1" step="1"></label>
+  </div>
+  <div class="runner-actions">
+    <button id="apply-run-btn" class="button-primary compact" type="button">Run inference</button>
+    <button id="apply-to-editor-btn" class="button-secondary compact" type="button">Edit this method first</button>
+  </div>
+  <div id="apply-status" class="status-panel">Choose a public method with reusable code.</div>
+  <div id="apply-output" class="inference-output"></div>
+</div>
+
+## Available datasets {#datasets}
+
+<div class="toolbar"><input id="dataset-search" class="search-input" type="search" placeholder="Search datasets…"><span id="dataset-count" class="muted"></span></div>
+<div id="dataset-grid" class="benchmark-grid"></div>
+
+<script>
+(function(){
+  const d=window.BE_SITE_DATA||{stats:{},leaderboard:[],datasets:[],backend:{}};
+  const $=id=>document.getElementById(id);
+  const esc=value=>String(value??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]));
+  const fmt=v=>v===null||v===undefined||Number.isNaN(Number(v))?"—":Number(v).toFixed(3);
+  ["datasets","runs","protocols","contributors"].forEach(k=>{const e=$("stat-"+k);if(e)e.textContent=d.stats[k]||0;});
+
+  const backend=$("backend-url");
+  backend.value=(d.backend&&d.backend.url)||"http://127.0.0.1:7899";
+  const backendBase=()=>backend.value.trim().replace(/\/$/,"");
+  const openBackend=$("open-backend");
+  const syncBackendLink=()=>{openBackend.href=backendBase();};
+  backend.addEventListener("input",syncBackendLink); syncBackendLink();
+
+  async function gradioCall(endpoint,data=[]){
+    const base=backendBase();
+    if(!base) throw new Error("Backend URL is empty.");
+    const start=await fetch(base+"/gradio_api/call/"+endpoint,{
+      method:"POST",credentials:"include",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({data})
+    });
+    if(!start.ok) throw new Error("Backend "+start.status+" while starting /"+endpoint);
+    const started=await start.json();
+    if(!started.event_id) throw new Error("Backend did not return an event id.");
+    const response=await fetch(base+"/gradio_api/call/"+endpoint+"/"+started.event_id,{credentials:"include"});
+    if(!response.ok) throw new Error("Backend "+response.status+" while reading /"+endpoint);
+    const text=await response.text();
+    let event="", payload=null;
+    for(const line of text.split(/\r?\n/)){
+      if(line.startsWith("event:")) event=line.slice(6).trim();
+      if(line.startsWith("data:")){
+        const raw=line.slice(5).trim();
+        try{payload=JSON.parse(raw);}catch(_){payload=raw;}
+        if(event==="error") throw new Error(typeof payload==="string"?payload:JSON.stringify(payload));
+      }
+    }
+    if(event!=="complete") throw new Error("Run ended without a complete event ("+(event||"unknown")+").");
+    return payload;
+  }
+
+  const ds=$("filter-dataset"), ps=$("filter-protocol"), q=$("filter-search"), tb=$("leaderboard-body"), rc=$("row-count");
+  const uniq=k=>Array.from(new Set(d.leaderboard.map(r=>r[k]).filter(Boolean))).sort();
+  const opts=(label,vals)=>'<option value="">All '+label+'</option>'+vals.map(v=>'<option value="'+esc(v)+'">'+esc(String(v).replaceAll("_"," "))+'</option>').join("");
+  ds.innerHTML=opts("datasets",uniq("dataset")); ps.innerHTML=opts("protocols",uniq("evaluation_protocol"));
+  let sk="score",sd=-1,selected=null;
+
+  function selectRow(row){
+    selected=row;
+    $("method-detail").classList.remove("hidden");
+    $("detail-title").textContent=row.submission_name||"unnamed";
+    $("detail-meta").textContent=(row.username||"unknown")+" · "+String(row.dataset||"").replaceAll("_"," ")+" · "+(row.evaluation_protocol||"unknown protocol");
+    $("detail-score").textContent=fmt(row.score); $("detail-valid").textContent=fmt(row.valid_mcc); $("detail-test").textContent=fmt(row.test_mcc);
+    const reusable=Boolean(row.correction_code||row.model_code);
+    $("detail-code-note").textContent=reusable?"This row exposes reusable benchmark code.":"This submission is private or does not expose reusable code.";
+    $("detail-benchmark").disabled=!reusable; $("detail-apply").disabled=!reusable;
+  }
+
+  function render(){
+    let rows=d.leaderboard.filter(r=>(!ds.value||r.dataset===ds.value)&&(!ps.value||r.evaluation_protocol===ps.value)&&(!q.value||[r.submission_name,r.username,r.dataset].join(" ").toLowerCase().includes(q.value.toLowerCase())));
+    rows.sort((a,b)=>{const av=a[sk],bv=b[sk];if(av==bv)return 0;if(av==null)return 1;if(bv==null)return-1;return typeof av==="number"?sd*(av-bv):sd*String(av).localeCompare(String(bv));});
+    rc.textContent=rows.length+" results";
+    tb.innerHTML=rows.map((r,i)=>'<tr data-submission="'+esc(r.submission_id)+'"><td class="rank-cell">'+(i+1)+'</td><td><strong>'+esc(r.submission_name||"unnamed")+'</strong><small class="cell-sub">'+esc(r.username||"")+'</small></td><td>'+esc(String(r.dataset||"").replaceAll("_"," "))+'</td><td><strong>'+fmt(r.score)+'</strong></td><td>'+fmt(r.valid_mcc)+'</td><td>'+fmt(r.test_mcc)+'</td><td>'+fmt(r.accuracy)+'</td><td><span class="protocol-pill">'+esc(r.evaluation_protocol||"—")+(r.cv_folds?" · "+esc(r.cv_folds):"")+'</span></td><td>'+(r.correction_code||r.model_code?'<span class="available-dot">usable</span>':'<span class="muted">private</span>')+'</td></tr>').join("")||'<tr><td colspan="9" class="empty-state">No results match these filters.</td></tr>';
+    tb.querySelectorAll("tr[data-submission]").forEach(tr=>tr.addEventListener("click",()=>{const row=d.leaderboard.find(r=>String(r.submission_id)===tr.dataset.submission);if(row)selectRow(row);}));
+  }
+  [ds,ps].forEach(e=>e.addEventListener("change",render)); q.addEventListener("input",render);
+  document.querySelectorAll("th[data-key]").forEach(th=>th.addEventListener("click",()=>{const k=th.dataset.key;if(sk===k)sd*=-1;else{sk=k;sd=["score","valid_mcc","test_mcc","accuracy"].includes(k)?-1:1;}render();}));
+  render();
+
+  const datasetOptions=d.datasets.map(x=>'<option value="'+esc(x.key)+'">'+esc(x.label)+'</option>').join("");
+  $("submit-dataset").innerHTML=datasetOptions; $("apply-dataset").innerHTML=datasetOptions;
+  const defaultDataset=d.datasets.some(x=>x.key==="massbench_benchmark")?"massbench_benchmark":(d.datasets[0]?.key||"");
+  $("submit-dataset").value=defaultDataset; $("apply-dataset").value=defaultDataset;
+  const defaultSource=key=>key?key+"_all.csv":"";
+  $("submit-source").value=defaultSource(defaultDataset); $("apply-source").value=defaultSource(defaultDataset);
+  $("submit-dataset").addEventListener("change",()=>{$("submit-source").value=defaultSource($("submit-dataset").value);});
+  $("apply-dataset").addEventListener("change",()=>{$("apply-source").value=defaultSource($("apply-dataset").value);});
+
+  function loadRowToEditors(row,scroll=true){
+    if(!row||( !row.correction_code && !row.model_code)) return;
+    $("correction-code").value=row.correction_code||"";
+    $("model-code").value=row.model_code||"";
+    $("submission-name").value=(row.submission_name||"method")+"_rerun";
+    $("submit-dataset").value=row.dataset||defaultDataset;
+    $("submit-protocol").value=row.evaluation_protocol||"fixed_external";
+    $("submit-folds").value=row.cv_folds||-1;
+    $("submit-source").value=row.source_file||defaultSource(row.dataset);
+    if(scroll)$("workbench").scrollIntoView({behavior:"smooth"});
+  }
+  $("detail-benchmark").addEventListener("click",()=>loadRowToEditors(selected,true));
+  $("detail-apply").addEventListener("click",()=>{if(!selected)return;$("apply-method").value=String(selected.submission_id);$("apply-dataset").value=selected.dataset;$("apply-source").value=selected.source_file||defaultSource(selected.dataset);$("apply").scrollIntoView({behavior:"smooth"});});
+
+  const publicMethods=d.leaderboard.filter(r=>r.correction_code||r.model_code);
+  $("apply-method").innerHTML=publicMethods.map(r=>'<option value="'+esc(r.submission_id)+'">'+esc((r.submission_name||"unnamed")+" · "+r.dataset+" · "+fmt(r.score))+'</option>').join("")||'<option value="">No public reusable methods</option>';
+  const methodById=id=>d.leaderboard.find(r=>String(r.submission_id)===String(id));
+  $("apply-to-editor-btn").addEventListener("click",()=>loadRowToEditors(methodById($("apply-method").value),true));
+
+  function preflight(){
+    const corr=$("correction-code").value, model=$("model-code").value, pkg=$("submit-pip").value.trim();
+    const problems=[];
+    if(!/\bdef\s+batch_correct\s*\(/.test(corr)) problems.push("batch-correction block must define batch_correct(...).");
+    if(!/\bdef\s+(fit|fit_predict|build_model)\s*\(/.test(model) && !/TrainAE(Classifier|ThenClassifier)Holdout|AEHeadPredictor/.test(model)) problems.push("model block must define fit(...), fit_predict(...), build_model(...), or a supported BERNN runner.");
+    if(/(^|\n)\s*(import|from)\s+/.test(corr+"\n"+model)) problems.push("direct imports are blocked by the current benchmark sandbox; use preloaded symbols.");
+    if(pkg) problems.push("PyPI requirements are recorded here, but arbitrary third-party imports require the isolated evaluator before they can be enabled safely.");
+    $("submit-status").textContent=problems.length?"Preflight found: "+problems.join(" "):"Preflight passed. The server will repeat authoritative validation before training.";
+    return problems.length===0;
+  }
+  $("preflight-btn").addEventListener("click",preflight);
+
+  let logTimer=null;
+  async function refreshLogs(){
+    try{
+      const data=await gradioCall((d.backend&&d.backend.logs_endpoint)||"read_latest_run_logs",[]);
+      const value=Array.isArray(data)?data[data.length-1]:data;
+      $("run-logs").textContent=typeof value==="string"?value:JSON.stringify(value,null,2);
+    }catch(err){$("run-logs").textContent="Log refresh: "+err.message;}
+  }
+  $("refresh-logs-btn").addEventListener("click",refreshLogs);
+  $("stop-btn").addEventListener("click",async()=>{try{const out=await gradioCall((d.backend&&d.backend.stop_endpoint)||"stop_real",[]);$("submit-status").textContent=Array.isArray(out)?String(out[0]):String(out);await refreshLogs();}catch(err){$("submit-status").textContent="Stop failed: "+err.message;}});
+
+  $("submit-btn").addEventListener("click",async()=>{
+    preflight();
+    $("submit-status").textContent="Benchmark submitted. Waiting for the benchmark-owned evaluation to finish…";
+    $("run-logs").textContent="Starting…";
+    const data=[
+      $("submission-name").value,$("submit-dataset").value,$("correction-code").value,$("model-code").value,
+      $("submit-pip").value,$("submit-protocol").value,Number($("submit-folds").value||-1),$("submit-source").value
+    ];
+    clearInterval(logTimer); logTimer=setInterval(refreshLogs,5000);
+    try{
+      const out=await gradioCall((d.backend&&d.backend.submit_endpoint)||"submit_real",data);
+      clearInterval(logTimer); logTimer=null;
+      if(Array.isArray(out)){
+        $("submit-status").textContent=String(out[1]??"Benchmark completed.");
+        if(out[2])$("run-logs").textContent=String(out[2]);
+      }else $("submit-status").textContent=JSON.stringify(out);
+    }catch(err){clearInterval(logTimer);logTimer=null;$("submit-status").textContent="Benchmark failed: "+err.message;await refreshLogs();}
+  });
+
+  $("apply-run-btn").addEventListener("click",async()=>{
+    const row=methodById($("apply-method").value);
+    if(!row){$("apply-status").textContent="Choose a public method first.";return;}
+    $("apply-status").textContent="Running the selected benchmark implementation on the inference target…";
+    $("apply-output").innerHTML="";
+    try{
+      const out=await gradioCall("run_inference",[
+        $("apply-dataset").value,$("apply-source").value,$("apply-target").value,
+        row.correction_code||"",row.model_code||"",Number($("apply-folds").value||-1)
+      ]);
+      if(Array.isArray(out)){
+        $("apply-status").textContent=String(out[1]??"Inference complete.");
+        const pred=out[0];
+        if(pred&&pred.headers&&pred.data){
+          const head=pred.headers.map(h=>'<th>'+esc(h)+'</th>').join("");
+          const body=pred.data.slice(0,25).map(r=>'<tr>'+r.map(v=>'<td>'+esc(v)+'</td>').join("")+'</tr>').join("");
+          $("apply-output").innerHTML='<div class="table-note">Previewing '+Math.min(25,pred.data.length)+' of '+pred.data.length+' predictions</div><div class="leaderboard-table-wrap"><table class="leaderboard-table"><thead><tr>'+head+'</tr></thead><tbody>'+body+'</tbody></table></div>';
+        }
+      }else $("apply-status").textContent=JSON.stringify(out);
+    }catch(err){$("apply-status").textContent="Inference failed: "+err.message;}
+  });
+
+  const si=$("dataset-search"),grid=$("dataset-grid"),dc=$("dataset-count");
+  function renderDatasets(){
+    const needle=(si.value||"").toLowerCase(),items=d.datasets.filter(x=>!needle||[x.key,x.label].join(" ").toLowerCase().includes(needle));
+    dc.textContent="showing "+items.length+" of "+d.datasets.length;
+    grid.innerHTML=items.map(x=>'<article class="benchmark-card"><div class="tag-row"><span class="tag">domain adaptation</span></div><h3>'+esc(x.label)+'</h3><p class="dataset-key">'+esc(x.key)+'</p><div class="benchmark-meta"><span><strong>'+x.runs+'</strong> scored runs</span><span><strong>'+x.protocols.length+'</strong> protocols</span></div><button class="dataset-link" data-dataset="'+esc(x.key)+'">View results →</button></article>').join("")||'<div class="empty-state">No datasets match this search.</div>';
+    grid.querySelectorAll(".dataset-link").forEach(b=>b.addEventListener("click",()=>{ds.value=b.dataset.dataset;render();$("leaderboard").scrollIntoView({behavior:"smooth"});}));
+  }
+  si.addEventListener("input",renderDatasets); renderDatasets();
+})();
+</script>
