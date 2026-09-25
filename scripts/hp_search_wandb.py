@@ -44,6 +44,26 @@ def make_objective_wandb(args, data):
         # --- MLflow-backed training first (no W&B run active) ---
         try:
             score, metrics = run_trial(cfg, args, data, exp_id)
+        except __import__("optuna").TrialPruned as exc:
+            trial.set_user_attr("pruned_reason", str(exc))
+            _log_wandb_trial(
+                args,
+                trial,
+                cfg,
+                {
+                    "status_pruned": 1,
+                    "pruned_reason": str(exc),
+                    "resource_repeats_completed": trial.user_attrs.get(
+                        "resource_repeats_completed", 0
+                    ),
+                    "partial_valid_mcc": trial.user_attrs.get(
+                        "partial_valid_mcc_mean"
+                    ),
+                    "pruning_stage": trial.user_attrs.get("pruning_stage"),
+                    "pruning_cutoff": trial.user_attrs.get("pruning_cutoff"),
+                },
+            )
+            raise
         except Exception as exc:
             trial.set_user_attr("error", f"{type(exc).__name__}: {exc}")
             print(f"[trial {trial.number}] FAILED: {type(exc).__name__}: {exc}")

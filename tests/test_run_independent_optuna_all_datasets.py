@@ -139,3 +139,47 @@ def test_save_wandb_files_uploads_nested_files_without_globbing(tmp_path):
     assert all(kwargs["policy"] == "now" for _, kwargs in run.saved)
     assert all(kwargs["glob"] is False for _, kwargs in run.saved)
     assert all(kwargs["base_path"] == str(tmp_path.resolve()) for _, kwargs in run.saved)
+
+
+def test_pruning_and_historical_bootstrap_are_enabled_by_default():
+    args = parse_args([])
+    assert args.pruning is True
+    assert args.auto_seed_history is True
+    assert args.seed_from_wandb is True
+    assert args.repeat1_prune_percentile == 25.0
+    assert args.repeat2_prune_percentile == 50.0
+
+
+def test_generic_completed_trial_without_fold_array_still_seeds_tpe(tmp_path):
+    import json
+    import optuna
+
+    config = {
+        "dloss": "DANN", "variational": True, "kan": False,
+        "class_triplet": True, "class_triplet_w": 0.3,
+        "lr": 1e-3, "wd": 1e-5, "nu": 0.1,
+        "smoothing": 0.01, "margin": 1.0, "dropout": 0.2,
+        "thres": 0.01, "warmup": 20, "n_layers": 2,
+        "layer1": 700, "scaler": "robust", "gamma": 0.1, "beta": 0.1,
+    }
+    path = tmp_path / "trials.json"
+    path.write_text(json.dumps([{
+        "protocol": "fixed_external",
+        "valid_mcc": 0.72,
+        "config": config,
+        "metrics": {},
+    }]))
+    study = optuna.create_study(direction="maximize")
+    assert import_seed_trials(
+        study,
+        [path],
+        "normal_tissue_878",
+        "fixed_external",
+        "plain",
+        expected_repeats=3,
+        max_warmup=50,
+    ) == 1
+    seeded = study.trials[0]
+    assert seeded.value == 0.72
+    assert seeded.intermediate_values == {}
+    assert seeded.user_attrs["transfer_seed"] is True

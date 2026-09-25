@@ -89,8 +89,30 @@ def parse_args(argv=None):
         help=("Import compatible completed trials.json records into a new study "
               "as TPE evidence without retraining them; repeatable."),
     )
+    p.add_argument(
+        "--auto-seed-history",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Automatically reuse compatible local historical trials (default: enabled).",
+    )
+    p.add_argument(
+        "--seed-from-wandb",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Best-effort import of compatible trials.json files from prior W&B runs.",
+    )
+    p.add_argument(
+        "--pruning",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable epoch pruning plus 1 -> 2 -> all-repeat promotion (default: enabled).",
+    )
+    p.add_argument("--repeat1-prune-percentile", type=float, default=25.0)
+    p.add_argument("--repeat2-prune-percentile", type=float, default=50.0)
+    p.add_argument("--prune-min-reference-trials", type=int, default=5)
     p.add_argument("--no-wandb", action="store_true")
     p.add_argument("--wandb-project", default="BE_leaderboard_meta_evolution")
+    p.add_argument("--wandb-entity", default=os.getenv("WANDB_ENTITY", "adlab"))
     p.add_argument("--wandb-group", default="independent-optuna-all-datasets-20")
     p.add_argument(
         "--feature-select-method",
@@ -206,12 +228,125 @@ def mz10_sanity_gate(metrics: dict, valid_mcc: float) -> tuple[bool, dict]:
     return details["passed"], details
 
 
-def mark_interrupted_failed(study) -> None:
+def interrupted_trials(study):
+    """Return RUNNING trials so --resume can continue their completed repeats."""
     import optuna
-    for trial in study.get_trials(deepcopy=False):
-        if trial.state == optuna.trial.TrialState.RUNNING:
-            study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
-            print(f"[resume] marked trial {trial.number} FAIL", flush=True)
+    return [
+        trial for trial in study.get_trials(deepcopy=False)
+        if trial.state == optuna.trial.TrialState.RUNNING
+    ]
+
+
+def mark_interrupted_failed(study) -> None:
+    """Legacy escape hatch; normal --resume no longer calls this."""
+    import optuna
+    for trial in interrupted_trials(study):
+        study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
+        print(f"[resume] marked trial {trial.number} FAIL", flush=True)
+
+
+def discover_local_seed_trials(dataset: str, current_output: Path) -> list[Path]:
+    """Find prior persisted trial banks for this dataset without touching current output."""
+    results_root = ROOT / "results"
+    if not results_root.exists():
+        return []
+    current = (current_output / "trials.json").resolve()
+    found = []
+    for path in results_root.rglob("trials.json"):
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        if resolved == current:
+            continue
+        if dataset not in str(path.parent):
+            continue
+        found.append(path)
+    return sorted(set(found))
+
+
+def download_wandb_seed_trials(args, dataset: str, protocol: str, output_dir: Path) -> list[Path]:
+    """Best-effort recovery of historical trials.json files already uploaded to W&B."""
+    if not bool(getattr(args, "seed_from_wandb", True)):
+        return []
+    try:
+        import wandb
+
+        api = wandb.Api(timeout=20)
+        project = f"{args.wandb_entity}/{args.wandb_project}"
+        runs = api.runs(project, filters={"config.dataset": dataset}, per_page=50)
+        root = output_dir / "seed_history" / "wandb"
+        paths = []
+        for run in runs:
+            config = dict(getattr(run, "config", {}) or {})
+            run_protocol = config.get("protocol")
+            if run_protocol and str(run_protocol) != str(protocol):
+                continue
+            run_root = root / str(run.id)
+            run_root.mkdir(parents=True, exist_ok=True)
+            for remote in run.files():
+                if not str(remote.name).endswith("trials.json"):
+                    continue
+                downloaded = remote.download(root=str(run_root), replace=True)
+                candidate = Path(downloaded.name)
+                if candidate.exists():
+                    paths.append(candidate)
+
+            # Older runs did not always persist valid_mcc_folds into trials.json,
+            # but the launcher logged those values and the sampled config to W&B
+            # history. Reconstruct a lightweight seed bank from that history.
+            config_keys = (
+                "dloss", "variational", "kan", "class_triplet", "class_triplet_w",
+                "lr", "wd", "nu", "smoothing", "margin", "dropout", "thres",
+                "warmup", "n_layers", "layer1", "scaler", "gamma", "beta",
+            )
+            history_keys = [
+                "trial_number", "metrics/valid_mcc", "metrics/test_mcc",
+                "runtime/fit_seconds",
+                *[f"folds/valid_mcc/fold_{i}" for i in range(5)],
+                *[f"config/{key}" for key in config_keys],
+            ]
+            history_records = []
+            try:
+                for item in run.scan_history(keys=history_keys, page_size=200):
+                    valid = item.get("metrics/valid_mcc")
+                    if valid is None or not math.isfinite(float(valid)):
+                        continue
+                    sampled = {
+                        key: item.get(f"config/{key}")
+                        for key in config_keys
+                        if item.get(f"config/{key}") is not None
+                    }
+                    folds = []
+                    for i in range(5):
+                        value = item.get(f"folds/valid_mcc/fold_{i}")
+                        if value is None or not math.isfinite(float(value)):
+                            break
+                        folds.append(float(value))
+                    history_records.append({
+                        "protocol": protocol,
+                        "valid_mcc": float(valid),
+                        "test_mcc": item.get("metrics/test_mcc"),
+                        "fit_seconds": item.get("runtime/fit_seconds"),
+                        "config": sampled,
+                        "metrics": {"valid_mcc_folds": folds} if folds else {},
+                    })
+            except Exception as exc:
+                print(
+                    f"[transfer seed] W&B history scan skipped for {run.id}: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+            if history_records:
+                history_path = run_root / "wandb_history_trials.json"
+                atomic_json(history_path, history_records)
+                paths.append(history_path)
+        if paths:
+            print(f"[transfer seed] recovered {len(paths)} W&B trial file(s)", flush=True)
+        return paths
+    except Exception as exc:
+        print(f"[transfer seed] W&B history unavailable: {type(exc).__name__}: {exc}", flush=True)
+        return []
 
 
 def _seed_trial_path(path: Path, dataset: str) -> Path:
@@ -225,8 +360,86 @@ def _seed_trial_path(path: Path, dataset: str) -> Path:
 
 
 def _highrange_seed_params(config: dict, search_space: str):
-    """Return current-space params/distributions, or None if incompatible."""
+    """Return current mz10-space params/distributions, or None if incompatible."""
     import optuna
+
+    if search_space in {"plain", "extended_nonvariational"}:
+        if bool(config.get("variational", False)):
+            return None
+        try:
+            dloss = str(config.get("dloss", "no"))
+            class_triplet = bool(config.get("class_triplet", False))
+            params = {
+                "lr": float(config["lr"]),
+                "wd": float(config["wd"]),
+                "smoothing": float(config["smoothing"]),
+                "dropout": float(config["dropout"]),
+                "warmup": int(config["warmup"]),
+                "n_layers": int(config["n_layers"]),
+                "layer1": int(config["layer1"]),
+                "scaler": str(config["scaler"]),
+            }
+        except (KeyError, TypeError, ValueError):
+            return None
+        distributions = {
+            "lr": optuna.distributions.FloatDistribution(3e-4, 3e-3, log=True),
+            "wd": optuna.distributions.FloatDistribution(1e-6, 1e-4, log=True),
+            "smoothing": optuna.distributions.FloatDistribution(0.0, 0.05),
+            "dropout": optuna.distributions.FloatDistribution(
+                0.0, 0.2 if search_space == "plain" else 0.2
+            ),
+            "warmup": optuna.distributions.IntDistribution(10, 50),
+            "n_layers": optuna.distributions.CategoricalDistribution((1, 2)),
+            "layer1": optuna.distributions.IntDistribution(256, 512, step=64),
+            "scaler": optuna.distributions.CategoricalDistribution(("standard", "robust")),
+        }
+        if search_space == "plain":
+            if dloss != "no" or bool(config.get("kan", False)) or class_triplet:
+                return None
+            try:
+                params["nu"] = float(config["nu"])
+            except (KeyError, TypeError, ValueError):
+                return None
+            distributions["nu"] = optuna.distributions.FloatDistribution(0.25, 4.0, log=True)
+        else:
+            allowed = ("no", "inverseTriplet", "DANN", "normae", "revDANN", "revTriplet")
+            if dloss not in allowed:
+                return None
+            params.update({
+                "dloss": dloss,
+                "kan": bool(config.get("kan", False)),
+                "class_triplet": class_triplet,
+                "margin": float(config.get("margin", 1.0)),
+            })
+            distributions.update({
+                "dloss": optuna.distributions.CategoricalDistribution(allowed),
+                "kan": optuna.distributions.CategoricalDistribution((False, True)),
+                "class_triplet": optuna.distributions.CategoricalDistribution((False, True)),
+                "margin": optuna.distributions.FloatDistribution(0.5, 5.0),
+            })
+            if class_triplet:
+                params["class_triplet_w"] = float(config.get("class_triplet_w", 0.0))
+                distributions["class_triplet_w"] = optuna.distributions.FloatDistribution(
+                    0.05, 1.0, log=True
+                )
+            if dloss != "no":
+                params["nu"] = float(config.get("nu", 0.0))
+                distributions["nu"] = optuna.distributions.FloatDistribution(
+                    1e-3, 0.5, log=True
+                )
+            if dloss in hp_search.ADVERSARIAL_DLOSS:
+                params["gamma"] = float(config.get("gamma", 0.0))
+                distributions["gamma"] = optuna.distributions.FloatDistribution(
+                    1e-3, 0.5, log=True
+                )
+        try:
+            for name, value in params.items():
+                dist = distributions[name]
+                if not dist._contains(dist.to_internal_repr(value)):
+                    return None
+        except (TypeError, ValueError):
+            return None
+        return params, distributions
 
     layer1 = int(config.get("layer1", -1))
     warmup = int(config.get("warmup", -1))
@@ -296,7 +509,90 @@ def _highrange_seed_params(config: dict, search_space: str):
     return params, distributions
 
 
-def import_seed_trials(study, paths, dataset: str, protocol: str, search_space: str) -> int:
+def _generic_seed_params(config: dict, max_warmup: int):
+    """Map a historical generic BERNN config into the current Optuna space."""
+    import optuna
+
+    try:
+        dloss = str(config["dloss"])
+        variational = bool(config["variational"])
+        params = {
+            "dloss": dloss,
+            "variational": variational,
+            "kan": bool(config["kan"]),
+            "class_triplet": bool(config["class_triplet"]),
+            "class_triplet_w": float(config.get("class_triplet_w", 0.0)),
+            "lr": float(config["lr"]),
+            "wd": float(config["wd"]),
+            "nu": float(config["nu"]),
+            "smoothing": float(config["smoothing"]),
+            "margin": float(config["margin"]),
+            "dropout": float(config["dropout"]),
+            "thres": float(config["thres"]),
+            "warmup": int(config["warmup"]),
+            "n_layers": int(config["n_layers"]),
+            "layer1": int(config["layer1"]),
+            "scaler": str(config["scaler"]),
+        }
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    distributions = {
+        "dloss": optuna.distributions.CategoricalDistribution(tuple(hp_search.DLOSS_CHOICES)),
+        "variational": optuna.distributions.CategoricalDistribution((False, True)),
+        "kan": optuna.distributions.CategoricalDistribution((False, True)),
+        "class_triplet": optuna.distributions.CategoricalDistribution((False, True)),
+        "class_triplet_w": optuna.distributions.FloatDistribution(0.0, 1.0),
+        "lr": optuna.distributions.FloatDistribution(1e-4, 1e-2, log=True),
+        "wd": optuna.distributions.FloatDistribution(1e-6, 1e-3, log=True),
+        "nu": optuna.distributions.FloatDistribution(1e-4, 1e2),
+        "smoothing": optuna.distributions.FloatDistribution(0.0, 0.2),
+        "margin": optuna.distributions.FloatDistribution(0.0, 10.0),
+        "dropout": optuna.distributions.FloatDistribution(0.0, 0.5),
+        "thres": optuna.distributions.FloatDistribution(0.0, 0.1),
+        "warmup": optuna.distributions.IntDistribution(1, int(max_warmup)),
+        "n_layers": optuna.distributions.CategoricalDistribution((1, 2, 3, 4, 5)),
+        "layer1": optuna.distributions.IntDistribution(512, 1024),
+        "scaler": optuna.distributions.CategoricalDistribution(tuple(hp_search.SCALER_CHOICES)),
+    }
+    if dloss in hp_search.ADVERSARIAL_DLOSS:
+        try:
+            params["gamma"] = float(config["gamma"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        distributions["gamma"] = optuna.distributions.FloatDistribution(1e-2, 1e2, log=True)
+    if variational:
+        try:
+            params["beta"] = float(config["beta"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        distributions["beta"] = optuna.distributions.FloatDistribution(1e-2, 1e2, log=True)
+
+    try:
+        for name, value in params.items():
+            dist = distributions[name]
+            if not dist._contains(dist.to_internal_repr(value)):
+                return None
+    except (TypeError, ValueError):
+        return None
+    return params, distributions
+
+
+def _compatible_seed_params(config: dict, dataset: str, search_space: str, max_warmup: int):
+    if dataset == "bacteria_2024_mz10":
+        return _highrange_seed_params(config, search_space)
+    return _generic_seed_params(config, max_warmup)
+
+
+def import_seed_trials(
+    study,
+    paths,
+    dataset: str,
+    protocol: str,
+    search_space: str,
+    expected_repeats: int = 5,
+    max_warmup: int = 50,
+) -> int:
     """Import compatible completed results as Optuna observations, never reruns."""
     import optuna
 
@@ -313,9 +609,13 @@ def import_seed_trials(study, paths, dataset: str, protocol: str, search_space: 
             if row.get("protocol") != protocol or row.get("valid_mcc") is None:
                 continue
             config = dict(row.get("config", {}))
-            compatible = _highrange_seed_params(config, search_space)
+            compatible = _compatible_seed_params(
+                config, dataset, search_space, max_warmup
+            )
             folds = row.get("metrics", {}).get("valid_mcc_folds", [])
-            if compatible is None or len(folds) != 5:
+            if compatible is None:
+                continue
+            if folds and len(folds) != int(expected_repeats):
                 continue
             params, distributions = compatible
             signature = json.dumps(params, sort_keys=True, default=str)
@@ -323,7 +623,7 @@ def import_seed_trials(study, paths, dataset: str, protocol: str, search_space: 
                 continue
             intermediate = {
                 hp_search.FOLD_PRUNE_STEP_BASE + index: float(np.mean(folds[:index]))
-                for index in range(1, 6)
+                for index in range(1, len(folds) + 1)
             }
             frozen = optuna.trial.create_trial(
                 params=params,
@@ -518,13 +818,16 @@ def run_worker(args) -> int:
         "batches": batch_values,
         "selection_metric": "valid_mcc",
         "pruning": {
+            "enabled": bool(args.pruning),
             "warmup_pruning": False,
             "classifier_patience": 30,
-            "epoch_checks": "classifier epochs 10,15,20,... on fold 1",
-            "minimum_reference_trials": hp_search.PRUNE_MIN_REFERENCE_TRIALS,
-            "reference_percentile": hp_search.PRUNE_PERCENTILE,
-            "fold1_hard_floor": 0.35,
-            "fold2_mean_floor": 0.55,
+            "epoch_checks": "classifier epochs 10,15,20,... on promotion repeats 1-2 only",
+            "minimum_reference_trials": int(args.prune_min_reference_trials),
+            "epoch_reference_percentile": hp_search.PRUNE_PERCENTILE,
+            "repeat1_reference_percentile": float(args.repeat1_prune_percentile),
+            "repeat2_reference_percentile": float(args.repeat2_prune_percentile),
+            "promotion_schedule": "repeat 1 -> repeat 2 -> all remaining repeats",
+            "checkpoint_resume": True,
         },
         "test_role": (
             "not_used_grouped_cv" if protocol == "grouped_cv"
@@ -566,17 +869,50 @@ def run_worker(args) -> int:
     study = optuna.create_study(
         study_name=f"independent_{dataset}",
         direction="maximize",
-        sampler=optuna.samplers.TPESampler(seed=args.seed),
+        sampler=optuna.samplers.TPESampler(seed=args.seed, n_startup_trials=5),
         storage=storage,
         load_if_exists=True,
     )
+
+    if protocol == "fixed_external":
+        seed_requested = CV_FOLDS.get(dataset, args.n_repeats)
+    elif protocol == "grouped_cv":
+        seed_requested = GROUPED_CV_FOLDS[dataset]
+    else:
+        seed_requested = CYCLIC_CV_FOLDS.get(dataset, len(batch_values))
+    expected_repeats = hp_search.resolve_n_repeats(seed_requested, batches)
+    warmup_cap = 150 if args.mz10_search_space.startswith("highrange_") else 50
+    max_warmup = max(1, min(warmup_cap, args.n_epochs))
+
+    seed_paths = list(args.seed_trials_from)
+    if args.auto_seed_history:
+        seed_paths.extend(discover_local_seed_trials(dataset, out))
+    seed_paths.extend(download_wandb_seed_trials(args, dataset, protocol, out))
+    # Preserve order but avoid importing the same file twice.
+    seed_paths = list(dict.fromkeys(Path(path) for path in seed_paths))
     imported_seed_trials = import_seed_trials(
-        study, args.seed_trials_from, dataset, protocol, args.mz10_search_space
+        study,
+        seed_paths,
+        dataset,
+        protocol,
+        args.mz10_search_space,
+        expected_repeats=expected_repeats,
+        max_warmup=max_warmup,
     )
     if imported_seed_trials:
-        print(f"[transfer seed] imported {imported_seed_trials} compatible completed trials", flush=True)
-    if args.resume:
-        mark_interrupted_failed(study)
+        print(
+            f"[transfer seed] imported {imported_seed_trials} compatible completed trials "
+            f"before new sampling",
+            flush=True,
+        )
+    meta["hpo_bootstrap"] = {
+        "compatible_seed_trials": int(imported_seed_trials),
+        "expected_repeats": int(expected_repeats),
+        "seed_sources": [str(path) for path in seed_paths],
+        "auto_local_history": bool(args.auto_seed_history),
+        "wandb_history": bool(args.seed_from_wandb),
+    }
+    atomic_json(meta_path, meta)
 
     wb = None
     if not args.no_wandb:
@@ -625,10 +961,13 @@ def run_worker(args) -> int:
             "provenance/dataset_sha256": ",".join(
                 row["sha256"] for row in provenance["dataset_files"]
             ),
+            "hpo/historical_seed_trials": int(imported_seed_trials),
+            "hpo/expected_repeats": int(expected_repeats),
         })
 
     try:
         completed_before = sorted(completed(study), key=lambda item: item.number)
+        resume_queue = sorted(interrupted_trials(study), key=lambda item: item.number) if args.resume else []
         terminal_states = {
             optuna.trial.TrialState.COMPLETE,
             optuna.trial.TrialState.PRUNED,
@@ -669,7 +1008,15 @@ def run_worker(args) -> int:
             )
         trial_indices = range(attempts_before, args.n_trials) if not sanity_blocked else ()
         for index in trial_indices:
-            trial = study.ask()
+            if resume_queue:
+                frozen = resume_queue.pop(0)
+                trial = optuna.trial.Trial(study, frozen._trial_id)
+                print(
+                    f"[resume] continuing trial {trial.number} from completed-repeat checkpoints",
+                    flush=True,
+                )
+            else:
+                trial = study.ask()
             run_args = hp_search.parse_args([])
             run_args.dataset = dataset
             run_args.n_epochs = args.n_epochs
@@ -685,8 +1032,19 @@ def run_worker(args) -> int:
             run_args.results_dir = str(out / "bernn")
             run_args.classifier_patience = 30
             run_args.early_warmup_stop = 0
-            run_args.enable_optuna_pruning = dataset == "bacteria_2024_mz10"
+            run_args.enable_optuna_pruning = bool(args.pruning)
+            run_args.repeat1_prune_percentile = float(args.repeat1_prune_percentile)
+            run_args.repeat2_prune_percentile = float(args.repeat2_prune_percentile)
+            run_args.prune_min_reference_trials = int(args.prune_min_reference_trials)
+            run_args.epoch_prune_percentile = hp_search.PRUNE_PERCENTILE
+            run_args.epoch_prune_start = 10
+            run_args.epoch_prune_interval = 5
+            run_args.repeat1_hard_floor = 0.35 if dataset == "bacteria_2024_mz10" else 0.0
+            run_args.repeat2_hard_floor = 0.55 if dataset == "bacteria_2024_mz10" else None
             run_args.optuna_trial = trial
+            run_args.fold_checkpoint_dir = str(
+                out / "trial_checkpoints" / f"trial_{trial.number:05d}"
+            )
 
             if protocol == "fixed_external":
                 requested = CV_FOLDS.get(dataset, args.n_repeats)
@@ -774,6 +1132,24 @@ def run_worker(args) -> int:
                         "pruning/classifier_epoch": trial.user_attrs.get(
                             "pruning_classifier_epoch"
                         ),
+                        "pruning/stage": trial.user_attrs.get("pruning_stage"),
+                        "pruning/repeat": trial.user_attrs.get("pruning_repeat"),
+                        "pruning/reference_count": trial.user_attrs.get(
+                            "pruning_reference_count"
+                        ),
+                        "pruning/cutoff": trial.user_attrs.get("pruning_cutoff"),
+                        "pruning/resource_repeats_completed": trial.user_attrs.get(
+                            "resource_repeats_completed"
+                        ),
+                        "pruning/predicted_final_mcc": trial.user_attrs.get(
+                            "predicted_final_mcc"
+                        ),
+                        "pruning/predicted_final_mcc_std": trial.user_attrs.get(
+                            "predicted_final_mcc_std"
+                        ),
+                        "pruning/predicted_final_cutoff": trial.user_attrs.get(
+                            "predicted_final_cutoff"
+                        ),
                         **config_metrics(config),
                     })
                     save_wandb_files(
@@ -826,6 +1202,15 @@ def run_worker(args) -> int:
                     "best/valid_mcc": float(best.value),
                     "best/test_mcc": best_metrics.get("test_mcc"),
                     "best/trial_number": int(best.number),
+                    "pruning/resource_repeats_completed": current.user_attrs.get(
+                        "resource_repeats_completed"
+                    ),
+                    "pruning/predicted_final_mcc": current.user_attrs.get(
+                        "predicted_final_mcc"
+                    ),
+                    "pruning/predicted_final_mcc_std": current.user_attrs.get(
+                        "predicted_final_mcc_std"
+                    ),
                     **wandb_metrics(current_metrics),
                     **config_metrics(dict(current.user_attrs.get("config", {}))),
                 })

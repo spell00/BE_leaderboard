@@ -98,9 +98,13 @@ import numpy as np
 import pandas as pd
 
 EPOCH_PRUNE_STEP_BASE = 100_000
+EPOCH_PRUNE_FOLD_STRIDE = 1_000
 FOLD_PRUNE_STEP_BASE = 200_000
 PRUNE_MIN_REFERENCE_TRIALS = 5
 PRUNE_PERCENTILE = 25.0
+REPEAT1_PRUNE_PERCENTILE = 25.0
+REPEAT2_PRUNE_PERCENTILE = 50.0
+REPEAT1_HARD_FLOOR = 0.0
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -401,7 +405,38 @@ def run_cyclic_batch_trial(cfg: dict, args, data, exp_id: str):
     oof_test_predictions = np.full(len(y), "", dtype=object)
     oof_test_mask = np.zeros(len(y), dtype=bool)
 
+    resume_fold = 0
+    for cached_idx, cached_split in enumerate(splits):
+        cached = load_fold_checkpoint(args, cfg, cached_idx)
+        if cached is None:
+            break
+        cached_valid = float(cached["valid_mcc"])
+        cached_test = float(cached["test_mcc"])
+        cached_predictions = np.asarray(cached["test_predictions"]).astype(str)
+        cached_test_idx = np.asarray(cached_split["test_idx"], dtype=int)
+        cached_test_labeled = supervised_mask[cached_test_idx]
+        valid_scores.append(cached_valid)
+        test_scores.append(cached_test)
+        oof_test_predictions[cached_test_idx[cached_test_labeled]] = cached_predictions[cached_test_labeled]
+        oof_test_mask[cached_test_idx[cached_test_labeled]] = True
+        cached_metrics = dict(cached.get("metrics", {}))
+        fold_metrics.append(cached_metrics)
+        traces = cached_metrics.get("_epoch_traces", [])
+        if traces:
+            epoch_traces_by_fold[str(cached_idx)] = traces
+        optuna_trial = getattr(args, "optuna_trial", None)
+        if optuna_trial is not None:
+            report_repeat_progress(optuna_trial, valid_scores, args, cached_idx)
+        resume_fold += 1
+        print(
+            f"[cyclic resume] restored round {cached_idx + 1}/{n_rounds} "
+            f"valid MCC={cached_valid:.4f} test MCC={cached_test:.4f}",
+            flush=True,
+        )
+
     for fold_idx, split in enumerate(splits):
+        if fold_idx < resume_fold:
+            continue
         train_idx = split["train_idx"]
         valid_idx = split["valid_idx"]
         test_idx = split["test_idx"]
@@ -410,6 +445,11 @@ def run_cyclic_batch_trial(cfg: dict, args, data, exp_id: str):
         fold_args.n_repeats = n_rounds
         fold_args.resolved_n_repeats = n_rounds
         fold_args.trainer_n_repeats = 1
+        fold_args.optuna_trial = getattr(args, "optuna_trial", None)
+        fold_args.fold_index = fold_idx
+        fold_args.enable_epoch_pruning = bool(
+            getattr(args, "enable_optuna_pruning", False) and fold_idx < 2
+        )
 
         fit_data = (
             X.iloc[train_idx].reset_index(drop=True),
@@ -484,6 +524,20 @@ def run_cyclic_batch_trial(cfg: dict, args, data, exp_id: str):
             "test_mcc": test_mcc,
         })
         fold_metrics.append(metrics)
+        save_fold_checkpoint(
+            args,
+            cfg,
+            fold_idx,
+            {
+                "valid_mcc": float(valid_mcc),
+                "test_mcc": float(test_mcc),
+                "test_predictions": predictions.tolist(),
+                "metrics": metrics,
+            },
+        )
+        optuna_trial = getattr(args, "optuna_trial", None)
+        if optuna_trial is not None:
+            report_repeat_progress(optuna_trial, valid_scores, args, fold_idx)
 
         print(
             f"[cyclic cv] round {fold_idx + 1}/{n_rounds} "
@@ -1014,6 +1068,185 @@ def percentile_prune_cutoff(
     return float(np.percentile(values, float(percentile)))
 
 
+def predict_final_mcc_from_partial(
+    trial,
+    step: int,
+    partial_value: float,
+    min_reference_trials: int = 8,
+):
+    """Fit a tiny historical partial->final calibrator and return prediction/std/count."""
+    import optuna
+
+    x_values = []
+    y_values = []
+    for previous in trial.study.get_trials(deepcopy=False):
+        if previous.number == trial.number or previous.state != optuna.trial.TrialState.COMPLETE:
+            continue
+        x = previous.intermediate_values.get(int(step))
+        y = previous.value
+        if x is None or y is None:
+            continue
+        if not (np.isfinite(x) and np.isfinite(y)):
+            continue
+        x_values.append(float(x))
+        y_values.append(float(y))
+    if len(x_values) < int(min_reference_trials):
+        return None
+
+    x = np.asarray(x_values, dtype=float)
+    y = np.asarray(y_values, dtype=float)
+    if float(np.std(x)) < 1e-8:
+        prediction = float(np.mean(y))
+        residual_std = float(np.std(y))
+    else:
+        slope, intercept = np.polyfit(x, y, 1)
+        fitted = slope * x + intercept
+        prediction = float(slope * float(partial_value) + intercept)
+        residual_std = float(np.std(y - fitted))
+    return prediction, residual_std, len(x_values)
+
+
+def report_repeat_progress(trial, fold_scores, args, fold_idx: int) -> None:
+    """Report repeat fidelity and prune weak trials after repeat 1 or 2."""
+    if trial is None:
+        return
+
+    import optuna
+
+    completed = int(fold_idx) + 1
+    partial_mean = float(np.mean(fold_scores))
+    step = FOLD_PRUNE_STEP_BASE + completed
+    trial.report(partial_mean, step=step)
+    trial.set_user_attr("partial_valid_mcc_folds", [float(x) for x in fold_scores])
+    trial.set_user_attr("partial_valid_mcc_mean", partial_mean)
+    trial.set_user_attr("resource_repeats_completed", completed)
+
+    resolved = int(getattr(args, "resolved_n_repeats", completed))
+    if (
+        not bool(getattr(args, "enable_optuna_pruning", False))
+        or completed >= resolved
+        or completed not in (1, 2)
+    ):
+        return
+
+    min_refs = int(getattr(args, "prune_min_reference_trials", PRUNE_MIN_REFERENCE_TRIALS))
+    percentile = float(
+        getattr(
+            args,
+            f"repeat{completed}_prune_percentile",
+            REPEAT1_PRUNE_PERCENTILE if completed == 1 else REPEAT2_PRUNE_PERCENTILE,
+        )
+    )
+    references = _reference_intermediate_values(trial, step)
+    cutoff = percentile_prune_cutoff(references, percentile, min_refs)
+    trial.set_user_attr("pruning_repeat", completed)
+    trial.set_user_attr("pruning_reference_count", len(references))
+    trial.set_user_attr("pruning_percentile", percentile)
+    trial.set_user_attr("pruning_cutoff", cutoff)
+
+    prediction = predict_final_mcc_from_partial(
+        trial,
+        step,
+        partial_mean,
+        min_reference_trials=max(8, min_refs),
+    )
+    if prediction is not None:
+        predicted_final, prediction_std, prediction_n = prediction
+        trial.set_user_attr("predicted_final_mcc", predicted_final)
+        trial.set_user_attr("predicted_final_mcc_std", prediction_std)
+        trial.set_user_attr("predicted_final_mcc_reference_count", prediction_n)
+    else:
+        predicted_final = prediction_std = None
+
+    hard_floor = getattr(args, f"repeat{completed}_hard_floor", None)
+    if completed == 1 and hard_floor is None:
+        hard_floor = REPEAT1_HARD_FLOOR
+    if hard_floor is not None and partial_mean < float(hard_floor):
+        trial.set_user_attr("pruning_stage", f"repeat_{completed}_hard_floor")
+        raise optuna.TrialPruned(
+            f"repeat {completed} mean MCC {partial_mean:.4f} below hard floor "
+            f"{float(hard_floor):.4f}"
+        )
+
+    if cutoff is not None and partial_mean < cutoff:
+        trial.set_user_attr("pruning_stage", f"repeat_{completed}_percentile")
+        raise optuna.TrialPruned(
+            f"repeat {completed} mean MCC {partial_mean:.4f} below historical "
+            f"p{percentile:g} cutoff {cutoff:.4f} from {len(references)} completed trials"
+        )
+
+    # A second, conservative gate: prune only when even the predicted final MCC
+    # plus one residual standard deviation remains below the same percentile of
+    # historical final scores.
+    if predicted_final is not None:
+        final_values = [
+            float(previous.value)
+            for previous in trial.study.get_trials(deepcopy=False)
+            if previous.value is not None
+            and getattr(previous.state, "name", "") == "COMPLETE"
+            and np.isfinite(previous.value)
+        ]
+        final_cutoff = percentile_prune_cutoff(
+            final_values,
+            percentile=percentile,
+            min_reference_trials=max(8, min_refs),
+        )
+        trial.set_user_attr("predicted_final_cutoff", final_cutoff)
+        if (
+            final_cutoff is not None
+            and predicted_final + prediction_std < final_cutoff
+        ):
+            trial.set_user_attr("pruning_stage", f"repeat_{completed}_predicted_final")
+            raise optuna.TrialPruned(
+                f"repeat {completed} predicted final MCC {predicted_final:.4f} "
+                f"+ 1sd {prediction_std:.4f} below historical p{percentile:g} "
+                f"final cutoff {final_cutoff:.4f}"
+            )
+
+
+def _config_signature(cfg: dict) -> str:
+    payload = json.dumps(cfg, sort_keys=True, default=str, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _fold_checkpoint_path(args, fold_idx: int) -> Path | None:
+    root = getattr(args, "fold_checkpoint_dir", None)
+    if not root:
+        return None
+    return Path(root) / f"fold_{int(fold_idx):02d}.json"
+
+
+def load_fold_checkpoint(args, cfg: dict, fold_idx: int):
+    """Load one completed-repeat checkpoint if it belongs to this exact config."""
+    path = _fold_checkpoint_path(args, fold_idx)
+    if path is None or not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text())
+    except Exception:
+        return None
+    if payload.get("config_signature") != _config_signature(cfg):
+        return None
+    return payload
+
+
+def save_fold_checkpoint(args, cfg: dict, fold_idx: int, payload: dict) -> None:
+    """Atomically persist one completed repeat so interrupted trials can resume."""
+    path = _fold_checkpoint_path(args, fold_idx)
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "schema_version": 1,
+        "config_signature": _config_signature(cfg),
+        "fold": int(fold_idx),
+        **payload,
+    }
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(record, indent=2, default=str) + "\n")
+    os.replace(tmp, path)
+
+
 def _install_post_warmup_epoch_pruner(trainer, args) -> None:
     """Prune only after classifier training begins; warmup always completes."""
     trial = getattr(args, "optuna_trial", None)
@@ -1040,8 +1273,11 @@ def _install_post_warmup_epoch_pruner(trainer, args) -> None:
             if np.isfinite(mcc):
                 state["best_valid_mcc"] = max(state["best_valid_mcc"], mcc)
             epoch = int(state["classifier_epoch"])
-            if epoch >= 10 and epoch % 5 == 0:
-                step = EPOCH_PRUNE_STEP_BASE + epoch
+            start_epoch = int(getattr(args, "epoch_prune_start", 10))
+            interval = int(getattr(args, "epoch_prune_interval", 5))
+            if epoch >= start_epoch and (epoch - start_epoch) % max(1, interval) == 0:
+                fold_index = int(getattr(args, "fold_index", 0))
+                step = EPOCH_PRUNE_STEP_BASE + fold_index * EPOCH_PRUNE_FOLD_STRIDE + epoch
                 best_valid = float(state["best_valid_mcc"])
                 trial.report(best_valid, step=step)
                 trial.set_user_attr("pruning_classifier_epoch", epoch)
@@ -1052,14 +1288,21 @@ def _install_post_warmup_epoch_pruner(trainer, args) -> None:
                         f"collapsed learning curve at classifier epoch {epoch}: "
                         f"train_mcc={state['train_mcc']:.4f}, best_valid_mcc={best_valid:.4f}"
                     )
-                cutoff = percentile_prune_cutoff(_reference_intermediate_values(trial, step))
+                cutoff = percentile_prune_cutoff(
+                    _reference_intermediate_values(trial, step),
+                    percentile=float(getattr(args, "epoch_prune_percentile", PRUNE_PERCENTILE)),
+                    min_reference_trials=int(
+                        getattr(args, "prune_min_reference_trials", PRUNE_MIN_REFERENCE_TRIALS)
+                    ),
+                )
                 if cutoff is not None and best_valid < cutoff:
                     state["bad_percentile_checks"] += 1
                 else:
                     state["bad_percentile_checks"] = 0
                 if state["bad_percentile_checks"] >= 2:
                     raise optuna.TrialPruned(
-                        f"learning curve below completed-trial p{PRUNE_PERCENTILE:g} "
+                        f"learning curve below completed-trial p"
+                        f"{float(getattr(args, 'epoch_prune_percentile', PRUNE_PERCENTILE)):g} "
                         f"for two checks at classifier epoch {epoch}: "
                         f"best_valid_mcc={best_valid:.4f}, cutoff={cutoff:.4f}"
                     )
@@ -1506,7 +1749,41 @@ def run_trial(cfg: dict, args, data, exp_id: str, fixed_test_data=None):
             y, batches, int(args.n_repeats), getattr(args, "cv_split_cache", None)
         )
 
+    split_iter = list(split_iter)
+
+    # Resume only a contiguous prefix of fully completed repeats. A partially
+    # trained repeat is deliberately retrained from its beginning.
+    resume_fold = 0
+    for cached_idx in range(len(split_iter)):
+        cached = load_fold_checkpoint(args, cfg, cached_idx)
+        if cached is None:
+            break
+        cached_metrics = dict(cached.get("metrics", {}))
+        cached_mcc = float(cached["valid_mcc"])
+        fold_scores.append(cached_mcc)
+        fold_metrics.append(cached_metrics)
+        traces = cached_metrics.get("_epoch_traces", [])
+        if traces:
+            epoch_traces_by_fold[str(cached_idx)] = traces
+        cached_predictions = cached.get("fixed_test_predictions")
+        if cached_predictions is not None:
+            fixed_test_predictions.append(np.asarray(cached_predictions).astype(str))
+            cached_test_mcc = cached_metrics.get("test_mcc")
+            if cached_test_mcc is not None:
+                fixed_test_mcc_scores.append(float(cached_test_mcc))
+        optuna_trial = getattr(args, "optuna_trial", None)
+        if optuna_trial is not None:
+            report_repeat_progress(optuna_trial, fold_scores, args, cached_idx)
+        resume_fold += 1
+        print(
+            f"[trial resume] restored fold {cached_idx + 1}/{resolved_n_repeats} "
+            f"valid MCC={cached_mcc:.4f}",
+            flush=True,
+        )
+
     for fold_idx, (train_idx, test_idx) in enumerate(split_iter):
+        if fold_idx < resume_fold:
+            continue
         model_y = np.asarray(y).astype(object).copy()
         if is_alzheimer:
             # Split whole technical batches, not only their labeled rows. Pool
@@ -1550,8 +1827,9 @@ def run_trial(cfg: dict, args, data, exp_id: str, fixed_test_data=None):
         fold_args.resolved_n_repeats = resolved_n_repeats
         fold_args.trainer_n_repeats = 1
         fold_args.optuna_trial = getattr(args, "optuna_trial", None)
+        fold_args.fold_index = fold_idx
         fold_args.enable_epoch_pruning = bool(
-            getattr(args, "enable_optuna_pruning", False) and fold_idx == 0
+            getattr(args, "enable_optuna_pruning", False) and fold_idx < 2
         )
         fit_data = (
             fold_data[0],
@@ -1626,28 +1904,21 @@ def run_trial(cfg: dict, args, data, exp_id: str, fixed_test_data=None):
         metrics["selected_features"] = float(len(selected_features))
         fold_scores.append(float(mcc))
         fold_metrics.append(metrics)
+        save_fold_checkpoint(
+            args,
+            cfg,
+            fold_idx,
+            {
+                "valid_mcc": float(mcc),
+                "metrics": metrics,
+                "fixed_test_predictions": (
+                    None if fixed_test_data is None else fixed_test_predictions[-1].tolist()
+                ),
+            },
+        )
         optuna_trial = getattr(args, "optuna_trial", None)
         if optuna_trial is not None:
-            import optuna
-
-            partial_mean = float(np.mean(fold_scores))
-            step = FOLD_PRUNE_STEP_BASE + fold_idx + 1
-            optuna_trial.report(partial_mean, step=step)
-            optuna_trial.set_user_attr("partial_valid_mcc_folds", list(fold_scores))
-            optuna_trial.set_user_attr("partial_valid_mcc_mean", partial_mean)
-            if bool(getattr(args, "enable_optuna_pruning", False)) and fold_idx in {0, 1}:
-                references = _reference_intermediate_values(optuna_trial, step)
-                cutoff = percentile_prune_cutoff(references)
-                if cutoff is not None:
-                    if fold_idx == 0 and partial_mean < 0.35:
-                        raise optuna.TrialPruned(
-                            f"fold-1 MCC {partial_mean:.4f} below calibrated hard floor 0.35"
-                        )
-                    if fold_idx == 1 and partial_mean < max(0.55, cutoff):
-                        raise optuna.TrialPruned(
-                            f"two-fold mean {partial_mean:.4f} below cutoff "
-                            f"{max(0.55, cutoff):.4f}"
-                        )
+            report_repeat_progress(optuna_trial, fold_scores, args, fold_idx)
         held_batches = sorted(set(np.asarray(batches)[test_idx].astype(str)))
         print(
             f"[trial cv] fold {fold_idx + 1}/{resolved_n_repeats} "
@@ -1730,8 +2001,12 @@ def make_objective(args, data):
             trial.set_user_attr(k, v)
         exp_id = f"{args.out_prefix}_{args.dataset}_t{trial.number}"
         trial.set_user_attr("mlflow_exp", exp_id)
+        trial_args = argparse.Namespace(**vars(args))
+        trial_args.optuna_trial = trial
         try:
-            score, metrics = run_trial(cfg, args, data, exp_id)
+            score, metrics = run_trial(cfg, trial_args, data, exp_id)
+        except __import__("optuna").TrialPruned:
+            raise
         except Exception as exc:  # a bad config shouldn't kill the whole study
             trial.set_user_attr("error", f"{type(exc).__name__}: {exc}")
             print(f"[trial {trial.number}] FAILED: {type(exc).__name__}: {exc}")
@@ -1887,11 +2162,26 @@ def parse_args(argv=None):
                    help="Run one named family (fixes dloss+variational; sets out-prefix).")
     p.add_argument("--no-wandb", action="store_true",
                    help="Disable Weights & Biases logging (MLflow stays on).")
+    p.add_argument(
+        "--optuna-pruning",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable staged epoch/repeat pruning (default: enabled).",
+    )
+    p.add_argument("--repeat1-prune-percentile", type=float, default=REPEAT1_PRUNE_PERCENTILE)
+    p.add_argument("--repeat2-prune-percentile", type=float, default=REPEAT2_PRUNE_PERCENTILE)
+    p.add_argument("--repeat1-hard-floor", type=float, default=REPEAT1_HARD_FLOOR)
+    p.add_argument("--repeat2-hard-floor", type=float, default=None)
+    p.add_argument("--prune-min-reference-trials", type=int, default=PRUNE_MIN_REFERENCE_TRIALS)
+    p.add_argument("--epoch-prune-percentile", type=float, default=PRUNE_PERCENTILE)
+    p.add_argument("--epoch-prune-start", type=int, default=10)
+    p.add_argument("--epoch-prune-interval", type=int, default=5)
     p.add_argument("--out-prefix", default="bernn_hpsearch",
                    help="Prefix for the output CSV/JSON files.")
     p.add_argument("--results-dir", default=str(ROOT / "results"),
                    help="Directory for the trials CSV / best JSON (default: results/).")
     args = p.parse_args(argv)
+    args.enable_optuna_pruning = bool(args.optuna_pruning)
     if args.preset:
         fam = PRESETS[args.preset]
         args.dloss = fam["dloss"]
