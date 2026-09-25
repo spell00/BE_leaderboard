@@ -288,6 +288,19 @@ def download_wandb_seed_trials(args, dataset: str, protocol: str, output_dir: Pa
                 continue
             run_root = root / str(run.id)
             run_root.mkdir(parents=True, exist_ok=True)
+            feature_method = (
+                (config.get("feature_selection") or {}).get("method")
+                or config.get("feature_select_method")
+            )
+            atomic_json(
+                run_root / "seed_source_metadata.json",
+                {
+                    "feature_select_method": feature_method,
+                    "n_epochs": config.get("n_epochs"),
+                    "wandb_run_id": str(run.id),
+                    "wandb_run_state": str(getattr(run, "state", "")),
+                },
+            )
             for remote in run.files():
                 if not str(remote.name).endswith("trials.json"):
                     continue
@@ -329,6 +342,8 @@ def download_wandb_seed_trials(args, dataset: str, protocol: str, output_dir: Pa
                         folds.append(float(value))
                     history_records.append({
                         "protocol": protocol,
+                        "feature_select_method": feature_method,
+                        "n_epochs": config.get("n_epochs"),
                         "valid_mcc": float(valid),
                         "test_mcc": item.get("metrics/test_mcc"),
                         "fit_seconds": item.get("runtime/fit_seconds"),
@@ -588,6 +603,28 @@ def _compatible_seed_params(config: dict, dataset: str, search_space: str, max_w
     return _generic_seed_params(config, max_warmup)
 
 
+def _seed_source_metadata(path: Path) -> dict:
+    """Best-effort metadata for one persisted historical trial bank."""
+    path = Path(path)
+    candidates = [path.parent / "run_metadata.json"]
+    candidates.extend(parent / "seed_source_metadata.json" for parent in path.parents[:4])
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        try:
+            payload = json.loads(candidate.read_text())
+        except Exception:
+            continue
+        feature = payload.get("feature_select_method")
+        if feature is None:
+            feature = (payload.get("feature_selection") or {}).get("method")
+        return {
+            "feature_select_method": feature,
+            "n_epochs": payload.get("n_epochs"),
+        }
+    return {}
+
+
 def import_seed_trials(
     study,
     paths,
@@ -596,6 +633,8 @@ def import_seed_trials(
     search_space: str,
     expected_repeats: int = 5,
     max_warmup: int = 50,
+    feature_select_method: str | None = None,
+    expected_n_epochs: int | None = None,
 ) -> int:
     """Import compatible completed results as Optuna observations, never reruns."""
     import optuna
@@ -609,9 +648,20 @@ def import_seed_trials(
         path = _seed_trial_path(Path(raw), dataset)
         if not path.exists():
             raise FileNotFoundError(f"Seed trial file not found: {path}")
+        source_meta = _seed_source_metadata(path)
         for row in json.loads(path.read_text()):
             if row.get("protocol") != protocol or row.get("valid_mcc") is None:
                 continue
+            source_feature = row.get(
+                "feature_select_method", source_meta.get("feature_select_method")
+            )
+            if feature_select_method is not None:
+                if source_feature is None or str(source_feature) != str(feature_select_method):
+                    continue
+            source_epochs = row.get("n_epochs", source_meta.get("n_epochs"))
+            if expected_n_epochs is not None and source_epochs is not None:
+                if int(source_epochs) != int(expected_n_epochs):
+                    continue
             config = dict(row.get("config", {}))
             compatible = _compatible_seed_params(
                 config, dataset, search_space, max_warmup
@@ -902,6 +952,8 @@ def run_worker(args) -> int:
         args.mz10_search_space,
         expected_repeats=expected_repeats,
         max_warmup=max_warmup,
+        feature_select_method=feature_select_method if dataset == "bacteria_2024_mz10" else None,
+        expected_n_epochs=args.n_epochs,
     )
     if imported_seed_trials:
         print(

@@ -183,3 +183,36 @@ def test_generic_completed_trial_without_fold_array_still_seeds_tpe(tmp_path):
     assert seeded.value == 0.72
     assert seeded.intermediate_values == {}
     assert seeded.user_attrs["transfer_seed"] is True
+
+
+def test_seed_import_rejects_mismatched_mz10_feature_selector(tmp_path):
+    import json
+    import optuna
+
+    config = {
+        "dloss": "no", "variational": False, "kan": False,
+        "class_triplet": False, "lr": 1e-3, "wd": 1e-5,
+        "smoothing": 0.01, "dropout": 0.2, "warmup": 47,
+        "n_layers": 1, "layer1": 512, "scaler": "standard",
+    }
+    path = tmp_path / "trials.json"
+    path.write_text(json.dumps([{
+        "protocol": "grouped_cv",
+        "feature_select_method": "f_classif",
+        "n_epochs": 1000,
+        "valid_mcc": 0.8,
+        "config": config,
+        "metrics": {"valid_mcc_folds": [0.7, 0.8, 0.75, 0.85, 0.9]},
+    }]))
+    study = optuna.create_study(direction="maximize")
+    assert import_seed_trials(
+        study,
+        [path],
+        "bacteria_2024_mz10",
+        "grouped_cv",
+        "highrange_plain",
+        expected_repeats=5,
+        max_warmup=150,
+        feature_select_method="xgboost_gain",
+        expected_n_epochs=1000,
+    ) == 0
