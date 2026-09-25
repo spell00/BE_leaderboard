@@ -30,6 +30,18 @@ def test_cyclic_five_groups_all_batches_without_dropping_any():
     assert _role_batches(splits, "test_batches") == sorted(set(batches))
 
 
+def test_cyclic_custom_batch_order_preserves_coverage():
+    batches = np.repeat(["b1", "b2", "b3", "b4", "b5", "b6"], 2)
+    custom_order = ["b1", "b4", "b2", "b6", "b3", "b5"]
+    splits = cyclic_train_valid_test_splits(
+        batches, n_splits=3, batch_order=custom_order
+    )
+
+    assert len(splits) == 3
+    assert _role_batches(splits, "valid_batches") == sorted(set(batches))
+    assert _role_batches(splits, "test_batches") == sorted(set(batches))
+
+
 def test_requested_folds_cannot_exceed_evaluable_batches():
     batches = np.repeat(["1", "2", "3", "4"], 2)
     with pytest.raises(ValueError, match="only 4 evaluable batches"):

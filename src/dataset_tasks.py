@@ -206,7 +206,9 @@ def cyclic_train_valid_splits(batches, eligible_mask=None, n_splits: int = -1):
     return splits
 
 
-def cyclic_train_valid_test_splits(batches, eligible_mask=None, n_splits: int = -1):
+def cyclic_train_valid_test_splits(
+    batches, eligible_mask=None, n_splits: int = -1, batch_order=None
+):
     """Rotate grouped batch roles for symmetric train/validation/test CV.
 
     n_splits=-1 is leave-one-batch-out over every evaluable batch. For a
@@ -233,7 +235,18 @@ def cyclic_train_valid_test_splits(batches, eligible_mask=None, n_splits: int = 
             raise ValueError("eligible_mask must have one boolean per sample")
         eligible_values = values[eligible_mask]
 
-    ordered = sorted(set(eligible_values.tolist()), key=_natural_batch_key)
+    eligible_set = set(eligible_values.tolist())
+    if batch_order is None:
+        ordered = sorted(eligible_set, key=_natural_batch_key)
+    else:
+        ordered = [str(value) for value in batch_order]
+        if len(ordered) != len(set(ordered)):
+            raise ValueError("batch_order must not contain duplicates")
+        if set(ordered) != eligible_set:
+            raise ValueError(
+                "batch_order must contain every evaluable batch exactly once; "
+                f"expected={sorted(eligible_set, key=_natural_batch_key)} got={ordered}"
+            )
     n_batches = len(ordered)
     if n_batches < 3:
         raise ValueError(
@@ -308,10 +321,10 @@ def cyclic_train_valid_test_splits(batches, eligible_mask=None, n_splits: int = 
         [batch for row in splits for batch in row["test_batches"]],
         key=_natural_batch_key,
     )
-    if valid_roles != ordered:
+    expected_roles = sorted(ordered, key=_natural_batch_key)
+    if valid_roles != expected_roles:
         raise AssertionError("Each evaluable batch must appear exactly once as validation")
-    if test_roles != ordered:
+    if test_roles != expected_roles:
         raise AssertionError("Each evaluable batch must appear exactly once as test")
 
     return splits
-

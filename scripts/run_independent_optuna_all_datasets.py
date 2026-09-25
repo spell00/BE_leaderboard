@@ -7,8 +7,9 @@ datasets first.
 
 Existing datasets keep the meta-hpo-bank fixed-external protocol: Optuna sees
 only grouped-CV validation MCC, while the labeled *_inference.csv cross-test is
-monitoring-only. New whole-dataset benchmarks use cyclic batch train/valid/test
-on *_all.csv; test MCC is likewise excluded from selection.
+monitoring-only. Most new whole-dataset benchmarks use cyclic batch
+train/valid/test. The high-concentration mz10 task uses grouped train/validation
+CV with training-fold-only feature selection and no per-trial test split.
 """
 
 from __future__ import annotations
@@ -32,12 +33,13 @@ if str(ROOT) not in sys.path:
 
 from scripts import hp_search
 from src.evolutionary_meta import recommended_batch_size
+from src.run_provenance import capture_run_provenance
 
 DATASETS = (
     # New datasets first.
+    ("bacteria_2024_mz10", "grouped_cv"),
     ("jdlber_sle_maldi", "cyclic"),
     ("seqc_maqc", "cyclic"),
-    ("scib_pancreas", "cyclic"),
     # Existing meta-hpo-bank datasets.
     ("normal_tissue_878", "fixed_external"),
     ("colon_3041", "fixed_external"),
@@ -45,6 +47,16 @@ DATASETS = (
     ("massbench_benchmark", "fixed_external"),
     ("massbench_alzheimer", "fixed_external"),
 )
+CYCLIC_CV_FOLDS = {
+    # Large whole-dataset benchmarks use grouped three-fold cyclic CV instead
+    # of one round per acquisition batch.
+    "scib_pancreas": 3,
+}
+GROUPED_CV_FOLDS = {"bacteria_2024_mz10": 5}
+GROUPED_FEATURE_COUNTS = {"bacteria_2024_mz10": 10_000}
+GROUPED_FEATURE_METHODS = {"bacteria_2024_mz10": "hybrid_xgboost_f"}
+MZ10_SANITY_MIN_VALID_MCC = 0.35
+MZ10_SANITY_MIN_TRAIN_MCC = 0.90
 CV_FOLDS = {
     "normal_tissue_878": 3,
     "colon_3041": 3,
@@ -72,11 +84,37 @@ def parse_args(argv=None):
     p.add_argument("--datasets", default=None, help="Optional comma-separated subset.")
     p.add_argument("--prepare-missing", action="store_true")
     p.add_argument("--resume", action="store_true")
+    p.add_argument(
+        "--seed-trials-from", type=Path, action="append", default=[],
+        help=("Import compatible completed trials.json records into a new study "
+              "as TPE evidence without retraining them; repeatable."),
+    )
     p.add_argument("--no-wandb", action="store_true")
     p.add_argument("--wandb-project", default="BE_leaderboard_meta_evolution")
     p.add_argument("--wandb-group", default="independent-optuna-all-datasets-20")
+    p.add_argument(
+        "--feature-select-method",
+        choices=("f_classif", "xgboost_gain", "hybrid_xgboost_f"),
+        default=None,
+        help="Override the grouped-CV training-fold feature selector.",
+    )
+    p.add_argument(
+        "--mz10-search-space",
+        choices=(
+            "plain",
+            "extended_nonvariational",
+            "highrange_plain",
+            "highrange_extended_nonvariational",
+        ),
+        default="plain",
+        help="Choose the mz10 BERNN family search; extended mode keeps VAE disabled.",
+    )
     p.add_argument("--worker-dataset", default=None, help=argparse.SUPPRESS)
-    p.add_argument("--worker-protocol", choices=("fixed_external", "cyclic"), help=argparse.SUPPRESS)
+    p.add_argument(
+        "--worker-protocol",
+        choices=("fixed_external", "cyclic", "grouped_cv"),
+        help=argparse.SUPPRESS,
+    )
     return p.parse_args(argv)
 
 
@@ -85,6 +123,26 @@ def atomic_json(path: Path, payload) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2, default=str) + "\n")
     os.replace(tmp, path)
+
+
+def save_wandb_files(run, paths, *, base_path: Path) -> int:
+    """Upload explicit files or directory trees into the run's Files tab."""
+    files = []
+    for raw_path in paths:
+        path = Path(raw_path)
+        if path.is_file():
+            files.append(path)
+        elif path.is_dir():
+            files.extend(candidate for candidate in path.rglob("*") if candidate.is_file())
+    unique_files = sorted({path.resolve() for path in files})
+    for path in unique_files:
+        run.save(
+            str(path),
+            base_path=str(base_path.resolve()),
+            policy="now",
+            glob=False,
+        )
+    return len(unique_files)
 
 
 def selected_datasets(raw: str | None) -> list[tuple[str, str]]:
@@ -100,7 +158,13 @@ def selected_datasets(raw: str | None) -> list[tuple[str, str]]:
 
 def required_path(dataset: str, protocol: str) -> Path:
     base = ROOT / "data" / "datasets" / dataset
-    suffix = "_all.csv" if protocol == "cyclic" else "_train.csv"
+    if protocol in {"cyclic", "grouped_cv"}:
+        sparse_matrix = base / f"{dataset}_features_csr.npz"
+        sparse_metadata = base / f"{dataset}_metadata.csv"
+        sparse_names = base / f"{dataset}_feature_names.npy"
+        if all(path.exists() for path in (sparse_matrix, sparse_metadata, sparse_names)):
+            return sparse_matrix
+    suffix = "_all.csv" if protocol in {"cyclic", "grouped_cv"} else "_train.csv"
     return base / f"{dataset}{suffix}"
 
 
@@ -125,12 +189,159 @@ def completed(study):
     ]
 
 
+def mz10_sanity_gate(metrics: dict, valid_mcc: float) -> tuple[bool, dict]:
+    """Require basic learning before spending the remaining mz10 HPO budget."""
+    train_mcc = metrics.get(
+        "mcc_train_all_concentrations", metrics.get("train_mcc")
+    )
+    valid_ok = float(valid_mcc) >= MZ10_SANITY_MIN_VALID_MCC
+    train_ok = train_mcc is None or float(train_mcc) >= MZ10_SANITY_MIN_TRAIN_MCC
+    details = {
+        "passed": bool(valid_ok and train_ok),
+        "valid_mcc": float(valid_mcc),
+        "train_mcc": None if train_mcc is None else float(train_mcc),
+        "min_valid_mcc": MZ10_SANITY_MIN_VALID_MCC,
+        "min_train_mcc": MZ10_SANITY_MIN_TRAIN_MCC,
+    }
+    return details["passed"], details
+
+
 def mark_interrupted_failed(study) -> None:
     import optuna
     for trial in study.get_trials(deepcopy=False):
         if trial.state == optuna.trial.TrialState.RUNNING:
             study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
             print(f"[resume] marked trial {trial.number} FAIL", flush=True)
+
+
+def _seed_trial_path(path: Path, dataset: str) -> Path:
+    if path.is_file():
+        return path
+    direct = path / "trials.json"
+    nested = path / dataset / "trials.json"
+    if direct.exists():
+        return direct
+    return nested
+
+
+def _highrange_seed_params(config: dict, search_space: str):
+    """Return current-space params/distributions, or None if incompatible."""
+    import optuna
+
+    layer1 = int(config.get("layer1", -1))
+    warmup = int(config.get("warmup", -1))
+    dropout = float(config.get("dropout", float("nan")))
+    if not (512 <= layer1 <= 2048 and (layer1 - 512) % 128 == 0):
+        return None
+    if not (1 <= warmup <= 150 and 0.0 <= dropout <= 0.5):
+        return None
+    if bool(config.get("variational", False)):
+        return None
+
+    params = {
+        "lr": float(config["lr"]), "wd": float(config["wd"]),
+        "smoothing": float(config["smoothing"]), "dropout": dropout,
+        "warmup": warmup, "n_layers": int(config["n_layers"]),
+        "layer1": layer1, "scaler": str(config["scaler"]),
+    }
+    distributions = {
+        "lr": optuna.distributions.FloatDistribution(3e-4, 3e-3, log=True),
+        "wd": optuna.distributions.FloatDistribution(1e-6, 1e-4, log=True),
+        "smoothing": optuna.distributions.FloatDistribution(0.0, 0.05),
+        "dropout": optuna.distributions.FloatDistribution(0.0, 0.5),
+        "warmup": optuna.distributions.IntDistribution(1, 150),
+        "n_layers": optuna.distributions.CategoricalDistribution((1, 2)),
+        "layer1": optuna.distributions.IntDistribution(512, 2048, step=128),
+        "scaler": optuna.distributions.CategoricalDistribution(("standard", "robust")),
+    }
+    if search_space == "highrange_plain":
+        if any((config.get("dloss", "no") != "no", bool(config.get("kan", False)),
+                bool(config.get("class_triplet", False)))):
+            return None
+        return params, distributions
+    if search_space != "highrange_extended_nonvariational":
+        return None
+
+    dloss = str(config.get("dloss", "no"))
+    allowed = ("no", "inverseTriplet", "DANN", "normae", "revDANN", "revTriplet")
+    if dloss not in allowed:
+        return None
+    params.update({
+        "dloss": dloss,
+        "kan": bool(config.get("kan", False)),
+        "class_triplet": bool(config.get("class_triplet", False)),
+        "margin": float(config.get("margin", 1.0)),
+    })
+    distributions.update({
+        "dloss": optuna.distributions.CategoricalDistribution(allowed),
+        "kan": optuna.distributions.CategoricalDistribution((False, True)),
+        "class_triplet": optuna.distributions.CategoricalDistribution((False, True)),
+        "margin": optuna.distributions.FloatDistribution(0.5, 5.0),
+    })
+    if params["class_triplet"]:
+        params["class_triplet_w"] = float(config.get("class_triplet_w", 0.0))
+        distributions["class_triplet_w"] = optuna.distributions.FloatDistribution(0.05, 1.0, log=True)
+    if dloss != "no":
+        params["nu"] = float(config.get("nu", 0.0))
+        distributions["nu"] = optuna.distributions.FloatDistribution(1e-3, 0.5, log=True)
+    if dloss in hp_search.ADVERSARIAL_DLOSS:
+        params["gamma"] = float(config.get("gamma", 0.0))
+        distributions["gamma"] = optuna.distributions.FloatDistribution(1e-3, 0.5, log=True)
+    try:
+        for name, value in params.items():
+            if not distributions[name]._contains(distributions[name].to_internal_repr(value)):
+                return None
+    except (TypeError, ValueError):
+        return None
+    return params, distributions
+
+
+def import_seed_trials(study, paths, dataset: str, protocol: str, search_space: str) -> int:
+    """Import compatible completed results as Optuna observations, never reruns."""
+    import optuna
+
+    existing = {
+        json.dumps(t.params, sort_keys=True, default=str)
+        for t in study.get_trials(deepcopy=False)
+    }
+    imported = 0
+    for raw in paths:
+        path = _seed_trial_path(Path(raw), dataset)
+        if not path.exists():
+            raise FileNotFoundError(f"Seed trial file not found: {path}")
+        for row in json.loads(path.read_text()):
+            if row.get("protocol") != protocol or row.get("valid_mcc") is None:
+                continue
+            config = dict(row.get("config", {}))
+            compatible = _highrange_seed_params(config, search_space)
+            folds = row.get("metrics", {}).get("valid_mcc_folds", [])
+            if compatible is None or len(folds) != 5:
+                continue
+            params, distributions = compatible
+            signature = json.dumps(params, sort_keys=True, default=str)
+            if signature in existing:
+                continue
+            intermediate = {
+                hp_search.FOLD_PRUNE_STEP_BASE + index: float(np.mean(folds[:index]))
+                for index in range(1, 6)
+            }
+            frozen = optuna.trial.create_trial(
+                params=params,
+                distributions=distributions,
+                value=float(row["valid_mcc"]),
+                intermediate_values=intermediate,
+                user_attrs={
+                    "transfer_seed": True,
+                    "transfer_seed_source": str(path),
+                    "config": config,
+                    "metrics": row.get("metrics", {}),
+                    "fit_seconds": row.get("fit_seconds"),
+                },
+            )
+            study.add_trial(frozen)
+            existing.add(signature)
+            imported += 1
+    return imported
 
 
 def json_metric(value):
@@ -245,6 +456,9 @@ def persist_trials(output_dir: Path, rows: list[dict]) -> None:
 
 def run_worker(args) -> int:
     dataset, protocol = args.worker_dataset, args.worker_protocol
+    feature_select_method = (
+        args.feature_select_method or GROUPED_FEATURE_METHODS.get(dataset)
+    )
     out = args.output_dir / dataset
     out.mkdir(parents=True, exist_ok=True)
     if args.prepare_missing:
@@ -253,17 +467,35 @@ def run_worker(args) -> int:
     if not target.exists():
         raise FileNotFoundError(f"Missing {target}; use --prepare-missing or prepare it first")
 
-    if protocol == "cyclic":
-        source_file = f"{dataset}_all.csv"
-        data = hp_search.load_cyclic_dataset(dataset, source_file=source_file)
+    dataset_files = [target]
+    if protocol in {"cyclic", "grouped_cv"}:
+        target = required_path(dataset, protocol)
+        if target.suffix == ".npz":
+            source_file = target.name
+            data = hp_search.load_cyclic_dataset(dataset)
+        else:
+            source_file = f"{dataset}_all.csv"
+            data = hp_search.load_cyclic_dataset(dataset, source_file=source_file)
         fixed_test = None
     else:
         source_file = f"{dataset}_train.csv"
         inference = ROOT / "data" / "datasets" / dataset / f"{dataset}_inference.csv"
         if not inference.exists():
             raise FileNotFoundError(f"Missing labeled fixed cross-test file {inference}")
+        dataset_files.append(inference)
         data = hp_search.load_dataset(dataset)
         fixed_test = hp_search.load_fixed_test_dataset(dataset)
+    for seed_path in args.seed_trials_from:
+        resolved_seed = _seed_trial_path(Path(seed_path), dataset)
+        if resolved_seed.exists():
+            dataset_files.append(resolved_seed)
+
+    provenance_snapshot, provenance = capture_run_provenance(
+        repo_root=ROOT,
+        output_dir=out,
+        dataset_files=dataset_files,
+        argv=[sys.executable, *sys.argv],
+    )
 
     X, _, batches = data
     batch_values = sorted(np.unique(np.asarray(batches).astype(str)).tolist())
@@ -285,9 +517,42 @@ def run_worker(args) -> int:
         "n_batches": len(batch_values),
         "batches": batch_values,
         "selection_metric": "valid_mcc",
-        "test_role": "monitoring_only_excluded_from_optuna",
+        "pruning": {
+            "warmup_pruning": False,
+            "classifier_patience": 30,
+            "epoch_checks": "classifier epochs 10,15,20,... on fold 1",
+            "minimum_reference_trials": hp_search.PRUNE_MIN_REFERENCE_TRIALS,
+            "reference_percentile": hp_search.PRUNE_PERCENTILE,
+            "fold1_hard_floor": 0.35,
+            "fold2_mean_floor": 0.55,
+        },
+        "test_role": (
+            "not_used_grouped_cv" if protocol == "grouped_cv"
+            else "monitoring_only_excluded_from_optuna"
+        ),
+        "feature_selection": (
+            {
+                "method": feature_select_method,
+                "k": GROUPED_FEATURE_COUNTS.get(dataset),
+                "fit_scope": "training_fold_only",
+                "xgboost_source": "MSML3 mz10 parameters; refit per fold",
+            }
+            if protocol == "grouped_cv" else None
+        ),
+        "mz10_search_space": (
+            args.mz10_search_space if dataset == "bacteria_2024_mz10" else None
+        ),
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "wandb_run_id": meta.get("wandb_run_id") or uuid.uuid4().hex[:8],
+        "provenance": {
+            "launch_id": provenance["launch_id"],
+            "manifest": str(provenance_snapshot / "manifest.json"),
+            "repository_file_count": len(provenance["repository_files"]),
+            "training_code_file_count": len(provenance["training_code_files"]),
+            "training_code_log": provenance["training_code_log"],
+            "bernn_file_count": len(provenance["bernn_files"]),
+            "dataset_files": provenance["dataset_files"],
+        },
     })
     atomic_json(meta_path, meta)
 
@@ -305,6 +570,11 @@ def run_worker(args) -> int:
         storage=storage,
         load_if_exists=True,
     )
+    imported_seed_trials = import_seed_trials(
+        study, args.seed_trials_from, dataset, protocol, args.mz10_search_space
+    )
+    if imported_seed_trials:
+        print(f"[transfer seed] imported {imported_seed_trials} compatible completed trials", flush=True)
     if args.resume:
         mark_interrupted_failed(study)
 
@@ -324,15 +594,81 @@ def run_worker(args) -> int:
         wandb.define_metric("metrics/*", step_metric="trial_index")
         wandb.define_metric("folds/*", step_metric="trial_index")
         wandb.define_metric("best/*", step_metric="trial_index")
+        artifact_name = f"{dataset}-run-provenance-{meta['wandb_run_id']}"
+        artifact = wandb.Artifact(
+            name=artifact_name,
+            type="run-provenance",
+            description="Exact source, BERNN, environment, git, and data-hash snapshot used by this launch.",
+            metadata={
+                "launch_id": provenance["launch_id"],
+                "dataset": dataset,
+                "protocol": protocol,
+                "git_head": provenance["git"]["head"].get("output", "").strip(),
+                "dataset_files": provenance["dataset_files"],
+            },
+        )
+        artifact.add_dir(str(provenance_snapshot))
+        wb.log_artifact(artifact, aliases=["latest", provenance["launch_id"]])
+        files_tab_count = save_wandb_files(
+            wb,
+            [provenance_snapshot, Path(provenance["training_code_log"]), meta_path],
+            base_path=args.output_dir,
+        )
+        wb.summary.update({
+            "provenance/artifact": artifact_name,
+            "provenance/launch_id": provenance["launch_id"],
+            "provenance/git_head": provenance["git"]["head"].get("output", "").strip(),
+            "provenance/repository_files": len(provenance["repository_files"]),
+            "provenance/training_code_files": len(provenance["training_code_files"]),
+            "provenance/bernn_files": len(provenance["bernn_files"]),
+            "provenance/files_tab_files": files_tab_count,
+            "provenance/dataset_sha256": ",".join(
+                row["sha256"] for row in provenance["dataset_files"]
+            ),
+        })
 
     try:
-        start = len(completed(study))
+        completed_before = sorted(completed(study), key=lambda item: item.number)
+        terminal_states = {
+            optuna.trial.TrialState.COMPLETE,
+            optuna.trial.TrialState.PRUNED,
+            optuna.trial.TrialState.FAIL,
+        }
+        attempts_before = sum(
+            trial.state in terminal_states and not trial.user_attrs.get("transfer_seed", False)
+            for trial in study.get_trials(deepcopy=False)
+        )
+        sanity_trials = [
+            item for item in completed_before
+            if item.user_attrs.get("config", {}).get("search_stage") == "sanity"
+        ]
+        sanity_blocked = False
+        if (
+            dataset == "bacteria_2024_mz10"
+            and args.mz10_search_space == "plain"
+            and sanity_trials
+        ):
+            sanity_trial = sanity_trials[0]
+            sanity_metrics = dict(sanity_trial.user_attrs.get("metrics", {}))
+            sanity_passed, sanity_details = mz10_sanity_gate(
+                sanity_metrics, float(sanity_trial.value)
+            )
+            atomic_json(out / "sanity_gate.json", sanity_details)
+            sanity_blocked = not sanity_passed
         print(
             f"[worker] {dataset}: protocol={protocol} samples={len(X)} "
-            f"features={X.shape[1]} batches={len(batch_values)} completed={start}/{args.n_trials}",
+            f"features={X.shape[1]} batches={len(batch_values)} "
+            f"attempted={attempts_before}/{args.n_trials} transfer_seeds={imported_seed_trials}",
             flush=True,
         )
-        for index in range(start, args.n_trials):
+        if sanity_blocked:
+            print(
+                f"[sanity gate] mz10 remains below the learning gate: {sanity_details}; "
+                "constrained HPO will not consume the remaining budget",
+                flush=True,
+            )
+        trial_indices = range(attempts_before, args.n_trials) if not sanity_blocked else ()
+        for index in trial_indices:
             trial = study.ask()
             run_args = hp_search.parse_args([])
             run_args.dataset = dataset
@@ -342,22 +678,61 @@ def run_worker(args) -> int:
             run_args.seed = args.seed
             run_args.no_wandb = True
             run_args.combine_test = False
-            run_args.max_warmup = max(1, min(50, args.n_epochs))
+            warmup_cap = 150 if args.mz10_search_space.startswith("highrange_") else 50
+            run_args.max_warmup = max(1, min(warmup_cap, args.n_epochs))
             run_args.log1p = True
             run_args.bs = recommended_batch_size(batches, cap=args.batch_size)
             run_args.results_dir = str(out / "bernn")
+            run_args.classifier_patience = 30
+            run_args.early_warmup_stop = 0
+            run_args.enable_optuna_pruning = dataset == "bacteria_2024_mz10"
+            run_args.optuna_trial = trial
 
             if protocol == "fixed_external":
                 requested = CV_FOLDS.get(dataset, args.n_repeats)
                 run_args.n_repeats = requested
                 run_args.resolved_n_repeats = hp_search.resolve_n_repeats(requested, batches)
                 run_args.cv_split_cache = str(out / "cv_splits.npz")
+            elif protocol == "grouped_cv":
+                requested = GROUPED_CV_FOLDS[dataset]
+                run_args.n_repeats = requested
+                run_args.resolved_n_repeats = hp_search.resolve_n_repeats(requested, batches)
+                run_args.trainer_n_repeats = 1
+                run_args.cv_split_cache = str(out / "cv_splits.npz")
+                run_args.feature_select_k = GROUPED_FEATURE_COUNTS[dataset]
+                run_args.feature_select_method = feature_select_method
+                run_args.feature_select_cache_dir = str(out / "feature_selection")
             else:
-                run_args.n_repeats = len(batch_values)
-                run_args.resolved_n_repeats = len(batch_values)
+                requested = CYCLIC_CV_FOLDS.get(dataset, len(batch_values))
+                run_args.n_repeats = requested
+                run_args.resolved_n_repeats = hp_search.resolve_n_repeats(
+                    requested, batches
+                )
                 run_args.trainer_n_repeats = 1
 
-            config = hp_search.sample_config(trial, run_args)
+            is_plain_mz10 = (
+                dataset == "bacteria_2024_mz10"
+                and args.mz10_search_space == "plain"
+            )
+            is_mz10_sanity = is_plain_mz10 and not sanity_trials
+            if dataset == "bacteria_2024_mz10":
+                if args.mz10_search_space == "highrange_extended_nonvariational":
+                    config = hp_search.sample_mz10_highrange_nonvariational_config(
+                        trial, run_args
+                    )
+                    config["search_stage"] = "highrange_extended_nonvariational"
+                elif args.mz10_search_space == "extended_nonvariational":
+                    config = hp_search.sample_mz10_nonvariational_config(trial, run_args)
+                    config["search_stage"] = "extended_nonvariational"
+                elif args.mz10_search_space == "highrange_plain":
+                    config = hp_search.sample_mz10_highrange_plain_config(trial, run_args)
+                    config["search_stage"] = "highrange_plain"
+                else:
+                    run_args.force_sanity_config = is_mz10_sanity
+                    config = hp_search.sample_mz10_plain_config(trial, run_args)
+                    config["search_stage"] = "sanity" if is_mz10_sanity else "constrained_hpo"
+            else:
+                config = hp_search.sample_config(trial, run_args)
             config["log1p"] = True
             config.update({
                 "batch_size": int(run_args.bs),
@@ -377,6 +752,36 @@ def run_worker(args) -> int:
                         config, run_args, data, exp_id, fixed_test_data=fixed_test
                     )
                 score = float(score)
+            except optuna.TrialPruned as exc:
+                fit_seconds = time.monotonic() - started
+                trial.set_user_attr("config", config)
+                trial.set_user_attr("fit_seconds", fit_seconds)
+                trial.set_user_attr("pruned_reason", str(exc))
+                study.tell(trial, state=optuna.trial.TrialState.PRUNED)
+                print(f"[worker] {dataset} trial {trial.number} pruned: {exc}", flush=True)
+                rows = records_for(study, protocol)
+                persist_trials(out, rows)
+                if wb:
+                    wb.log({
+                        "trial_index": index,
+                        "trial_number": int(trial.number),
+                        "status/pruned": 1,
+                        "runtime/fit_seconds": fit_seconds,
+                        "pruning/partial_valid_mcc": trial.user_attrs.get(
+                            "partial_valid_mcc_mean",
+                            trial.user_attrs.get("pruning_best_valid_mcc"),
+                        ),
+                        "pruning/classifier_epoch": trial.user_attrs.get(
+                            "pruning_classifier_epoch"
+                        ),
+                        **config_metrics(config),
+                    })
+                    save_wandb_files(
+                        wb,
+                        [out / "trials.json", out / "trials.csv", out / "optuna.sqlite3"],
+                        base_path=args.output_dir,
+                    )
+                continue
             except Exception as exc:
                 score = -1.0
                 error = f"{type(exc).__name__}: {exc}"
@@ -394,6 +799,18 @@ def run_worker(args) -> int:
 
             rows = records_for(study, protocol)
             persist_trials(out, rows)
+            if wb:
+                save_wandb_files(
+                    wb,
+                    [
+                        out / "trials.json",
+                        out / "trials.csv",
+                        out / "cv_splits.npz",
+                        out / "feature_selection",
+                        out / "sanity_gate.json",
+                    ],
+                    base_path=args.output_dir,
+                )
             done = sorted(completed(study), key=lambda x: x.number)
             current = done[-1]
             best = max(done, key=lambda x: float(x.value))
@@ -418,8 +835,26 @@ def run_worker(args) -> int:
                 f"best_valid={float(best.value):.4f} best_test={best_metrics.get('test_mcc')}",
                 flush=True,
             )
+            if is_mz10_sanity:
+                sanity_passed, sanity_details = mz10_sanity_gate(
+                    current_metrics, float(current.value)
+                )
+                atomic_json(out / "sanity_gate.json", sanity_details)
+                print(f"[sanity gate] mz10 {sanity_details}", flush=True)
+                sanity_trials.append(current)
+                if not sanity_passed:
+                    print(
+                        "[sanity gate] stopping mz10 before constrained HPO; "
+                        "the plain BERNN MLP did not clear the learning gate",
+                        flush=True,
+                    )
+                    break
 
-        best = max(completed(study), key=lambda x: float(x.value))
+        finished = completed(study)
+        if not finished:
+            print(f"[worker] {dataset}: no completed trials", flush=True)
+            return 1
+        best = max(finished, key=lambda x: float(x.value))
         best_metrics = dict(best.user_attrs.get("metrics", {}))
         summary = {
             "dataset": dataset,
@@ -438,6 +873,21 @@ def run_worker(args) -> int:
         return 0
     finally:
         if wb:
+            save_wandb_files(
+                wb,
+                [
+                    meta_path,
+                    out / "trials.json",
+                    out / "trials.csv",
+                    out / "summary.json",
+                    out / "sanity_gate.json",
+                    out / "cv_splits.npz",
+                    out / "feature_selection",
+                    out / "optuna.sqlite3",
+                    args.output_dir / "logs" / f"{dataset}.log",
+                ],
+                base_path=args.output_dir,
+            )
             wb.finish()
         try:
             storage.engine.dispose()
@@ -489,6 +939,12 @@ def run_launcher(args) -> int:
                 cmd.append("--no-wandb")
             if args.prepare_missing:
                 cmd.append("--prepare-missing")
+            if args.feature_select_method:
+                cmd.extend(["--feature-select-method", args.feature_select_method])
+            if args.mz10_search_space != "plain":
+                cmd.extend(["--mz10-search-space", args.mz10_search_space])
+            for seed_path in args.seed_trials_from:
+                cmd.extend(["--seed-trials-from", str(seed_path)])
 
             env = os.environ.copy()
             env["CUDA_VISIBLE_DEVICES"] = gpu

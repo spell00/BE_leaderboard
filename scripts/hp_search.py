@@ -97,6 +97,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+EPOCH_PRUNE_STEP_BASE = 100_000
+FOLD_PRUNE_STEP_BASE = 200_000
+PRUNE_MIN_REFERENCE_TRIALS = 5
+PRUNE_PERCENTILE = 25.0
+
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -119,6 +124,16 @@ warnings.filterwarnings("ignore")
 logging.getLogger("ax").setLevel(logging.ERROR)
 
 DATASETS_DIR = ROOT / "data" / "datasets"
+CYCLIC_BATCH_ORDERS = {
+    # Three contiguous 5-batch groups. Each group contains every one of the 29
+    # supervised classes, so any group can train while the other two serve as
+    # validation and test in the three-round cyclic protocol.
+    "bacteria_2024_mz10": [
+        "b1", "b15", "b4", "b5", "b7",
+        "b12", "b13", "b14", "b8", "b9",
+        "b10", "b11", "b2", "b3", "b6",
+    ],
+}
 # MLflow tracking store (DVC-tracked). Every trial's metrics land here.
 MLRUNS_DIR = ROOT / "mlruns"
 
@@ -265,6 +280,47 @@ def load_cyclic_dataset(name: str, source_file: str | None = None):
     Pass source_file=<dataset>_train.csv to work on the development split only.
     """
     base = DATASETS_DIR / name
+    sparse_matrix = base / f"{name}_features_csr.npz"
+    sparse_metadata = base / f"{name}_metadata.csv"
+    sparse_feature_names = base / f"{name}_feature_names.npy"
+    if source_file is None and all(
+        path.exists() for path in (sparse_matrix, sparse_metadata, sparse_feature_names)
+    ):
+        from scipy import sparse
+
+        matrix = sparse.load_npz(sparse_matrix).tocsr().astype(np.float32)
+        metadata = pd.read_csv(sparse_metadata)
+        feature_names = np.load(sparse_feature_names, allow_pickle=True).astype(str)
+        if matrix.shape[0] != len(metadata):
+            raise ValueError(
+                f"Sparse bundle row mismatch for {name}: "
+                f"matrix={matrix.shape[0]} metadata={len(metadata)}"
+            )
+        if matrix.shape[1] != len(feature_names):
+            raise ValueError(
+                f"Sparse bundle feature mismatch for {name}: "
+                f"matrix={matrix.shape[1]} names={len(feature_names)}"
+            )
+        required = {"name", "label", "batch"}
+        if not required.issubset(metadata.columns):
+            raise ValueError(
+                f"Sparse bundle metadata for {name} lacks "
+                f"{sorted(required - set(metadata.columns))}"
+            )
+        X = pd.DataFrame(matrix.toarray(), columns=feature_names, dtype=np.float32)
+        y = metadata["label"].astype(str).to_numpy()
+        batches = metadata["batch"].astype(str).to_numpy()
+        cyclic_train_valid_test_splits(
+            batches, batch_order=CYCLIC_BATCH_ORDERS.get(name)
+        )
+        print(
+            f"[cyclic data] dataset={name} source=sparse_bundle "
+            f"labeled_rows={len(metadata)} features={X.shape[1]} "
+            f"batches={len(set(batches.tolist()))}",
+            flush=True,
+        )
+        return X, y, batches
+
     if source_file is None:
         try:
             source_path = ensure_all_dataset_file(ROOT, name)
@@ -293,7 +349,9 @@ def load_cyclic_dataset(name: str, source_file: str | None = None):
     y = frame["label"].astype(str).to_numpy()
     batches = frame["batch"].astype(str).to_numpy()
 
-    cyclic_train_valid_test_splits(batches)
+    cyclic_train_valid_test_splits(
+        batches, batch_order=CYCLIC_BATCH_ORDERS.get(name)
+    )
     print(
         f"[cyclic data] dataset={name} source={source_path.name} "
         f"labeled_rows={len(frame)} batches={len(set(batches.tolist()))}",
@@ -326,6 +384,8 @@ def run_cyclic_batch_trial(cfg: dict, args, data, exp_id: str):
     splits = cyclic_train_valid_test_splits(
         batches,
         eligible_mask=supervised_mask if is_alzheimer else None,
+        n_splits=int(getattr(args, "resolved_n_repeats", -1)),
+        batch_order=CYCLIC_BATCH_ORDERS.get(getattr(args, "dataset", "")),
     )
     n_rounds = len(splits)
 
@@ -490,6 +550,10 @@ def build_trainer_config(cfg: dict, args, exp_id: str):
         update_grid=bool(cfg["kan"]),  # KAN-only; enabling with MLP crashes bernn
         groupkfold=True,
         n_epochs=int(args.n_epochs),
+        early_stop=int(getattr(args, "classifier_patience", 30)),
+        # Optuna pruning is post-warmup only. Zero guarantees that BERNN does
+        # not shorten the configured representation warmup internally.
+        early_warmup_stop=int(getattr(args, "early_warmup_stop", 0)),
         # hp_search owns the outer CV loop.  BERNN's cross_test=True path also
         # interprets n_repeats as an internal fit loop, so external folds set
         # trainer_n_repeats=1 to ensure one BERNN fit per explicit fold.
@@ -535,6 +599,8 @@ def sample_config(trial, args) -> dict:
     log1p = trial.suggest_categorical("log1p", [False, True]) if args.log1p is None else args.log1p
     if args.class_triplet is None:
         class_triplet_w = trial.suggest_float("class_triplet_w", 0.0, 1.0, log=False)
+    else:
+        class_triplet_w = float(args.class_triplet_w or 0.0)
 
     cfg = {
         "model_type": getattr(args, "model_type", "joint"),
@@ -560,6 +626,223 @@ def sample_config(trial, args) -> dict:
         "beta": trial.suggest_float("beta", 1e-2, 1e2, log=True) if variational else 0.0,
     }
     return cfg
+
+
+def sample_mz10_plain_config(trial, args) -> dict:
+    """Sample the deliberately narrow BERNN-MLP space used for mz10.
+
+    Trial zero is a deterministic sanity configuration. Later trials retain the
+    same plain MLP family and tune only the parameters that can plausibly improve
+    classification; batch-adversarial, VAE, KAN, and triplet variants are kept
+    out of this first stage.
+    """
+    baseline = {
+        "model_type": "joint",
+        "dloss": "no",
+        "variational": False,
+        "kan": False,
+        "class_triplet": False,
+        "class_triplet_w": 0.0,
+        "lr": 1e-3,
+        "wd": 1e-5,
+        "nu": 1.0,
+        "smoothing": 0.0,
+        "margin": 1.0,
+        "dropout": 0.1,
+        "thres": 0.0,
+        "warmup": min(20, int(args.max_warmup)),
+        "n_layers": 2,
+        "layer1": 512,
+        "log1p": True,
+        "scaler": "standard",
+        "gamma": 0.0,
+        "beta": 0.0,
+    }
+    if bool(getattr(args, "force_sanity_config", False)) or int(trial.number) == 0:
+        return baseline
+    return {
+        **baseline,
+        "lr": trial.suggest_float("lr", 3e-4, 3e-3, log=True),
+        "wd": trial.suggest_float("wd", 1e-6, 1e-4, log=True),
+        "nu": trial.suggest_float("nu", 0.25, 4.0, log=True),
+        "smoothing": trial.suggest_float("smoothing", 0.0, 0.05),
+        "dropout": trial.suggest_float("dropout", 0.0, 0.2),
+        "warmup": trial.suggest_int(
+            "warmup", min(10, int(args.max_warmup)), int(args.max_warmup)
+        ),
+        "n_layers": trial.suggest_categorical("n_layers", [1, 2]),
+        "layer1": trial.suggest_int("layer1", 256, 512, step=64),
+        "scaler": trial.suggest_categorical("scaler", ["standard", "robust"]),
+    }
+
+
+def sample_mz10_nonvariational_config(trial, args) -> dict:
+    """Search BERNN corrections/KAN/triplet on mz10 without a VAE.
+
+    Trial zero deliberately exercises inverseTriplet + KAN + class-triplet.
+    Later trials ablate those choices. Domain weights stay conservative because
+    analytical batch and organism class are strongly confounded in this task.
+    """
+    if int(trial.number) == 0:
+        return {
+            "model_type": "joint",
+            "dloss": "inverseTriplet",
+            "variational": False,
+            "kan": True,
+            "class_triplet": True,
+            "class_triplet_w": 0.25,
+            "lr": 1e-3,
+            "wd": 1e-5,
+            "nu": 0.05,
+            "smoothing": 0.0,
+            "margin": 1.0,
+            "dropout": 0.1,
+            "thres": 0.0,
+            "warmup": min(20, int(args.max_warmup)),
+            "n_layers": 2,
+            "layer1": 512,
+            "log1p": True,
+            "scaler": "standard",
+            "gamma": 0.05,
+            "beta": 0.0,
+        }
+
+    dloss = trial.suggest_categorical(
+        "dloss", ["no", "inverseTriplet", "DANN", "normae", "revDANN", "revTriplet"]
+    )
+    class_triplet = trial.suggest_categorical("class_triplet", [False, True])
+    return {
+        "model_type": "joint",
+        "dloss": dloss,
+        "variational": False,
+        "kan": trial.suggest_categorical("kan", [False, True]),
+        "class_triplet": class_triplet,
+        "class_triplet_w": (
+            trial.suggest_float("class_triplet_w", 0.05, 1.0, log=True)
+            if class_triplet else 0.0
+        ),
+        "lr": trial.suggest_float("lr", 3e-4, 3e-3, log=True),
+        "wd": trial.suggest_float("wd", 1e-6, 1e-4, log=True),
+        "nu": (
+            trial.suggest_float("nu", 1e-3, 0.5, log=True)
+            if dloss != "no" else 0.0
+        ),
+        "smoothing": trial.suggest_float("smoothing", 0.0, 0.05),
+        "margin": trial.suggest_float("margin", 0.5, 5.0),
+        "dropout": trial.suggest_float("dropout", 0.0, 0.2),
+        "thres": 0.0,
+        "warmup": trial.suggest_int(
+            "warmup", min(10, int(args.max_warmup)), int(args.max_warmup)
+        ),
+        "n_layers": trial.suggest_categorical("n_layers", [1, 2]),
+        "layer1": trial.suggest_int("layer1", 256, 512, step=64),
+        "log1p": True,
+        "scaler": trial.suggest_categorical("scaler", ["standard", "robust"]),
+        "gamma": (
+            trial.suggest_float("gamma", 1e-3, 0.5, log=True)
+            if dloss in ADVERSARIAL_DLOSS else 0.0
+        ),
+        "beta": 0.0,
+    }
+
+
+def sample_mz10_highrange_plain_config(trial, args) -> dict:
+    """Second-stage plain MLP search beyond the original mz10 upper bounds."""
+    baseline = {
+        "model_type": "joint",
+        "dloss": "no",
+        "variational": False,
+        "kan": False,
+        "class_triplet": False,
+        "class_triplet_w": 0.0,
+        "lr": 9.790043280847745e-4,
+        "wd": 2.4197610035022675e-5,
+        "nu": 0.0,
+        "smoothing": 0.021527892913496827,
+        "margin": 1.0,
+        "dropout": 0.2,
+        "thres": 0.0,
+        "warmup": 50,
+        "n_layers": 1,
+        "layer1": 512,
+        "log1p": True,
+        "scaler": "standard",
+        "gamma": 0.0,
+        "beta": 0.0,
+    }
+    if int(trial.number) == 0:
+        return baseline
+    return {
+        **baseline,
+        "lr": trial.suggest_float("lr", 3e-4, 3e-3, log=True),
+        "wd": trial.suggest_float("wd", 1e-6, 1e-4, log=True),
+        "smoothing": trial.suggest_float("smoothing", 0.0, 0.05),
+        "dropout": trial.suggest_float("dropout", 0.0, 0.5),
+        "warmup": trial.suggest_int("warmup", 1, int(args.max_warmup)),
+        "n_layers": trial.suggest_categorical("n_layers", [1, 2]),
+        "layer1": trial.suggest_int("layer1", 512, 2048, step=128),
+        "scaler": trial.suggest_categorical("scaler", ["standard", "robust"]),
+    }
+
+
+def sample_mz10_highrange_nonvariational_config(trial, args) -> dict:
+    """Second-stage KAN/domain/triplet search beyond mz10 boundary optima."""
+    if int(trial.number) == 0:
+        return {
+            "model_type": "joint",
+            "dloss": "inverseTriplet",
+            "variational": False,
+            "kan": True,
+            "class_triplet": True,
+            "class_triplet_w": 0.25,
+            "lr": 1e-3,
+            "wd": 1e-5,
+            "nu": 0.05,
+            "smoothing": 0.0,
+            "margin": 1.0,
+            "dropout": 0.2,
+            "thres": 0.0,
+            "warmup": 50,
+            "n_layers": 2,
+            "layer1": 512,
+            "log1p": True,
+            "scaler": "standard",
+            "gamma": 0.05,
+            "beta": 0.0,
+        }
+
+    dloss = trial.suggest_categorical(
+        "dloss", ["no", "inverseTriplet", "DANN", "normae", "revDANN", "revTriplet"]
+    )
+    class_triplet = trial.suggest_categorical("class_triplet", [False, True])
+    return {
+        "model_type": "joint",
+        "dloss": dloss,
+        "variational": False,
+        "kan": trial.suggest_categorical("kan", [False, True]),
+        "class_triplet": class_triplet,
+        "class_triplet_w": (
+            trial.suggest_float("class_triplet_w", 0.05, 1.0, log=True)
+            if class_triplet else 0.0
+        ),
+        "lr": trial.suggest_float("lr", 3e-4, 3e-3, log=True),
+        "wd": trial.suggest_float("wd", 1e-6, 1e-4, log=True),
+        "nu": trial.suggest_float("nu", 1e-3, 0.5, log=True) if dloss != "no" else 0.0,
+        "smoothing": trial.suggest_float("smoothing", 0.0, 0.05),
+        "margin": trial.suggest_float("margin", 0.5, 5.0),
+        "dropout": trial.suggest_float("dropout", 0.0, 0.5),
+        "thres": 0.0,
+        "warmup": trial.suggest_int("warmup", 1, int(args.max_warmup)),
+        "n_layers": trial.suggest_categorical("n_layers", [1, 2]),
+        "layer1": trial.suggest_int("layer1", 512, 2048, step=128),
+        "log1p": True,
+        "scaler": trial.suggest_categorical("scaler", ["standard", "robust"]),
+        "gamma": (
+            trial.suggest_float("gamma", 1e-3, 0.5, log=True)
+            if dloss in ADVERSARIAL_DLOSS else 0.0
+        ),
+        "beta": 0.0,
+    }
 
 
 def _sanitize(key: str) -> str:
@@ -669,11 +952,120 @@ def _close_fit_resources(trainer) -> None:
     except Exception:
         pass
 
+
+def assert_bernn_label_mapping_contract(labels) -> None:
+    """Fail fast if BERNN remaps encoded class IDs into a different order."""
+    from sklearn.preprocessing import LabelEncoder
+    from bernn.dl.train.train_ae import TrainAE
+
+    normalized = TrainAE._normalize_labels_for_encoding(labels)
+    known = normalized[normalized != "-1"]
+    encoder = LabelEncoder().fit(known)
+    encoded = encoder.transform(known)
+    probe = TrainAE.__new__(TrainAE)
+    probe._label_encoder = encoder
+    mapping_builder = getattr(probe, "_classifier_label_mapping", None)
+    if not callable(mapping_builder):
+        raise RuntimeError(
+            "Installed BERNN lacks the encoded-label identity-map fix; refusing "
+            "to train because MCC/predict labels can be silently permuted."
+        )
+    label_map, internal_labels = mapping_builder(encoded)
+    expected = np.arange(len(encoder.classes_), dtype=int)
+    if (
+        label_map != {int(i): int(i) for i in expected}
+        or not np.array_equal(np.asarray(internal_labels), expected)
+    ):
+        raise RuntimeError(
+            "Installed BERNN violates the encoded-label identity-map contract; "
+            "MCC and decoded predictions would not match classifier targets."
+        )
+
     try:
         import matplotlib.pyplot as plt
         plt.close("all")
     except Exception:
         pass
+
+
+def _reference_intermediate_values(trial, step: int) -> list[float]:
+    """Completed-study values aligned to one epoch/fold checkpoint."""
+    import optuna
+
+    values = []
+    for previous in trial.study.get_trials(deepcopy=False):
+        if previous.number == trial.number or previous.state != optuna.trial.TrialState.COMPLETE:
+            continue
+        value = previous.intermediate_values.get(int(step))
+        if value is not None and np.isfinite(value):
+            values.append(float(value))
+    return values
+
+
+def percentile_prune_cutoff(
+    reference_values, percentile: float = PRUNE_PERCENTILE,
+    min_reference_trials: int = PRUNE_MIN_REFERENCE_TRIALS,
+):
+    """Return a calibrated pruning cutoff, or None until enough evidence exists."""
+    values = np.asarray(list(reference_values), dtype=float)
+    values = values[np.isfinite(values)]
+    if len(values) < int(min_reference_trials):
+        return None
+    return float(np.percentile(values, float(percentile)))
+
+
+def _install_post_warmup_epoch_pruner(trainer, args) -> None:
+    """Prune only after classifier training begins; warmup always completes."""
+    trial = getattr(args, "optuna_trial", None)
+    if trial is None or not bool(getattr(args, "enable_epoch_pruning", False)):
+        return
+
+    import optuna
+
+    original = trainer._score_public_split_metrics
+    state = {
+        "classifier_epoch": 0,
+        "train_mcc": float("nan"),
+        "best_valid_mcc": -1.0,
+        "bad_percentile_checks": 0,
+    }
+
+    def score_with_pruning(split):
+        metrics = original(split)
+        mcc = float(metrics.get("mcc", metrics.get("MCC", float("nan"))))
+        if split == "train":
+            state["train_mcc"] = mcc
+        elif split == "valid":
+            state["classifier_epoch"] += 1
+            if np.isfinite(mcc):
+                state["best_valid_mcc"] = max(state["best_valid_mcc"], mcc)
+            epoch = int(state["classifier_epoch"])
+            if epoch >= 10 and epoch % 5 == 0:
+                step = EPOCH_PRUNE_STEP_BASE + epoch
+                best_valid = float(state["best_valid_mcc"])
+                trial.report(best_valid, step=step)
+                trial.set_user_attr("pruning_classifier_epoch", epoch)
+                trial.set_user_attr("pruning_best_valid_mcc", best_valid)
+                trial.set_user_attr("pruning_train_mcc", state["train_mcc"])
+                if state["train_mcc"] < 0.20 and best_valid < 0.10:
+                    raise optuna.TrialPruned(
+                        f"collapsed learning curve at classifier epoch {epoch}: "
+                        f"train_mcc={state['train_mcc']:.4f}, best_valid_mcc={best_valid:.4f}"
+                    )
+                cutoff = percentile_prune_cutoff(_reference_intermediate_values(trial, step))
+                if cutoff is not None and best_valid < cutoff:
+                    state["bad_percentile_checks"] += 1
+                else:
+                    state["bad_percentile_checks"] = 0
+                if state["bad_percentile_checks"] >= 2:
+                    raise optuna.TrialPruned(
+                        f"learning curve below completed-trial p{PRUNE_PERCENTILE:g} "
+                        f"for two checks at classifier epoch {epoch}: "
+                        f"best_valid_mcc={best_valid:.4f}, cutoff={cutoff:.4f}"
+                    )
+        return metrics
+
+    trainer._score_public_split_metrics = score_with_pruning
 
     import gc
     gc.collect()
@@ -705,6 +1097,7 @@ def _fit_one(cfg, args, data, exp_id: str, seed: int, keep_models: bool):
         X, y, batches, X_valid, y_valid, batches_valid, X_test, y_test, batches_test = data
     else:
         raise ValueError(f"Expected 3, 6, or 9 data items, got {len(data)}")
+    assert_bernn_label_mapping_contract(y)
     tc = build_trainer_config(cfg, args, exp_id)
     set_bernn_seed(seed)       # reproducibility: same config/seed -> same result
     trainer_cls = TrainAEThenClassifierHoldout if cfg.get("model_type") == "two_stage" else TrainAEClassifierHoldout
@@ -714,6 +1107,7 @@ def _fit_one(cfg, args, data, exp_id: str, seed: int, keep_models: bool):
         # needed for model selection and are intentionally disabled.
         config=tc, log_metrics=False, keep_models=keep_models, log_mlflow=True,
     )
+    _install_post_warmup_epoch_pruner(trainer, args)
     trainer.seed = int(seed)   # vary stochastic BERNN initialization across folds
     import inspect
 
@@ -877,6 +1271,171 @@ def cached_cv_splits(y, batches, n_repeats: int, cache_path=None):
     return splits
 
 
+def cached_fold_feature_indices(
+    X, y, train_idx, *, fold_idx: int, k: int, cache_dir=None,
+    method: str = "f_classif",
+):
+    """Select and cache top features using training rows from one fold only."""
+    supported_methods = {"f_classif", "xgboost_gain", "hybrid_xgboost_f"}
+    if method not in supported_methods:
+        raise ValueError(f"Unsupported fold feature selector: {method}")
+    n_features = int(X.shape[1])
+    requested_k = int(k)
+    if requested_k <= 0 or requested_k >= n_features:
+        return np.arange(n_features, dtype=int)
+
+    train_idx = np.asarray(train_idx, dtype=int)
+    train_y = np.asarray(y)[train_idx].astype(str)
+    digest = hashlib.sha256()
+    digest.update(str(X.shape).encode())
+    digest.update(b"\x00")
+    digest.update("\x1f".join(map(str, X.columns)).encode())
+    digest.update(b"\x00")
+    digest.update(train_idx.tobytes())
+    digest.update(b"\x00")
+    digest.update("\x1f".join(train_y).encode())
+    digest.update(f"\x00{method}\x00{requested_k}".encode())
+    fingerprint = digest.hexdigest()
+    path = None
+    if cache_dir:
+        path = Path(cache_dir) / f"fold_{int(fold_idx)}_{method}_k{requested_k}.npz"
+        if path.exists():
+            try:
+                with np.load(path, allow_pickle=False) as payload:
+                    if str(payload["fingerprint"].item()) == fingerprint:
+                        selected = payload["selected"].astype(int)
+                        if len(selected) and np.all((0 <= selected) & (selected < n_features)):
+                            print(
+                                f"[feature selection] fold={fold_idx + 1} cache=hit "
+                                f"method={method} selected={len(selected)}/{n_features}",
+                                flush=True,
+                            )
+                            return selected
+            except Exception:
+                pass
+
+    train_values = X.iloc[train_idx].to_numpy(dtype=np.float32, copy=False)
+    nonzero = np.any(train_values != 0, axis=0)
+
+    def f_scores():
+        from sklearn.feature_selection import f_classif
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            scores, _ = f_classif(train_values, train_y)
+        scores = np.nan_to_num(
+            np.asarray(scores), nan=-np.inf, neginf=-np.inf,
+            posinf=np.finfo(np.float64).max,
+        )
+        scores[~nonzero] = -np.inf
+        return scores
+
+    if method == "f_classif":
+        scores = f_scores()
+        eligible = np.flatnonzero(np.isfinite(scores))
+        selected_k = min(requested_k, len(eligible))
+        selected = _top_feature_indices(scores, selected_k, eligible=eligible)
+    else:
+        xgb_scores = _xgboost_gain_scores(train_values, train_y)
+        xgb_scores[~nonzero] = -np.inf
+        xgb_eligible = np.flatnonzero(np.isfinite(xgb_scores) & (xgb_scores > 0))
+        if method == "xgboost_gain":
+            selected_k = min(requested_k, len(xgb_eligible))
+            selected = _top_feature_indices(
+                xgb_scores, selected_k, eligible=xgb_eligible
+            )
+        else:
+            # XGBoost gain is sparse: many useful bins never become split
+            # features. Keep up to half of the requested budget from gain, then
+            # fill the remainder with univariate training-fold signal. This
+            # preserves nonlinear XGBoost discoveries without discarding all
+            # distributed/weak features.
+            xgb_k = min(requested_k // 2, len(xgb_eligible))
+            xgb_selected = _top_feature_indices(
+                xgb_scores, xgb_k, eligible=xgb_eligible
+            )
+            univariate_scores = f_scores()
+            univariate_scores[xgb_selected] = -np.inf
+            f_eligible = np.flatnonzero(np.isfinite(univariate_scores))
+            f_k = min(requested_k - len(xgb_selected), len(f_eligible))
+            f_selected = _top_feature_indices(
+                univariate_scores, f_k, eligible=f_eligible
+            )
+            selected = np.concatenate([xgb_selected, f_selected])
+            selected_k = len(selected)
+
+    if selected_k == 0:
+        raise ValueError(f"Fold {fold_idx + 1} has no selectable non-zero features")
+    selected = np.sort(selected.astype(int))
+    if path is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp.npz")
+        np.savez_compressed(
+            temporary,
+            fingerprint=np.asarray(fingerprint),
+            selected=selected,
+        )
+        os.replace(temporary, path)
+    print(
+        f"[feature selection] fold={fold_idx + 1} cache=miss "
+        f"method={method} selected={len(selected)}/{n_features}",
+        flush=True,
+    )
+    return selected
+
+
+def _top_feature_indices(scores, k: int, *, eligible=None):
+    scores = np.asarray(scores)
+    eligible = (
+        np.flatnonzero(np.isfinite(scores))
+        if eligible is None else np.asarray(eligible, dtype=int)
+    )
+    k = min(int(k), len(eligible))
+    if k <= 0:
+        return np.array([], dtype=int)
+    if k == len(eligible):
+        return eligible.copy()
+    top = np.argpartition(scores[eligible], -k)[-k:]
+    return eligible[top]
+
+
+def _xgboost_gain_scores(train_values, train_y):
+    """Fit a small training-fold-only XGBoost model and return gain by column."""
+    import xgboost as xgb
+    from scipy import sparse
+    from sklearn.preprocessing import LabelEncoder
+
+    labels = LabelEncoder().fit_transform(np.asarray(train_y).astype(str))
+    matrix = sparse.csr_matrix(train_values)
+    device = "cuda" if os.environ.get("CUDA_VISIBLE_DEVICES", "").strip() not in {"", "-1"} else "cpu"
+    dtrain = xgb.DMatrix(matrix, label=labels)
+    booster = xgb.train(
+        {
+            "objective": "multi:softprob",
+            "num_class": int(np.unique(labels).size),
+            "tree_method": "hist",
+            "device": device,
+            "max_depth": 6,
+            "eta": 0.3,
+            "max_bin": 256,
+            "subsample": 1.0,
+            "colsample_bytree": 1.0,
+            "seed": 42,
+            "nthread": max(1, min(8, os.cpu_count() or 1)),
+        },
+        dtrain,
+        num_boost_round=64,
+        verbose_eval=False,
+    )
+    scores = np.zeros(train_values.shape[1], dtype=np.float64)
+    for feature, gain in booster.get_score(importance_type="gain").items():
+        if feature.startswith("f") and feature[1:].isdigit():
+            index = int(feature[1:])
+            if 0 <= index < len(scores):
+                scores[index] = float(gain)
+    return scores
+
+
 def _aggregate_fold_metrics(fold_metrics: list[dict]) -> dict:
     """Mean metric dictionaries and retain per-fold vectors for dashboards.
 
@@ -969,9 +1528,20 @@ def run_trial(cfg: dict, args, data, exp_id: str, fixed_test_data=None):
         if set(train_idx) & set(test_idx) or len(train_idx) + len(test_idx) != len(X):
             raise AssertionError("Every development sample must appear exactly once in train or validation")
 
+        selected_features = cached_fold_feature_indices(
+            X,
+            model_y,
+            train_idx,
+            fold_idx=fold_idx,
+            k=int(getattr(args, "feature_select_k", 0)),
+            cache_dir=getattr(args, "feature_select_cache_dir", None),
+            method=getattr(args, "feature_select_method", "f_classif"),
+        )
+        X_fold = X.iloc[:, selected_features]
+        X_fixed_fold = None if X_fixed is None else X_fixed.iloc[:, selected_features]
         fold_exp_id = f"{exp_id}_fold{fold_idx}"
         fold_data = (
-            X.iloc[train_idx].reset_index(drop=True),
+            X_fold.iloc[train_idx].reset_index(drop=True),
             model_y[train_idx],
             batches[train_idx],
         )
@@ -979,11 +1549,15 @@ def run_trial(cfg: dict, args, data, exp_id: str, fixed_test_data=None):
         fold_args.n_repeats = resolved_n_repeats
         fold_args.resolved_n_repeats = resolved_n_repeats
         fold_args.trainer_n_repeats = 1
+        fold_args.optuna_trial = getattr(args, "optuna_trial", None)
+        fold_args.enable_epoch_pruning = bool(
+            getattr(args, "enable_optuna_pruning", False) and fold_idx == 0
+        )
         fit_data = (
             fold_data[0],
             fold_data[1],
             fold_data[2],
-            X.iloc[test_idx].reset_index(drop=True),
+            X_fold.iloc[test_idx].reset_index(drop=True),
             model_y[test_idx],
             batches[test_idx],
         )
@@ -992,7 +1566,7 @@ def run_trial(cfg: dict, args, data, exp_id: str, fixed_test_data=None):
             # supplied to BERNN, while labels remain outside fit() and are used
             # only below to score predictions after training.
             fit_data = fit_data + (
-                X_fixed.copy(),
+                X_fixed_fold.copy(),
                 None,
                 np.asarray(batches_fixed).copy(),
             )
@@ -1001,6 +1575,7 @@ def run_trial(cfg: dict, args, data, exp_id: str, fixed_test_data=None):
             f"train={len(train_idx)} valid={len(test_idx)} "
             f"cross_test={int(X_fixed is not None)} "
             f"cross_test_samples={0 if X_fixed is None else len(X_fixed)} "
+            f"features={len(selected_features)} "
             f"train_batches={sorted(train_batch_values)} "
             f"valid_batches={sorted(valid_batch_values)} "
             f"test_batches={sorted(fixed_batch_values)}",
@@ -1016,6 +1591,14 @@ def run_trial(cfg: dict, args, data, exp_id: str, fixed_test_data=None):
         )
         metrics = extract_mlflow_metrics(fold_exp_id)
         epoch_traces = extract_mlflow_epoch_traces(fold_exp_id)
+        if fixed_test_data is None:
+            # BERNN needs a placeholder test loader in grouped CV, but those
+            # duplicate-validation test metrics are not real test estimates.
+            metrics = {key: value for key, value in metrics.items() if "test" not in key.lower()}
+            epoch_traces = [
+                {key: value for key, value in row.items() if "test" not in key.lower()}
+                for row in epoch_traces
+            ]
         if epoch_traces:
             metrics["_epoch_traces"] = epoch_traces
             epoch_traces_by_fold[str(fold_idx)] = epoch_traces
@@ -1025,10 +1608,10 @@ def run_trial(cfg: dict, args, data, exp_id: str, fixed_test_data=None):
 
             try:
                 predictions = trainer.predict(
-                    X_fixed.copy(), groups_test=np.asarray(batches_fixed).copy()
+                    X_fixed_fold.copy(), groups_test=np.asarray(batches_fixed).copy()
                 )
             except TypeError:
-                predictions = trainer.predict(X_fixed.copy())
+                predictions = trainer.predict(X_fixed_fold.copy())
             predictions = np.asarray(predictions).astype(str).reshape(-1)
             if len(predictions) != len(y_fixed):
                 raise ValueError(
@@ -1040,8 +1623,31 @@ def run_trial(cfg: dict, args, data, exp_id: str, fixed_test_data=None):
             ))
             fixed_test_mcc_scores.append(float(metrics["test_mcc"]))
         metrics["fold"] = float(fold_idx)
+        metrics["selected_features"] = float(len(selected_features))
         fold_scores.append(float(mcc))
         fold_metrics.append(metrics)
+        optuna_trial = getattr(args, "optuna_trial", None)
+        if optuna_trial is not None:
+            import optuna
+
+            partial_mean = float(np.mean(fold_scores))
+            step = FOLD_PRUNE_STEP_BASE + fold_idx + 1
+            optuna_trial.report(partial_mean, step=step)
+            optuna_trial.set_user_attr("partial_valid_mcc_folds", list(fold_scores))
+            optuna_trial.set_user_attr("partial_valid_mcc_mean", partial_mean)
+            if bool(getattr(args, "enable_optuna_pruning", False)) and fold_idx in {0, 1}:
+                references = _reference_intermediate_values(optuna_trial, step)
+                cutoff = percentile_prune_cutoff(references)
+                if cutoff is not None:
+                    if fold_idx == 0 and partial_mean < 0.35:
+                        raise optuna.TrialPruned(
+                            f"fold-1 MCC {partial_mean:.4f} below calibrated hard floor 0.35"
+                        )
+                    if fold_idx == 1 and partial_mean < max(0.55, cutoff):
+                        raise optuna.TrialPruned(
+                            f"two-fold mean {partial_mean:.4f} below cutoff "
+                            f"{max(0.55, cutoff):.4f}"
+                        )
         held_batches = sorted(set(np.asarray(batches)[test_idx].astype(str)))
         print(
             f"[trial cv] fold {fold_idx + 1}/{resolved_n_repeats} "
