@@ -1,0 +1,24 @@
+project:
+  type: website
+  output-dir: _site
+  pre-render:
+    - python3 export_data.py
+website:
+  title: "BE Leaderboard"
+  navbar:
+    title: "BE Leaderboard"
+    left:
+      - href: index.qmd
+        text: Overview
+  page-footer:
+    left: "Batch-effect correction benchmarks"
+    right: "Quarto comparison frontend — Gradio remains unchanged"
+format:
+  html:
+    theme: cosmo
+    css: styles.css
+    toc: false
+    page-layout: full
+    smooth-scroll: true
+resources:
+  - data/site-data.js

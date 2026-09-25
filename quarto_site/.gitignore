@@ -1,0 +1,6 @@
+_site/
+.quarto/
+data/site-data.js
+
+/.quarto/
+**/*.quarto_ipynb
